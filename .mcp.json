@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "repo-catalog": {
+      "command": "uv",
+      "args": ["run", "repo-catalog", "mcp", "--out", "data"]
+    }
+  }
+}

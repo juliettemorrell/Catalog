@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Repo Catalog</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%232a78d6'/><path d='M9 10h14M9 16h14M9 22h9' stroke='white' stroke-width='3' stroke-linecap='round'/></svg>" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"></span>
+        <span>Repo Catalog</span>
+      </div>
+      <nav class="tabs" aria-label="Sections">
+        <a href="#/repos" data-tab="repos">Repositories</a>
+        <a href="#/assets" data-tab="assets">AI Asset Library</a>
+        <a href="#/insights" data-tab="insights">Insights</a>
+      </nav>
+      <button class="icon-btn" id="theme" type="button" aria-label="Toggle color theme"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"/></svg></button>
+    </header>
+    <main id="main"><p class="loading">Loading catalog…</p></main>
+    <aside id="drawer" class="drawer" aria-hidden="true" tabindex="-1"></aside>
+    <div id="scrim" class="scrim" hidden></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

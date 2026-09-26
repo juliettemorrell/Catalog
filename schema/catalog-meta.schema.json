@@ -1,0 +1,45 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "generated_at": {
+      "format": "date-time",
+      "title": "Generated At",
+      "type": "string"
+    },
+    "scanner_version": {
+      "title": "Scanner Version",
+      "type": "string"
+    },
+    "source": {
+      "title": "Source",
+      "type": "string"
+    },
+    "repo_count": {
+      "title": "Repo Count",
+      "type": "integer"
+    },
+    "asset_count": {
+      "title": "Asset Count",
+      "type": "integer"
+    },
+    "llm_enriched": {
+      "default": false,
+      "title": "Llm Enriched",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "generated_at",
+    "scanner_version",
+    "source",
+    "repo_count",
+    "asset_count"
+  ],
+  "title": "CatalogMeta",
+  "type": "object"
+}

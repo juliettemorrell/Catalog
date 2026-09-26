@@ -1,0 +1,116 @@
+# Scans every repository in the org on a schedule and publishes the catalog.
+#
+# Setup (see README "Running it on a schedule"):
+#   Auth, pick one:
+#     - GitHub App (recommended): vars.CATALOG_APP_ID + secrets.CATALOG_APP_PRIVATE_KEY,
+#       installed on the org with read-only Contents + Metadata (+ Custom properties).
+#     - Fine-grained PAT: secrets.CATALOG_TOKEN with read-only Contents + Metadata.
+#   vars.CATALOG_ORG            org (or user) to scan; defaults to this repo's owner
+#   secrets.ANTHROPIC_API_KEY   optional; enables Claude summaries when vars.CATALOG_LLM == 'true'
+#   vars.CATALOG_PUBLISH_PAGES  'true' to deploy the site to GitHub Pages. Only do this when
+#                               Pages access is restricted (private/internal Pages): the
+#                               catalog describes private repositories.
+name: Catalog scan
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      org:
+        description: Org or user to scan (default vars.CATALOG_ORG or repo owner)
+        required: false
+      force:
+        description: Rescan every repo even if unchanged
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: catalog-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      ORG: ${{ inputs.org || vars.CATALOG_ORG || github.repository_owner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: GitHub App token
+        id: app-token
+        if: vars.CATALOG_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.CATALOG_APP_ID }}
+          private-key: ${{ secrets.CATALOG_APP_PRIVATE_KEY }}
+          owner: ${{ env.ORG }}
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked --extra llm
+
+      # Clones, previous results and LLM responses make re-runs incremental and cheap.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cache
+            data/repos
+          key: catalog-${{ env.ORG }}-${{ github.run_id }}
+          restore-keys: catalog-${{ env.ORG }}-
+
+      - name: Scan
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.CATALOG_TOKEN || github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LLM: ${{ vars.CATALOG_LLM == 'true' && secrets.ANTHROPIC_API_KEY != '' && '--llm' || '' }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: uv run repo-catalog scan --org "$ORG" --out data --workers 6 $LLM $FORCE
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: catalog-data
+          path: |
+            data/*.json
+            data/*.yaml
+            data/catalog.db
+          retention-days: 30
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - name: Build site
+        working-directory: site
+        run: npm ci && npm run build
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: catalog-site
+          path: site/dist
+          retention-days: 30
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: vars.CATALOG_PUBLISH_PAGES == 'true'
+        with:
+          path: site/dist
+
+  deploy:
+    needs: scan
+    if: vars.CATALOG_PUBLISH_PAGES == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

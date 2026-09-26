@@ -1,0 +1,365 @@
+{
+  "$defs": {
+    "AssetFile": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "size": {
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "size"
+      ],
+      "title": "AssetFile",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One entry in the AI asset library.",
+  "properties": {
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "kind": {
+      "enum": [
+        "skill",
+        "agent",
+        "command",
+        "prompt",
+        "instructions",
+        "mcp-server",
+        "mcp-config",
+        "hook",
+        "plugin",
+        "eval",
+        "workflow",
+        "sdk-usage"
+      ],
+      "title": "Kind",
+      "type": "string"
+    },
+    "ecosystem": {
+      "title": "Ecosystem",
+      "type": "string"
+    },
+    "name": {
+      "title": "Name",
+      "type": "string"
+    },
+    "title": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Title"
+    },
+    "description": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Description"
+    },
+    "repo": {
+      "title": "Repo",
+      "type": "string"
+    },
+    "path": {
+      "title": "Path",
+      "type": "string"
+    },
+    "url": {
+      "title": "Url",
+      "type": "string"
+    },
+    "scope": {
+      "default": "repo",
+      "enum": [
+        "repo",
+        "plugin",
+        "package",
+        "user"
+      ],
+      "title": "Scope",
+      "type": "string"
+    },
+    "confidence": {
+      "default": "high",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "title": "Confidence",
+      "type": "string"
+    },
+    "detector": {
+      "title": "Detector",
+      "type": "string"
+    },
+    "frontmatter": {
+      "additionalProperties": true,
+      "title": "Frontmatter",
+      "type": "object"
+    },
+    "tools": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Tools",
+      "type": "array"
+    },
+    "models": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Models",
+      "type": "array"
+    },
+    "providers": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Providers",
+      "type": "array"
+    },
+    "triggers": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Triggers",
+      "type": "array"
+    },
+    "arguments": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Arguments",
+      "type": "array"
+    },
+    "mcp_servers": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Mcp Servers",
+      "type": "array"
+    },
+    "tags": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Tags",
+      "type": "array"
+    },
+    "license": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "License"
+    },
+    "version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Version"
+    },
+    "content": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Content"
+    },
+    "content_truncated": {
+      "default": false,
+      "title": "Content Truncated",
+      "type": "boolean"
+    },
+    "excerpt": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Excerpt"
+    },
+    "headings": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Headings",
+      "type": "array"
+    },
+    "files": {
+      "items": {
+        "$ref": "#/$defs/AssetFile"
+      },
+      "title": "Files",
+      "type": "array"
+    },
+    "line_count": {
+      "default": 0,
+      "title": "Line Count",
+      "type": "integer"
+    },
+    "word_count": {
+      "default": 0,
+      "title": "Word Count",
+      "type": "integer"
+    },
+    "token_estimate": {
+      "default": 0,
+      "title": "Token Estimate",
+      "type": "integer"
+    },
+    "content_sha": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Content Sha"
+    },
+    "last_modified": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Last Modified"
+    },
+    "last_author": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Last Author"
+    },
+    "commit_count": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Commit Count"
+    },
+    "quality_score": {
+      "default": 0,
+      "title": "Quality Score",
+      "type": "integer"
+    },
+    "quality_notes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Quality Notes",
+      "type": "array"
+    },
+    "summary": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Summary"
+    },
+    "use_cases": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Use Cases",
+      "type": "array"
+    },
+    "category": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Category"
+    },
+    "duplicates": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Duplicates",
+      "type": "array"
+    }
+  },
+  "required": [
+    "id",
+    "kind",
+    "ecosystem",
+    "name",
+    "repo",
+    "path",
+    "url",
+    "detector"
+  ],
+  "title": "AIAsset",
+  "type": "object"
+}

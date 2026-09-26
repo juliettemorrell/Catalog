@@ -1,0 +1,1032 @@
+{
+  "$defs": {
+    "AIUsageSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "has_ai": {
+          "default": false,
+          "title": "Has Ai",
+          "type": "boolean"
+        },
+        "asset_count": {
+          "default": 0,
+          "title": "Asset Count",
+          "type": "integer"
+        },
+        "asset_kinds": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Asset Kinds",
+          "type": "object"
+        },
+        "ecosystems": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Ecosystems",
+          "type": "array"
+        },
+        "sdks": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Sdks",
+          "type": "array"
+        },
+        "models": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Models",
+          "type": "array"
+        },
+        "mcp_servers_provided": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Mcp Servers Provided",
+          "type": "array"
+        },
+        "mcp_servers_consumed": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Mcp Servers Consumed",
+          "type": "array"
+        }
+      },
+      "title": "AIUsageSummary",
+      "type": "object"
+    },
+    "Contributor": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "commits": {
+          "title": "Commits",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "commits"
+      ],
+      "title": "Contributor",
+      "type": "object"
+    },
+    "Declared": {
+      "additionalProperties": false,
+      "description": "Metadata a team declared themselves (Backstage/Cortex/OpsLevel/Compass files,\nGitHub custom properties). Treated as ground truth over inferred values.",
+      "properties": {
+        "source_files": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Source Files",
+          "type": "array"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "owner": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Owner"
+        },
+        "system": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "System"
+        },
+        "domain": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Domain"
+        },
+        "lifecycle": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lifecycle"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Type"
+        },
+        "tier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tier"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tags",
+          "type": "array"
+        },
+        "links": {
+          "items": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "title": "Links",
+          "type": "array"
+        },
+        "provides_apis": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Provides Apis",
+          "type": "array"
+        },
+        "consumes_apis": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Consumes Apis",
+          "type": "array"
+        },
+        "depends_on": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Depends On",
+          "type": "array"
+        },
+        "custom_properties": {
+          "additionalProperties": true,
+          "title": "Custom Properties",
+          "type": "object"
+        }
+      },
+      "title": "Declared",
+      "type": "object"
+    },
+    "Dependency": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        },
+        "ecosystem": {
+          "title": "Ecosystem",
+          "type": "string"
+        },
+        "scope": {
+          "default": "runtime",
+          "enum": [
+            "runtime",
+            "dev",
+            "optional",
+            "peer",
+            "build"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "manifest": {
+          "title": "Manifest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "ecosystem",
+        "manifest"
+      ],
+      "title": "Dependency",
+      "type": "object"
+    },
+    "LanguageStat": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "files": {
+          "title": "Files",
+          "type": "integer"
+        },
+        "lines": {
+          "title": "Lines",
+          "type": "integer"
+        },
+        "percent": {
+          "title": "Percent",
+          "type": "number"
+        }
+      },
+      "required": [
+        "name",
+        "files",
+        "lines",
+        "percent"
+      ],
+      "title": "LanguageStat",
+      "type": "object"
+    },
+    "Ownership": {
+      "additionalProperties": false,
+      "properties": {
+        "codeowners": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Codeowners",
+          "type": "array"
+        },
+        "top_contributors": {
+          "items": {
+            "$ref": "#/$defs/Contributor"
+          },
+          "title": "Top Contributors",
+          "type": "array"
+        },
+        "contributor_count": {
+          "default": 0,
+          "title": "Contributor Count",
+          "type": "integer"
+        },
+        "commit_count": {
+          "default": 0,
+          "title": "Commit Count",
+          "type": "integer"
+        },
+        "first_commit": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "First Commit"
+        },
+        "last_commit": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Commit"
+        }
+      },
+      "title": "Ownership",
+      "type": "object"
+    },
+    "Package": {
+      "additionalProperties": false,
+      "description": "A publishable/buildable unit inside the repo (monorepos have several).",
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "ecosystem": {
+          "title": "Ecosystem",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "private": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Private"
+        }
+      },
+      "required": [
+        "name",
+        "path",
+        "ecosystem"
+      ],
+      "title": "Package",
+      "type": "object"
+    },
+    "PracticeCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "category": {
+          "title": "Category",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "passed": {
+          "title": "Passed",
+          "type": "boolean"
+        },
+        "weight": {
+          "default": 1,
+          "title": "Weight",
+          "type": "integer"
+        },
+        "evidence": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Evidence"
+        }
+      },
+      "required": [
+        "id",
+        "category",
+        "label",
+        "passed"
+      ],
+      "title": "PracticeCheck",
+      "type": "object"
+    },
+    "Practices": {
+      "additionalProperties": false,
+      "properties": {
+        "score": {
+          "default": 0,
+          "title": "Score",
+          "type": "integer"
+        },
+        "grade": {
+          "default": "F",
+          "enum": [
+            "A",
+            "B",
+            "C",
+            "D",
+            "F"
+          ],
+          "title": "Grade",
+          "type": "string"
+        },
+        "checks": {
+          "items": {
+            "$ref": "#/$defs/PracticeCheck"
+          },
+          "title": "Checks",
+          "type": "array"
+        }
+      },
+      "title": "Practices",
+      "type": "object"
+    },
+    "Stack": {
+      "additionalProperties": false,
+      "properties": {
+        "primary_language": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Primary Language"
+        },
+        "languages": {
+          "items": {
+            "$ref": "#/$defs/LanguageStat"
+          },
+          "title": "Languages",
+          "type": "array"
+        },
+        "frameworks": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Frameworks",
+          "type": "array"
+        },
+        "libraries": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Libraries",
+          "type": "array"
+        },
+        "runtimes": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Runtimes",
+          "type": "object"
+        },
+        "package_managers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Package Managers",
+          "type": "array"
+        },
+        "build_tools": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Build Tools",
+          "type": "array"
+        },
+        "testing": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Testing",
+          "type": "array"
+        },
+        "linting": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Linting",
+          "type": "array"
+        },
+        "databases": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Databases",
+          "type": "array"
+        },
+        "messaging": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Messaging",
+          "type": "array"
+        },
+        "cloud": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Cloud",
+          "type": "array"
+        },
+        "infrastructure": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Infrastructure",
+          "type": "array"
+        },
+        "ci_cd": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Ci Cd",
+          "type": "array"
+        },
+        "observability": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Observability",
+          "type": "array"
+        },
+        "auth": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Auth",
+          "type": "array"
+        },
+        "ai": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Ai",
+          "type": "array"
+        }
+      },
+      "title": "Stack",
+      "type": "object"
+    },
+    "Structure": {
+      "additionalProperties": false,
+      "properties": {
+        "repo_type": {
+          "default": "unknown",
+          "title": "Repo Type",
+          "type": "string"
+        },
+        "is_monorepo": {
+          "default": false,
+          "title": "Is Monorepo",
+          "type": "boolean"
+        },
+        "packages": {
+          "items": {
+            "$ref": "#/$defs/Package"
+          },
+          "title": "Packages",
+          "type": "array"
+        },
+        "entrypoints": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Entrypoints",
+          "type": "array"
+        },
+        "api_specs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Api Specs",
+          "type": "array"
+        },
+        "dockerfiles": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dockerfiles",
+          "type": "array"
+        },
+        "top_level": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Top Level",
+          "type": "array"
+        },
+        "docs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Docs",
+          "type": "array"
+        },
+        "file_count": {
+          "default": 0,
+          "title": "File Count",
+          "type": "integer"
+        },
+        "total_lines": {
+          "default": 0,
+          "title": "Total Lines",
+          "type": "integer"
+        }
+      },
+      "title": "Structure",
+      "type": "object"
+    },
+    "Summary": {
+      "additionalProperties": false,
+      "properties": {
+        "one_liner": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "One Liner"
+        },
+        "readme_title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Readme Title"
+        },
+        "readme_excerpt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Readme Excerpt"
+        },
+        "purpose": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Purpose"
+        },
+        "key_features": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Key Features",
+          "type": "array"
+        },
+        "reuse_notes": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reuse Notes"
+        },
+        "domains": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Domains",
+          "type": "array"
+        },
+        "source": {
+          "default": "none",
+          "enum": [
+            "github",
+            "readme",
+            "manifest",
+            "llm",
+            "none"
+          ],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "title": "Summary",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One entry in the general catalog.",
+  "properties": {
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "name": {
+      "title": "Name",
+      "type": "string"
+    },
+    "owner": {
+      "title": "Owner",
+      "type": "string"
+    },
+    "url": {
+      "title": "Url",
+      "type": "string"
+    },
+    "description": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Description"
+    },
+    "homepage": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Homepage"
+    },
+    "topics": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Topics",
+      "type": "array"
+    },
+    "visibility": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Visibility"
+    },
+    "archived": {
+      "default": false,
+      "title": "Archived",
+      "type": "boolean"
+    },
+    "fork": {
+      "default": false,
+      "title": "Fork",
+      "type": "boolean"
+    },
+    "is_template": {
+      "default": false,
+      "title": "Is Template",
+      "type": "boolean"
+    },
+    "default_branch": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Default Branch"
+    },
+    "head_sha": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Head Sha"
+    },
+    "license": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "License"
+    },
+    "stars": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stars"
+    },
+    "open_issues": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Open Issues"
+    },
+    "created_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Created At"
+    },
+    "pushed_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Pushed At"
+    },
+    "lifecycle": {
+      "default": "active",
+      "enum": [
+        "active",
+        "maintained",
+        "stale",
+        "archived"
+      ],
+      "title": "Lifecycle",
+      "type": "string"
+    },
+    "capabilities": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Capabilities",
+      "type": "array"
+    },
+    "github_languages": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "title": "Github Languages",
+      "type": "object"
+    },
+    "declared": {
+      "$ref": "#/$defs/Declared"
+    },
+    "summary": {
+      "$ref": "#/$defs/Summary"
+    },
+    "stack": {
+      "$ref": "#/$defs/Stack"
+    },
+    "dependencies": {
+      "items": {
+        "$ref": "#/$defs/Dependency"
+      },
+      "title": "Dependencies",
+      "type": "array"
+    },
+    "structure": {
+      "$ref": "#/$defs/Structure"
+    },
+    "practices": {
+      "$ref": "#/$defs/Practices"
+    },
+    "ownership": {
+      "$ref": "#/$defs/Ownership"
+    },
+    "ai": {
+      "$ref": "#/$defs/AIUsageSummary"
+    },
+    "scanned_at": {
+      "format": "date-time",
+      "title": "Scanned At",
+      "type": "string"
+    },
+    "scanner_version": {
+      "title": "Scanner Version",
+      "type": "string"
+    },
+    "scan_errors": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Scan Errors",
+      "type": "array"
+    }
+  },
+  "required": [
+    "id",
+    "name",
+    "owner",
+    "url",
+    "scanned_at",
+    "scanner_version"
+  ],
+  "title": "Repo",
+  "type": "object"
+}

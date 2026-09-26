@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Scanner working state and outputs (outputs describe private repos: don't commit by default)
+.cache/
+data/
+
+# Site
+site/node_modules/
+site/dist/
+
+# Local env
+.env
+.env.*
+!.env.example
+.DS_Store
