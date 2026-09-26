@@ -33,7 +33,35 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 | `practices` | `score` 0–100, `grade` A–F (≥85/70/55/40), `checks[]` with `id`, `category`, `label`, `passed`, `weight`, `evidence` | see below |
 | `ownership` | `codeowners`, `top_contributors`, `contributor_count`, `commit_count`, `first_commit`, `last_commit` | CODEOWNERS, git log |
 | `ai` | `has_ai`, `asset_count`, `asset_kinds`, `ecosystems`, `sdks`, `models`, `mcp_servers_provided`, `mcp_servers_consumed` | AI detectors |
+| `stack.runtime_versions[]` | Concrete pinned versions (`runtime`, `version`, `path`) from Dockerfiles, `.nvmrc`/`.python-version`/`.tool-versions`, `global.json`, CI `*-version:` inputs, csproj/pom/Gemfile/composer pins. Ranges and `go.mod`'s `go` line are compatibility, not pins, so they are skipped | files |
+| `flags[]` | Findings: `id`, `category` (security, maintenance, ownership, ai-governance), `severity` (high, medium, low), `message`, `path`, `line`. See the table below | flag detectors |
+| `reusables[]` | Building blocks: `kind` (action, reusable-workflow, terraform-module, helm-chart, template, api, config-package), `name`, `path`, `description`, `details` (inputs, secrets, variables, outputs, providers, operations and a sample, version…) | files |
+| `references[]` | Pointers to other repos: `kind` (action, reusable-workflow, terraform, container, git), `target` (`owner/repo`, lowercase), `path` | workflows, `.tf`, Dockerfiles, `.gitmodules` |
+| `depends_on[]`, `used_by[]` | Org repos linked by packages, actions, workflows, modules, images or git deps: `repo`, `via` (e.g. `npm @acme/ui`). Filled at build time, so only in `catalog.json`/SQLite, not per-repo files | org-wide |
 | `scanned_at`, `scanner_version`, `scan_errors` | Provenance of the record | scanner |
+
+### Flags
+
+| id | Category | Severity | Raised when |
+|---|---|---|---|
+| `committed-secret` | security | high (low in test/example/docs paths) | A credential-shaped string with a real-looking value (GitHub, AWS, Anthropic, OpenAI, Slack, Google, GitLab, Stripe live, npm, Hugging Face, SendGrid, Azure storage, private key with a body). Only kind, file and line are stored |
+| `workflow-script-injection` | security | high | Untrusted event text (issue/PR titles and bodies, comments, branch names, commit messages) interpolated into `run:` or `github-script` |
+| `workflow-pwn-request` | security | high (medium behind an `environment:` approval) | `pull_request_target` job checks out the PR head |
+| `docker-unpinned-base` | security | medium | `FROM image` or `:latest` without a digest |
+| `docker-runs-as-root` | security | low | Final stage has no non-root `USER` |
+| `eol-runtime` | maintenance | high (EOL > 1 year ago), medium (EOL passed), low (within 180 days) | A pinned runtime version past its end-of-life |
+| `depends-on-archived` | maintenance | medium | Depends on an archived org repo |
+| `no-owner` | ownership | low | No CODEOWNERS and no declared owner |
+| `single-maintainer` | ownership | medium | 90%+ of 30+ human commits by one person |
+| `deprecated-model` | ai-governance | high (retired), medium (deprecated), low (in example code) | A retired or deprecated model ID is referenced |
+| `ai-permissions-bypassed` | ai-governance | high (medium in skills/agents/commands) | Committed agent config or automation disables approvals |
+| `ai-unrestricted-shell` | ai-governance | medium in settings, low on assets | `Bash` allowed without a command scope |
+| `ai-remote-code-exec` | ai-governance | high in hooks/workflows/plugins, medium in skills/commands | `curl … \| sh` and equivalents |
+| `ai-mcp-auto-enabled`, `ai-personal-settings-committed` | ai-governance | low | `enableAllProjectMcpServers`, committed `settings.local.json` |
+| `mcp-unpinned-package` | ai-governance | medium | MCP launcher fetches an unpinned package or image (`npx -y pkg`, `uvx pkg`, `docker run img:latest`); local runners like `tsx` are ignored |
+| `mcp-inline-secret` | ai-governance | high | A literal credential in an MCP server's env/headers/args instead of `${VAR}` |
+| `mcp-plaintext-http` | ai-governance | medium | Remote MCP server over `http://` (localhost excluded) |
+| `secret-in-asset` | security | high | An AI file contained a credential (redacted in the catalog) |
 
 ### Practice checks
 
@@ -85,10 +113,11 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 | `quality_score`, `quality_notes` | 0–100 heuristic: description present and well-sized, body substance, structure, examples, length, plus kind-specific checks (Agent Skills naming rules, least-privilege tools, parameters, build/test instructions) |
 | `summary`, `use_cases`, `category` | Claude (`--llm`) |
 | `duplicates` | IDs of assets with byte-identical content elsewhere in the org |
+| `flags[]` | Governance findings for this asset (same shape as repo flags) |
 
 ## SQLite (`catalog.db`)
 
-Tables: `repos` (flat columns + `json`), `repo_tech(repo_id, category, name)`, `repo_capabilities`, `repo_topics`, `repo_languages`, `dependencies`, `packages`, `practice_checks`, `ai_assets` (flat columns + `content` + `json`), `asset_tools`, `asset_models`, `asset_tags`, and `meta`. Full-text search: `repos_fts`, `assets_fts` (unicode61, prefix matching). Views: `tech_usage`, `dependency_usage`.
+Tables: `repos` (flat columns + `json`), `repo_tech(repo_id, category, name)`, `repo_capabilities`, `repo_topics`, `repo_languages`, `dependencies`, `packages`, `practice_checks`, `ai_assets` (flat columns + `content` + `json`), `asset_tools`, `asset_models`, `asset_tags`, `flags(repo_id, asset_id, flag_id, category, severity, message, path, line)`, `reusables(repo_id, kind, name, path, description, details)`, `repo_links(repo_id, depends_on, via)`, `runtime_versions`, and `meta`. Full-text search: `repos_fts`, `assets_fts` (unicode61, prefix matching). Views: `tech_usage`, `dependency_usage`, `dependency_versions` (version drift), `flag_summary`.
 
 ```sql
 -- Which repos already integrate Stripe, newest first?
@@ -101,6 +130,16 @@ SELECT name, repo_count FROM tech_usage WHERE category = 'frameworks' LIMIT 10;
 -- Services missing tests
 SELECT r.id FROM repos r JOIN practice_checks c ON c.repo_id = r.id
 WHERE r.repo_type = 'service' AND c.check_id = 'tests' AND c.passed = 0;
+
+-- High-severity security findings across the org
+SELECT repo_id, flag_id, message, path, line FROM flags
+WHERE category = 'security' AND severity = 'high' ORDER BY repo_id;
+
+-- Blast radius: who depends on this repo, and how
+SELECT repo_id, via FROM repo_links WHERE depends_on = 'acme/shared-ui';
+
+-- Terraform modules we already have
+SELECT repo_id, name, path, description FROM reusables WHERE kind = 'terraform-module';
 
 -- Best skills about testing
 SELECT a.name, a.repo_id, a.quality_score FROM assets_fts f JOIN ai_assets a ON a.id = f.id

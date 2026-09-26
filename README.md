@@ -73,28 +73,47 @@ Every asset records its kind, ecosystem, name, description, parsed frontmatter, 
 - **Best practices**: 25 weighted checks → a 0–100 score and A–F grade, with evidence. The checks cover docs, governance, security (lockfiles, Dependabot, committed `.env` files, SHA-pinned Actions, workflow permissions), quality (tests, linters, typing) and delivery (CI runs tests, release automation).
 - **Ownership**: CODEOWNERS, declared owner/system/lifecycle (from `catalog-info.yaml`, `cortex.yaml`, `opslevel.yml`, `compass.yml`, or GitHub custom properties), top contributors, commit history and lifecycle (active / maintained / stale / archived).
 
+### Building blocks and relationships
+
+- **Building blocks** other teams can adopt as-is: GitHub Actions (`action.yml`, with inputs/outputs), reusable workflows (`on: workflow_call`), Terraform modules (variables, outputs, providers, README blurb), Helm charts, project templates (cookiecutter, copier, Backstage scaffolder, GitHub template repos), APIs (OpenAPI/AsyncAPI operations, gRPC services, GraphQL fields) and shared config packages (`eslint-config`, `tsconfig`…).
+- **Relationships**: which org repos each repo depends on, and which depend on it, resolved across the whole org from published packages (npm, PyPI, Go modules…), `uses:` of actions and reusable workflows, Terraform `source = "github.com/…"`, `FROM ghcr.io/…` images, git dependencies and submodules. Exported to Backstage as `dependsOn`.
+
+### Findings (flags)
+
+Things worth a human's attention, each with severity, location and a line number where it applies. Secret values are never stored: only the kind of secret and where it is.
+
+| Category | Flags |
+|---|---|
+| Security | committed secrets (GitHub/AWS/Anthropic/OpenAI/Slack/Stripe/… keys, private keys; placeholders and test paths are down-ranked), GitHub Actions script injection (`${{ github.event.issue.title }}` in `run:`), `pull_request_target` checkouts of untrusted PR code, `:latest`/untagged base images, containers running as root |
+| Maintenance | end-of-life runtimes (Python, Node.js, Java, .NET, Go, Ruby, PHP pinned in Dockerfiles, version files, CI or manifests; dates from endoflife.date), depending on an archived org repo |
+| Ownership | no CODEOWNERS or declared owner, bus factor 1 |
+| AI governance | retired/deprecated model IDs (Bedrock/Vertex spellings too), agent approvals disabled (`bypassPermissions`, `--dangerously-skip-permissions`, `--yolo`, Copilot auto-approve, Codex `danger-full-access`), unrestricted agent shell, `curl \| sh` in hooks and skills, unpinned MCP packages (`npx -y pkg`, `uvx pkg`, `:latest` images), credentials written into MCP configs, MCP over plain HTTP, secrets inside AI files |
+
+Calendar-dependent flags (EOL, retired models) and cross-repo ones are recomputed on every `build`, so they stay current for repos that were not re-scanned. Reference dates live in [`analyzers/reference.py`](src/repo_catalog/analyzers/reference.py).
+
 Field-by-field reference: [docs/catalog-data.md](docs/catalog-data.md). JSON Schemas: [`schema/`](schema).
 
 ## Querying it
 
-**Web UI** (`site/`): instant search with facets, detail drawers, an insights dashboard and CSV export. The query syntax is shared across the UI:
+**Web UI** (`site/`): instant search over repos, AI assets and building blocks, with facets, detail drawers, an insights dashboard (findings, most depended-on repos, version drift) and CSV export. The query syntax is shared across the UI:
 
 ```
 payments lang:python -type:library     fastapi missing:tests grade:D
 kind:skill eco:claude-code             kind:mcp-server tool:jira
 cap:pdf                                uses:anthropic ai:yes
 fw:fastapi data:postgresql minscore:70  kind:skill minq:60 dup:no
+sev:high flag:committed-secret         reuse:terraform-module usedby:yes
 ```
 
-Filters: `lang` (primary language), `anylang`, `fw`, `data`, `infra`, `tech` (any stack item, partial), `type`, `grade`, `cap`, `topic`, `owner`, `lifecycle`, `ai`, `uses`, `missing`, `has`, `is`, `minscore`; for assets `kind`, `eco`, `repo`, `tool`, `model`, `tag`, `conf`, `scope`, `dup`, `minq`. Prefix with `-` to exclude. Unknown keys are searched as text.
-
-```KEEP```
+Filters: `lang` (primary language), `anylang`, `fw`, `data`, `infra`, `tech` (any stack item, partial), `type`, `grade`, `cap`, `topic`, `owner`, `lifecycle`, `ai`, `uses`, `missing`, `has`, `is`, `minscore`, `flag`, `sev`, `reuse`, `usedby`; for assets `kind`, `eco`, `repo`, `tool`, `model`, `tag`, `conf`, `scope`, `dup`, `minq`, `flag`, `sev`; for building blocks `kind`, `format`, `repo`, `lang`, `grade`, `lifecycle`. Prefix with `-` to exclude. Unknown keys are searched as text.
 
 **CLI**
 
 ```bash
 repo-catalog search "stripe webhooks"
 repo-catalog search "code review" --assets
+repo-catalog blocks "postgres" --kind terraform-module
+repo-catalog flags --severity high --category security
 repo-catalog sql "SELECT name, repo_count FROM tech_usage WHERE category='frameworks'"
 repo-catalog sql "SELECT repo_id FROM practice_checks WHERE check_id='tests' AND passed=0"
 ```
@@ -105,7 +124,7 @@ repo-catalog sql "SELECT repo_id FROM practice_checks WHERE check_id='tests' AND
 { "mcpServers": { "repo-catalog": { "command": "uv", "args": ["run", "--extra", "mcp", "repo-catalog", "mcp", "--out", "data"] } } }
 ```
 
-Tools: `search_repos`, `get_repo`, `search_ai_assets`, `get_ai_asset`, `repos_using`, `technology_usage`, `sql` (read-only). The skill in [`.claude/skills/repo-catalog`](.claude/skills/repo-catalog/SKILL.md) teaches an agent how to use them for prior-art searches.
+Tools: `search_repos`, `get_repo`, `search_ai_assets`, `get_ai_asset`, `find_building_blocks`, `repo_relationships`, `list_flags`, `repos_using`, `technology_usage`, `sql` (read-only). The skill in [`.claude/skills/repo-catalog`](.claude/skills/repo-catalog/SKILL.md) teaches an agent how to use them for prior-art searches.
 
 ## Running it on a schedule
 

@@ -1,5 +1,5 @@
 import MiniSearch from "minisearch";
-import type { Asset, Repo } from "./types";
+import type { Asset, Block, Repo } from "./types";
 
 /**
  * Query language shared by both views: free text plus `key:value` filters.
@@ -86,6 +86,10 @@ export const REPO_FILTERS: Record<string, FilterDef<Repo>> = {
     exact: true, help: "archived, fork, monorepo, private, public",
   },
   minscore: { get: () => null, min: (r) => r.practices.score, help: "minimum practices score (0-100)" },
+  flag: { get: (r) => r.flags.map((f) => f.id), exact: true, help: "finding id, e.g. committed-secret, eol-runtime" },
+  sev: { get: (r) => r.flags.map((f) => f.severity), exact: true, help: "has a finding of severity high, medium or low" },
+  reuse: { get: (r) => r.reusables.map((x) => x.kind), exact: true, help: "ships a building block: action, terraform-module, helm-chart, api…" },
+  usedby: { get: (r) => (r.used_by.length ? "yes" : "no"), exact: true, help: "other org repos depend on it (yes/no)" },
 };
 
 export const ASSET_FILTERS: Record<string, FilterDef<Asset>> = {
@@ -99,6 +103,17 @@ export const ASSET_FILTERS: Record<string, FilterDef<Asset>> = {
   scope: { get: (a) => a.scope, exact: true, help: "repo, plugin" },
   dup: { get: (a) => (a.duplicates.length ? "yes" : "no"), exact: true, help: "has copies elsewhere (yes/no)" },
   minq: { get: () => null, min: (a) => a.quality_score, help: "minimum quality score (0-100)" },
+  flag: { get: (a) => a.flags.map((f) => f.id), exact: true, help: "governance finding id, e.g. mcp-unpinned-package" },
+  sev: { get: (a) => a.flags.map((f) => f.severity), exact: true, help: "has a finding of severity high, medium or low" },
+};
+
+export const BLOCK_FILTERS: Record<string, FilterDef<Block>> = {
+  kind: { get: (b) => b.kind, exact: true, help: "action, reusable-workflow, terraform-module, helm-chart, template, api, config-package" },
+  repo: { get: (b) => [b.repo, b.repo.split("/")[1]], exact: true, help: "repository" },
+  lang: { get: (b) => b.repoRef.stack.primary_language, exact: true, help: "primary language of the repo" },
+  format: { get: (b) => String(b.details.format ?? b.details.engine ?? b.details.using ?? "").split(" ")[0], exact: true, help: "openapi, grpc, graphql, cookiecutter, composite…" },
+  grade: { get: (b) => b.repoRef.practices.grade, exact: true, help: "practices grade of the repo" },
+  lifecycle: { get: (b) => b.repoRef.lifecycle, exact: true, help: "active, maintained, stale, archived" },
 };
 
 function matches<T>(item: T, f: Filter, defs: Record<string, FilterDef<T>>): boolean {
@@ -188,7 +203,25 @@ export function assetIndex(): MiniSearch<Asset> {
   return ms;
 }
 
-/** Rank by text relevance (falling back to OR when AND finds nothing), then filter. */
+export function blockIndex(): MiniSearch<Block> {
+  return new MiniSearch<Block>({
+    idField: "id",
+    fields: ["name", "description", "details", "repo", "path"],
+    extractField: (b, field) => {
+      switch (field) {
+        case "id": return b.id;
+        case "name": return `${b.name} ${b.kind}`.replace(/[-_/]/g, " ");
+        case "description": return [b.description, b.repoRef.summary.one_liner].filter(Boolean).join(" ");
+        case "details": return JSON.stringify(b.details).replace(/[{}[\]",:_-]/g, " ");
+        case "repo": return b.repo;
+        case "path": return b.path.replace(/[/._-]/g, " ");
+        default: return "";
+      }
+    },
+    searchOptions: { boost: { name: 4, description: 3, details: 1.5, path: 1 }, prefix: true, fuzzy: 0.15, combineWith: "AND" },
+  });
+}
+
 /** A search index filled in the background, in chunks, so large catalogs never freeze the UI. */
 export class LazyIndex<T> {
   ready = false;

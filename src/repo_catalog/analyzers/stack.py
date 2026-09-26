@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import Any, cast
 
 from ..fs import RepoFiles
 from ..models import Package, Stack, Structure
@@ -174,7 +175,7 @@ def analyze_stack(files: RepoFiles, manifests: ManifestResult) -> StackResult:
         languages=langs[:15],
         runtimes=manifests.runtimes,
         package_managers=sorted(manifests.package_managers),
-        **{f: col.values[f] for f in _STACK_FIELDS},
+        **cast(dict[str, Any], {f: col.values[f] for f in _STACK_FIELDS}),
     )
     structure = _structure(files, manifests, stack, total_lines, core)
     caps = col.capabilities

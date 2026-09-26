@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 
 from . import __version__
+from .analyzers.org import link_org
 from .github import GitHubClient, GitHubError, RepoRef
 from .models import AIAsset, Repo
 from .outputs import exports, store
@@ -111,6 +112,33 @@ def _parser() -> argparse.ArgumentParser:
     q.add_argument("--limit", type=int, default=15)
     q.add_argument("--out", type=Path, default=Path("data"))
     q.set_defaults(func=cmd_search)
+
+    bl = sub.add_parser("blocks", help="Find reusable building blocks (actions, modules...).")
+    bl.add_argument("query", nargs="?", default="")
+    bl.add_argument(
+        "--kind",
+        choices=[
+            "action",
+            "reusable-workflow",
+            "terraform-module",
+            "helm-chart",
+            "template",
+            "api",
+            "config-package",
+        ],
+    )
+    bl.add_argument("--limit", type=_positive, default=20)
+    bl.add_argument("--out", type=Path, default=Path("data"))
+    bl.set_defaults(func=cmd_blocks)
+
+    fl = sub.add_parser("flags", help="List security, maintenance and AI-governance findings.")
+    fl.add_argument("--severity", choices=["high", "medium", "low"])
+    fl.add_argument("--category", choices=["security", "maintenance", "ownership", "ai-governance"])
+    fl.add_argument("--id", dest="flag_id", help="e.g. committed-secret, eol-runtime")
+    fl.add_argument("--repo")
+    fl.add_argument("--limit", type=_positive, default=100)
+    fl.add_argument("--out", type=Path, default=Path("data"))
+    fl.set_defaults(func=cmd_flags)
 
     sql = sub.add_parser("sql", help="Run a read-only SQL query against catalog.db.")
     sql.add_argument("query")
@@ -323,6 +351,7 @@ def _build(out: Path, source: str, llm: bool) -> None:
         a for r in repos for a in sorted(prev[r.id][1], key=lambda a: (a.kind, a.path))
     ]
     mark_duplicates(assets)
+    link_org(repos, assets)
     llm = llm or any(r.summary.source == "llm" for r in repos)
     meta = store.write_aggregates(out, repos, assets, source, llm)
     build_sqlite(out / DB_FILE, repos, assets, dump_meta(meta.model_dump(mode="json")))
@@ -345,6 +374,29 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     con = _connect(args.out)
     rows = (search_assets if args.assets else search_repos)(con, args.query, limit=args.limit)
+    print(json.dumps(rows, indent=2))
+    return 0
+
+
+def cmd_blocks(args: argparse.Namespace) -> int:
+    from .query import find_building_blocks
+
+    rows = find_building_blocks(_connect(args.out), args.query, kind=args.kind, limit=args.limit)
+    print(json.dumps(rows, indent=2))
+    return 0
+
+
+def cmd_flags(args: argparse.Namespace) -> int:
+    from .query import list_flags
+
+    rows = list_flags(
+        _connect(args.out),
+        severity=args.severity,
+        category=args.category,
+        flag_id=args.flag_id,
+        repo=args.repo,
+        limit=args.limit,
+    )
     print(json.dumps(rows, indent=2))
     return 0
 

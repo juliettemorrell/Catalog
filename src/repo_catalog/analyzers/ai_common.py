@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from ..models import AIAsset, AssetFile
+from ..models import AIAsset, AssetFile, Flag
 from ..textutil import load_yaml, redact_secrets, sanitize_config
 
 MAX_CONTENT = 100_000
@@ -144,6 +144,10 @@ class AssetDraft:
     line: int | None = None
 
     def build(self, ctx: RepoContext) -> AIAsset:
+        from .flags import find_secrets  # local import: flags depends on manifests
+
+        raw = "\n".join(x for x in (self.text, self.body, self.description) if x)
+        leak = next(iter(find_secrets(raw)), None)
         text = redact_secrets(self.text or "")
         body = redact_secrets(self.body) if self.body is not None else text
         if EXAMPLE_PATH.search(self.path) and "example" not in self.tags:
@@ -184,6 +188,16 @@ class AssetDraft:
             token_estimate=len(text) // 4,
             content_sha=hashlib.sha256(text.encode()).hexdigest() if text else None,
         )
+        if leak:
+            asset.flags.append(
+                Flag(
+                    id="secret-in-asset",
+                    category="security",
+                    severity="high",
+                    message=f"{leak[0]} committed in this file (redacted here); rotate it",
+                    path=self.path,
+                )
+            )
         score_asset(asset, body)
         return asset
 

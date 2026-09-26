@@ -1,7 +1,7 @@
 ---
 name: repo-catalog
 description: Search the org-wide repository catalog and AI asset library for prior art. Use when planning or implementing a change and you want existing code, services, libraries, skills, prompts or MCP servers to reuse, or to learn how the org usually builds something (standard stack, conventions, owners).
-allowed-tools: mcp__repo-catalog__search_repos mcp__repo-catalog__get_repo mcp__repo-catalog__search_ai_assets mcp__repo-catalog__get_ai_asset mcp__repo-catalog__repos_using mcp__repo-catalog__technology_usage mcp__repo-catalog__sql
+allowed-tools: mcp__repo-catalog__search_repos mcp__repo-catalog__get_repo mcp__repo-catalog__search_ai_assets mcp__repo-catalog__get_ai_asset mcp__repo-catalog__repos_using mcp__repo-catalog__technology_usage mcp__repo-catalog__find_building_blocks mcp__repo-catalog__repo_relationships mcp__repo-catalog__list_flags mcp__repo-catalog__sql
 ---
 
 # Repo catalog: finding prior art
@@ -15,11 +15,13 @@ The `repo-catalog` MCP server exposes a catalog of every repository in the org a
    - `search_repos(query_text=..., capability=..., technology=..., language=...)` returns candidates with their purpose and practices score.
    - `repos_using(technology="stripe")` shows every repo that depends on a library or framework.
    - `technology_usage(category="frameworks")` shows what the org standardizes on. Prefer the majority choice unless there's a reason not to.
+   - `find_building_blocks(query_text=..., kind=...)` finds GitHub Actions, reusable workflows, Terraform modules, Helm charts, templates and APIs to adopt instead of writing CI/CD, infrastructure or clients from scratch.
 3. **Inspect the best 2–3 candidates** with `get_repo(repo_id)`. Look at `summary.reuse_notes`, `structure.packages` (importable libraries), `structure.entrypoints` and `api_specs`, and `practices` (prefer grade A/B, active lifecycle). The owners are in `declared.owner` and `ownership.codeowners`.
 4. **For AI work**, check the asset library first:
    - `search_ai_assets(query_text=..., kind="skill" | "agent" | "prompt" | "mcp-server" | "instructions")`
    - `get_ai_asset(id)` returns the full content, so you can reuse or adapt it. Prefer high `quality_score`. `duplicates` shows where a copy already lives.
-5. **Report** what you found: repo, path, permalink `url`, why it fits, and any caveats (stale, low score, different stack). If nothing fits, say so explicitly before building new.
+5. **Check risk before reusing.** `get_repo` includes `flags` (committed secrets, end-of-life runtimes, retired models, workflow injection…); `list_flags(repo=...)` lists them. Don't copy code with open high-severity findings without saying so. `repo_relationships(repo_id)` shows who depends on a repo, which is the blast radius of changing it.
+6. **Report** what you found: repo, path, permalink `url`, why it fits, and any caveats (stale, low score, different stack). If nothing fits, say so explicitly before building new.
 
 ## Tips
 

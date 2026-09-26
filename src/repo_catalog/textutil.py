@@ -137,7 +137,7 @@ _BEARER = re.compile(
     r"(?i)((?:bearer|basic)\s+|(?:api[_-]?key|token|secret|password|passwd|pwd)[\"']?\s*[:=]\s*[\"']?)"
     r"([A-Za-z0-9._~+/\-]{16,}=*)"
 )
-_SECRET_NAME = re.compile(r"(?i)(key|token|secret|password|passwd|pwd|credential|auth)")
+SECRET_NAME = re.compile(r"(?i)(key|token|secret|password|passwd|pwd|credential|auth)")
 _SENSITIVE_KEYS = {"env", "headers", "http_headers", "environment", "secrets", "requestinit"}
 
 
@@ -183,7 +183,7 @@ def redact_args(args: list[Any]) -> list[str]:
             out.append("[REDACTED]")
             mask_next = False
             continue
-        if a.startswith("-") and _SECRET_NAME.search(a):
+        if a.startswith("-") and SECRET_NAME.search(a):
             if "=" in a:
                 out.append(a.split("=", 1)[0] + "=[REDACTED]")
             else:
@@ -191,7 +191,7 @@ def redact_args(args: list[Any]) -> list[str]:
                 mask_next = True
             continue
         key, eq, _ = a.partition("=")
-        if eq and _SECRET_NAME.search(key) and not key.startswith(("http", "/")):
+        if eq and SECRET_NAME.search(key) and not key.startswith(("http", "/")):
             out.append(f"{key}=[REDACTED]")
         elif re.match(r"^[a-z]+://", a):
             out.append(redact_url(a))
@@ -212,7 +212,7 @@ def sanitize_config(obj: Any, depth: int = 0) -> Any:
                 clean[str(k)] = sorted(str(x) for x in v)  # names only
             elif str(k).lower() == "args" and isinstance(v, list):
                 clean[str(k)] = redact_args(v)
-            elif isinstance(v, str) and _SECRET_NAME.search(str(k)) and len(v) >= 8:
+            elif isinstance(v, str) and SECRET_NAME.search(str(k)) and len(v) >= 8:
                 clean[str(k)] = "[REDACTED]"
             else:
                 clean[str(k)] = sanitize_config(v, depth + 1)

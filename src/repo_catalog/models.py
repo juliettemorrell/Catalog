@@ -51,12 +51,21 @@ class LanguageStat(_Model):
     percent: float
 
 
+class RuntimeVersion(_Model):
+    """A concrete runtime version the repo pins (Dockerfile, version file, CI, manifest)."""
+
+    runtime: str  # python, node, java, dotnet, go, ruby, php
+    version: str  # as written, e.g. "3.8", "18", "net6.0"
+    path: str
+
+
 class Stack(_Model):
     primary_language: str | None = None
     languages: list[LanguageStat] = Field(default_factory=list)
     frameworks: list[str] = Field(default_factory=list)
     libraries: list[str] = Field(default_factory=list)  # notable, curated libraries
     runtimes: dict[str, str] = Field(default_factory=dict)  # e.g. {"node": ">=20"}
+    runtime_versions: list[RuntimeVersion] = Field(default_factory=list)  # pinned versions
     package_managers: list[str] = Field(default_factory=list)
     build_tools: list[str] = Field(default_factory=list)
     testing: list[str] = Field(default_factory=list)
@@ -155,6 +164,56 @@ class Declared(_Model):
     custom_properties: dict[str, Any] = Field(default_factory=dict)
 
 
+Severity = Literal["high", "medium", "low"]
+
+
+class Flag(_Model):
+    """Something worth a human's attention: a risk, a gap or upcoming maintenance.
+
+    Flags never carry secret values: only what was found, and where."""
+
+    id: str  # e.g. "committed-secret", "eol-runtime", "mcp-unpinned-package"
+    category: Literal["security", "maintenance", "ownership", "ai-governance"]
+    severity: Severity
+    message: str
+    path: str | None = None
+    line: int | None = None
+
+
+ReusableKind = Literal[
+    "action",  # GitHub Action (action.yml)
+    "reusable-workflow",  # workflow with on: workflow_call
+    "terraform-module",
+    "helm-chart",
+    "template",  # cookiecutter / copier / Backstage scaffolder / GitHub template repo
+    "api",  # OpenAPI / AsyncAPI / GraphQL / protobuf contract
+    "config-package",  # shared lint/format/tsconfig presets
+]
+
+
+class Reusable(_Model):
+    """A building block other teams can adopt as-is."""
+
+    kind: ReusableKind
+    name: str
+    path: str
+    description: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)  # inputs, operations, version...
+
+
+class CrossRef(_Model):
+    """A reference from this repo to code in another repository (resolved org-wide)."""
+
+    kind: Literal["action", "reusable-workflow", "terraform", "go-module", "git", "container"]
+    target: str  # owner/repo (lowercase) or image name
+    path: str  # where the reference is
+
+
+class RepoLink(_Model):
+    repo: str  # owner/name
+    via: str  # e.g. "npm @acme/ui", "action acme/setup-env"
+
+
 class Repo(_Model):
     """One entry in the general catalog."""
 
@@ -187,6 +246,12 @@ class Repo(_Model):
     practices: Practices = Field(default_factory=Practices)
     ownership: Ownership = Field(default_factory=Ownership)
     ai: AIUsageSummary = Field(default_factory=AIUsageSummary)
+    flags: list[Flag] = Field(default_factory=list)
+    reusables: list[Reusable] = Field(default_factory=list)
+    references: list[CrossRef] = Field(default_factory=list)
+    # org-wide, filled when the catalog is built (not stored in per-repo files)
+    depends_on: list[RepoLink] = Field(default_factory=list)
+    used_by: list[RepoLink] = Field(default_factory=list)
     scanned_at: datetime
     scanner_version: str
     scan_fingerprint: str | None = None  # scanner version + options that shape the output
@@ -265,6 +330,7 @@ class AIAsset(_Model):
     use_cases: list[str] = Field(default_factory=list)  # LLM-written
     category: str | None = None  # LLM-assigned, e.g. "code-review", "testing"
     duplicates: list[str] = Field(default_factory=list)  # ids of assets with same content
+    flags: list[Flag] = Field(default_factory=list)  # governance/risk findings
 
 
 class CatalogMeta(_Model):

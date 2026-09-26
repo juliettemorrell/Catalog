@@ -78,6 +78,39 @@
       "title": "Contributor",
       "type": "object"
     },
+    "CrossRef": {
+      "additionalProperties": false,
+      "description": "A reference from this repo to code in another repository (resolved org-wide).",
+      "properties": {
+        "kind": {
+          "enum": [
+            "action",
+            "reusable-workflow",
+            "terraform",
+            "go-module",
+            "git",
+            "container"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "target": {
+          "title": "Target",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "target",
+        "path"
+      ],
+      "title": "CrossRef",
+      "type": "object"
+    },
     "Declared": {
       "additionalProperties": false,
       "description": "Metadata a team declared themselves (Backstage/Cortex/OpsLevel/Compass files,\nGitHub custom properties). Treated as ground truth over inferred values.",
@@ -267,6 +300,71 @@
         "manifest"
       ],
       "title": "Dependency",
+      "type": "object"
+    },
+    "Flag": {
+      "additionalProperties": false,
+      "description": "Something worth a human's attention: a risk, a gap or upcoming maintenance.\n\nFlags never carry secret values: only what was found, and where.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "category": {
+          "enum": [
+            "security",
+            "maintenance",
+            "ownership",
+            "ai-governance"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line"
+        }
+      },
+      "required": [
+        "id",
+        "category",
+        "severity",
+        "message"
+      ],
+      "title": "Flag",
       "type": "object"
     },
     "LanguageStat": {
@@ -493,6 +591,101 @@
       "title": "Practices",
       "type": "object"
     },
+    "RepoLink": {
+      "additionalProperties": false,
+      "properties": {
+        "repo": {
+          "title": "Repo",
+          "type": "string"
+        },
+        "via": {
+          "title": "Via",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo",
+        "via"
+      ],
+      "title": "RepoLink",
+      "type": "object"
+    },
+    "Reusable": {
+      "additionalProperties": false,
+      "description": "A building block other teams can adopt as-is.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "action",
+            "reusable-workflow",
+            "terraform-module",
+            "helm-chart",
+            "template",
+            "api",
+            "config-package"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "details": {
+          "additionalProperties": true,
+          "title": "Details",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "name",
+        "path"
+      ],
+      "title": "Reusable",
+      "type": "object"
+    },
+    "RuntimeVersion": {
+      "additionalProperties": false,
+      "description": "A concrete runtime version the repo pins (Dockerfile, version file, CI, manifest).",
+      "properties": {
+        "runtime": {
+          "title": "Runtime",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "runtime",
+        "version",
+        "path"
+      ],
+      "title": "RuntimeVersion",
+      "type": "object"
+    },
     "Stack": {
       "additionalProperties": false,
       "properties": {
@@ -535,6 +728,13 @@
           },
           "title": "Runtimes",
           "type": "object"
+        },
+        "runtime_versions": {
+          "items": {
+            "$ref": "#/$defs/RuntimeVersion"
+          },
+          "title": "Runtime Versions",
+          "type": "array"
         },
         "package_managers": {
           "items": {
@@ -1002,6 +1202,41 @@
     },
     "ai": {
       "$ref": "#/$defs/AIUsageSummary"
+    },
+    "flags": {
+      "items": {
+        "$ref": "#/$defs/Flag"
+      },
+      "title": "Flags",
+      "type": "array"
+    },
+    "reusables": {
+      "items": {
+        "$ref": "#/$defs/Reusable"
+      },
+      "title": "Reusables",
+      "type": "array"
+    },
+    "references": {
+      "items": {
+        "$ref": "#/$defs/CrossRef"
+      },
+      "title": "References",
+      "type": "array"
+    },
+    "depends_on": {
+      "items": {
+        "$ref": "#/$defs/RepoLink"
+      },
+      "title": "Depends On",
+      "type": "array"
+    },
+    "used_by": {
+      "items": {
+        "$ref": "#/$defs/RepoLink"
+      },
+      "title": "Used By",
+      "type": "array"
     },
     "scanned_at": {
       "format": "date-time",

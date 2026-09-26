@@ -42,6 +42,12 @@ CREATE TABLE ai_assets (
 CREATE TABLE asset_tools (asset_id TEXT, tool TEXT);
 CREATE TABLE asset_models (asset_id TEXT, model TEXT);
 CREATE TABLE asset_tags (asset_id TEXT, tag TEXT);
+CREATE TABLE flags (repo_id TEXT, asset_id TEXT, flag_id TEXT, category TEXT,
+  severity TEXT, message TEXT, path TEXT, line INTEGER);
+CREATE TABLE reusables (repo_id TEXT, kind TEXT, name TEXT, path TEXT, description TEXT,
+  details TEXT);
+CREATE TABLE repo_links (repo_id TEXT, depends_on TEXT, via TEXT);
+CREATE TABLE runtime_versions (repo_id TEXT, runtime TEXT, version TEXT, path TEXT);
 CREATE VIRTUAL TABLE repos_fts USING fts5(
   id UNINDEXED, name, description, summary, readme, tech, capabilities, topics,
   tokenize = 'unicode61 remove_diacritics 2');
@@ -54,6 +60,19 @@ CREATE INDEX idx_cap ON repo_capabilities(capability);
 CREATE INDEX idx_dep ON dependencies(name COLLATE NOCASE);
 CREATE INDEX idx_asset_kind ON ai_assets(kind, ecosystem);
 CREATE INDEX idx_asset_repo ON ai_assets(repo_id);
+CREATE INDEX idx_flags ON flags(flag_id, severity);
+CREATE INDEX idx_reusable ON reusables(kind);
+CREATE VIEW flag_summary AS
+  SELECT flag_id, category, severity, COUNT(*) AS findings,
+         COUNT(DISTINCT repo_id) AS repo_count
+  FROM flags GROUP BY flag_id, category, severity ORDER BY
+  CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, findings DESC;
+CREATE VIEW dependency_versions AS
+  SELECT ecosystem, name, COUNT(DISTINCT repo_id) AS repo_count,
+         COUNT(DISTINCT version) AS version_count, GROUP_CONCAT(DISTINCT version) AS versions
+  FROM dependencies WHERE version IS NOT NULL AND scope != 'transitive'
+  GROUP BY ecosystem, name HAVING COUNT(DISTINCT repo_id) > 1
+  ORDER BY version_count DESC, repo_count DESC;
 CREATE VIEW tech_usage AS
   SELECT category, name, COUNT(DISTINCT repo_id) AS repo_count
   FROM repo_tech GROUP BY category, name ORDER BY repo_count DESC;
@@ -167,6 +186,24 @@ def _insert_repo(con: sqlite3.Connection, r: Repo) -> None:
             for c in r.practices.checks
         ],
     )
+    con.executemany(
+        "INSERT INTO flags VALUES (?,?,?,?,?,?,?,?)",
+        [(r.id, None, f.id, f.category, f.severity, f.message, f.path, f.line) for f in r.flags],
+    )
+    con.executemany(
+        "INSERT INTO reusables VALUES (?,?,?,?,?,?)",
+        [
+            (r.id, x.kind, x.name, x.path, x.description, json.dumps(x.details, sort_keys=True))
+            for x in r.reusables
+        ],
+    )
+    con.executemany(
+        "INSERT INTO repo_links VALUES (?,?,?)", [(r.id, ln.repo, ln.via) for ln in r.depends_on]
+    )
+    con.executemany(
+        "INSERT INTO runtime_versions VALUES (?,?,?,?)",
+        [(r.id, v.runtime, v.version, v.path) for v in r.stack.runtime_versions],
+    )
     con.execute(
         "INSERT INTO repos_fts VALUES (?,?,?,?,?,?,?,?)",
         (
@@ -212,6 +249,10 @@ def _insert_asset(con: sqlite3.Connection, a: AIAsset) -> None:
             a.content,
             a.model_dump_json(exclude={"content"}),
         ),
+    )
+    con.executemany(
+        "INSERT INTO flags VALUES (?,?,?,?,?,?,?,?)",
+        [(a.repo, a.id, f.id, f.category, f.severity, f.message, f.path, f.line) for f in a.flags],
     )
     con.executemany("INSERT INTO asset_tools VALUES (?,?)", [(a.id, t) for t in a.tools])
     con.executemany("INSERT INTO asset_models VALUES (?,?)", [(a.id, m) for m in a.models])

@@ -1,12 +1,13 @@
 import "./styles.css";
 import {
-  ASSET_FILTERS, LazyIndex, REPO_FILTERS, assetIndex, hasFilter, parseQuery, repoIndex, resolveQuery,
-  runSearch, toggleFilter,
+  ASSET_FILTERS, BLOCK_FILTERS, LazyIndex, REPO_FILTERS, assetIndex, blockIndex, hasFilter, parseQuery,
+  repoIndex, resolveQuery, runSearch, toggleFilter,
 } from "./search";
-import type { Asset, Catalog, Repo } from "./types";
+import type { Asset, Block, Catalog, Flag, Repo } from "./types";
 import { chips, copyText, countBy, downloadCsv, esc, fmtNum, markdown, num, relTime, safeUrl } from "./util";
 
-type Tab = "repos" | "assets" | "insights";
+type Tab = "repos" | "assets" | "blocks" | "insights";
+const TABS: Tab[] = ["repos", "assets", "blocks", "insights"];
 interface State { tab: Tab; q: string; open: string | null }
 
 const PAGE = 60;
@@ -15,7 +16,24 @@ const KIND_LABEL: Record<string, string> = {
   "mcp-server": "MCP server", "mcp-config": "MCP config", hook: "Hook", plugin: "Plugin", eval: "Eval",
   workflow: "Workflow", "sdk-usage": "LLM SDK usage",
 };
-const TAB_TITLE: Record<Tab, string> = { repos: "Repositories", assets: "AI Asset Library", insights: "Insights" };
+const TAB_TITLE: Record<Tab, string> = { repos: "Repositories", assets: "AI Asset Library", blocks: "Building blocks", insights: "Insights" };
+const BLOCK_LABEL: Record<string, string> = {
+  action: "GitHub Action", "reusable-workflow": "Reusable workflow", "terraform-module": "Terraform module",
+  "helm-chart": "Helm chart", template: "Template", api: "API", "config-package": "Config package",
+};
+const FLAG_LABEL: Record<string, string> = {
+  "committed-secret": "Committed secret", "secret-in-asset": "Secret in AI file", "eol-runtime": "End-of-life runtime",
+  "deprecated-model": "Retired / deprecated model", "workflow-script-injection": "Workflow script injection",
+  "workflow-pwn-request": "Untrusted PR checkout", "docker-unpinned-base": "Unpinned base image",
+  "docker-runs-as-root": "Container runs as root", "no-owner": "No owner", "single-maintainer": "Bus factor 1",
+  "depends-on-archived": "Depends on archived repo", "ai-permissions-bypassed": "Agent approvals disabled",
+  "ai-unrestricted-shell": "Unrestricted agent shell", "ai-remote-code-exec": "curl | sh in AI config",
+  "ai-mcp-auto-enabled": "MCP servers auto-enabled", "ai-personal-settings-committed": "Personal AI settings committed",
+  "mcp-unpinned-package": "Unpinned MCP package", "mcp-inline-secret": "Secret in MCP config",
+  "mcp-plaintext-http": "MCP over plain HTTP",
+};
+const SEV_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+const flagLabel = (id: string) => FLAG_LABEL[id] ?? id;
 const GRADES = new Set(["A", "B", "C", "D", "F"]);
 const STACK_ROWS: [keyof Repo["stack"], string, string][] = [
   ["frameworks", "Frameworks", "fw"], ["libraries", "Libraries", "tech"], ["databases", "Data", "data"],
@@ -28,6 +46,9 @@ const STACK_ROWS: [keyof Repo["stack"], string, string][] = [
 let catalog: Catalog;
 let repoIdx: LazyIndex<Repo>;
 let assetIdx: LazyIndex<Asset>;
+let blockIdx: LazyIndex<Block>;
+let blocks: Block[] = [];
+let blocksById = new Map<string, Block>();
 let assetsById = new Map<string, Asset>();
 let reposById = new Map<string, Repo>();
 let shown = PAGE;
@@ -48,7 +69,7 @@ function onIndexReady(): void {
 function readState(): State {
   const [path = "", query = ""] = location.hash.replace(/^#\/?/, "").split("?");
   const params = new URLSearchParams(query);
-  const tab = (["repos", "assets", "insights"].includes(path) ? path : "repos") as Tab;
+  const tab = (TABS as string[]).includes(path) ? (path as Tab) : "repos";
   return { tab, q: params.get("q") ?? "", open: params.get("open") };
 }
 
@@ -83,13 +104,21 @@ async function load(): Promise<void> {
       and <code>data/ai-assets.json</code>, then reload.</p><p class="muted">${esc(err)}</p></div>`;
     return;
   }
+  for (const r of catalog.repos) { // catalogs from older scanner versions lack these fields
+    r.flags ??= []; r.reusables ??= []; r.depends_on ??= []; r.used_by ??= [];
+    r.stack.runtime_versions ??= [];
+  }
+  for (const a of catalog.assets) a.flags ??= [];
+  blocks = catalog.repos.flatMap((r) => r.reusables.map((x, i) => ({ ...x, id: `${r.id}::${i}`, repo: r.id, repoRef: r })));
   reposById = new Map(catalog.repos.map((r) => [r.id, r]));
   assetsById = new Map(catalog.assets.map((a) => [a.id, a]));
+  blocksById = new Map(blocks.map((b) => [b.id, b]));
   repoIdx = new LazyIndex(repoIndex(), catalog.repos, onIndexReady);
   assetIdx = new LazyIndex(assetIndex(), catalog.assets, onIndexReady);
+  blockIdx = new LazyIndex(blockIndex(), blocks, onIndexReady);
   render();
   // build search indexes after first paint, repos first (smaller, default tab)
-  setTimeout(() => void repoIdx.start().then(() => assetIdx.start()), 50);
+  setTimeout(() => void repoIdx.start().then(() => blockIdx.start()).then(() => assetIdx.start()), 50);
 }
 
 async function fetchJson(url: string) {
@@ -131,26 +160,59 @@ function render(force = false): void {
   }
 }
 
+interface ListView {
+  results: unknown[]; total: number; noun: string; placeholder: string; examples: string[];
+  defs: Record<string, { help: string }>; idx: LazyIndex<never> | LazyIndex<Repo> | LazyIndex<Asset> | LazyIndex<Block>;
+  facets: string; card: (item: never) => string; csv: () => boolean;
+}
+
+function listView(tab: Tab, q: ReturnType<typeof resolveQuery>, raw: string): ListView {
+  if (tab === "repos") {
+    const results = runSearch(catalog.repos, repoIdx, q, REPO_FILTERS,
+      (a, b) => (b.pushed_at ?? "").localeCompare(a.pushed_at ?? ""));
+    return {
+      results, total: catalog.repos.length, noun: "repositories", defs: REPO_FILTERS, idx: repoIdx,
+      placeholder: "Search repos: what they do, stack, capabilities…",
+      examples: ["payments", "lang:python fw:fastapi", "type:service missing:tests", "sev:high", "usedby:yes"],
+      facets: repoFacets(results, raw), card: repoCard as (x: never) => string,
+      csv: () => downloadCsv("repos.csv", results.map(repoRow)),
+    };
+  }
+  if (tab === "blocks") {
+    const results = runSearch(blocks, blockIdx, q, BLOCK_FILTERS,
+      (a, b) => a.kind.localeCompare(b.kind) || num(b.repoRef.practices.score) - num(a.repoRef.practices.score) || a.name.localeCompare(b.name));
+    return {
+      results, total: blocks.length, noun: "building blocks", defs: BLOCK_FILTERS, idx: blockIdx,
+      placeholder: "Search actions, reusable workflows, Terraform modules, Helm charts, templates, APIs…",
+      examples: ["kind:terraform-module", "deploy", "kind:action release", "kind:api format:openapi", "kind:template"],
+      facets: blockFacets(results, raw), card: blockCard as (x: never) => string,
+      csv: () => downloadCsv("building-blocks.csv", results.map(blockRow)),
+    };
+  }
+  const results = runSearch(catalog.assets, assetIdx, q, ASSET_FILTERS,
+    (a, b) => num(b.quality_score) - num(a.quality_score) || a.name.localeCompare(b.name));
+  return {
+    results, total: catalog.assets.length, noun: "AI assets", defs: ASSET_FILTERS, idx: assetIdx,
+    placeholder: "Search skills, agents, prompts, rules, MCP servers…",
+    examples: ["kind:skill", "code review", "kind:mcp-server", "eco:cursor", "kind:prompt minq:60", "sev:high"],
+    facets: assetFacets(results, raw), card: assetCard as (x: never) => string,
+    csv: () => downloadCsv("ai-assets.csv", results.map(assetRow)),
+  };
+}
+
 function renderSearch(state: State): void {
-  const isRepos = state.tab === "repos";
-  const q = resolveQuery(parseQuery(state.q), isRepos ? REPO_FILTERS : ASSET_FILTERS);
-  const results: (Repo | Asset)[] = isRepos
-    ? runSearch(catalog.repos, repoIdx, q, REPO_FILTERS,
-      (a, b) => (b.pushed_at ?? "").localeCompare(a.pushed_at ?? ""))
-    : runSearch(catalog.assets, assetIdx, q, ASSET_FILTERS,
-      (a, b) => num(b.quality_score) - num(a.quality_score) || a.name.localeCompare(b.name));
+  const defsFor = state.tab === "repos" ? REPO_FILTERS : state.tab === "blocks" ? BLOCK_FILTERS : ASSET_FILTERS;
+  const q = resolveQuery(parseQuery(state.q), defsFor);
+  const view = listView(state.tab, q, state.q);
+  const results = view.results as never[];
 
   const existing = document.getElementById("q") as HTMLInputElement | null;
   const keepFocus = existing && document.activeElement === existing;
   const sel = existing ? [existing.selectionStart, existing.selectionEnd, existing.selectionDirection] as const : null;
 
-  const examples = isRepos
-    ? ["payments", "lang:python fw:fastapi", "type:service missing:tests", "cap:pdf", "ai:yes uses:anthropic"]
-    : ["kind:skill", "code review", "kind:mcp-server", "eco:cursor", "kind:prompt minq:60", "dup:yes"];
-  const defs: Record<string, { help: string }> = isRepos ? REPO_FILTERS : ASSET_FILTERS;
+  const { examples, defs, idx } = view;
   const help = Object.entries(defs).map(([k, d]) => `<li><code>${k}:</code> ${esc(d.help)}</li>`).join("")
     + "<li>Prefix with <code>-</code> to exclude. Repeat a key to OR values. Quote values with spaces.</li>";
-  const idx = isRepos ? repoIdx : assetIdx;
   const indexing = q.text.trim() && !idx.ready
     ? `<p class="notice" role="status">Building the search index (${Math.round(idx.progress * 100)}%). Showing exact matches until it is ready.</p>`
     : "";
@@ -161,15 +223,15 @@ function renderSearch(state: State): void {
   $main.innerHTML = `
     <h1 class="sr-only">${esc(TAB_TITLE[state.tab])}</h1>
     <section class="search">
-      <label class="sr-only" for="q">Search ${isRepos ? "repositories" : "AI assets"}</label>
+      <label class="sr-only" for="q">Search ${view.noun}</label>
       <div class="search-box">
         <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
         <input id="q" type="search" autocomplete="off" spellcheck="false" value="${esc(state.q)}"
-          placeholder="${isRepos ? "Search repos: what they do, stack, capabilities…" : "Search skills, agents, prompts, rules, MCP servers…"}" />
+          placeholder="${esc(view.placeholder)}" />
         <kbd aria-hidden="true">/</kbd>
       </div>
       <div class="search-meta">
-        <span><strong>${fmtNum(results.length)}</strong> of ${fmtNum(isRepos ? catalog.repos.length : catalog.assets.length)} ${isRepos ? "repositories" : "AI assets"}</span>
+        <span><strong>${fmtNum(results.length)}</strong> of ${fmtNum(view.total)} ${view.noun}</span>
         <span class="examples">Try ${examples.map((e) => `<a href="${esc(href({ q: e, open: null }))}">${esc(e)}</a>`).join(" ")}</span>
         <details class="help"><summary>Query syntax</summary><ul>${help}</ul></details>
         <button type="button" class="btn-link" id="csv" ${results.length ? "" : "disabled"}>Export CSV</button>
@@ -177,9 +239,9 @@ function renderSearch(state: State): void {
       ${unknown}${indexing}
     </section>
     <div class="layout">
-      <aside class="facets" aria-label="Filters">${isRepos ? repoFacets(results as Repo[], state.q) : assetFacets(results as Asset[], state.q)}</aside>
+      <aside class="facets" aria-label="Filters">${view.facets}</aside>
       <section class="results" aria-live="polite" aria-label="Results">
-        ${results.length ? results.slice(0, shown).map((r) => (isRepos ? repoCard(r as Repo) : assetCard(r as Asset))).join("")
+        ${results.length ? results.slice(0, shown).map(view.card).join("")
           : `<div class="empty"><h2>No matches</h2><p>Remove a filter or try broader words.</p></div>`}
         ${results.length > shown ? `<button type="button" class="more-btn" id="more" data-focus="more">Show ${Math.min(PAGE, results.length - shown)} more</button>` : ""}
       </section>
@@ -200,10 +262,7 @@ function renderSearch(state: State): void {
     render(true);
     document.getElementById("more")?.focus();
   });
-  document.getElementById("csv")?.addEventListener("click", () => {
-    if (isRepos) downloadCsv("repos.csv", (results as Repo[]).map(repoRow));
-    else downloadCsv("ai-assets.csv", (results as Asset[]).map(assetRow));
-  });
+  document.getElementById("csv")?.addEventListener("click", () => view.csv());
   document.querySelector(".facets")?.addEventListener("click", (e) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-more]");
     if (!btn) return;
@@ -241,6 +300,10 @@ function repoFacets(rs: Repo[], q: string): string {
     facetGroup("Practices grade", "grade", countBy(rs, (r) => r.practices.grade).sort((a, b) => a[0].localeCompare(b[0])), q),
     facetGroup("Missing practice", "missing", countBy(rs, (r) => r.practices.checks.filter((c) => !c.passed).map((c) => c.id)), q),
     facetGroup("Lifecycle", "lifecycle", countBy(rs, (r) => r.lifecycle), q),
+    facetGroup("Findings", "flag", countBy(rs, (r) => r.flags.map((f) => f.id)), q, 8, flagLabel),
+    facetGroup("Severity", "sev", countBy(rs, (r) => r.flags.map((f) => f.severity)).sort((a, b) => num(SEV_ORDER[a[0]]) - num(SEV_ORDER[b[0]])), q),
+    facetGroup("Ships building blocks", "reuse", countBy(rs, (r) => r.reusables.map((x) => x.kind)), q, 8, (v) => BLOCK_LABEL[v] ?? v),
+    facetGroup("Used by other repos", "usedby", countBy(rs, (r) => (r.used_by.length ? "yes" : "no")), q, 8, (v) => (v === "yes" ? "Yes" : "No")),
     facetGroup("Topic", "topic", countBy(rs, (r) => r.topics), q),
   ].join("");
 }
@@ -255,6 +318,18 @@ function assetFacets(as: Asset[], q: string): string {
     facetGroup("Models", "model", countBy(as, (a) => a.models), q),
     facetGroup("Confidence", "conf", countBy(as, (a) => a.confidence), q),
     facetGroup("Copied elsewhere", "dup", countBy(as, (a) => (a.duplicates.length ? "yes" : "no")), q, 8, (v) => (v === "yes" ? "Yes" : "No")),
+    facetGroup("Findings", "flag", countBy(as, (a) => a.flags.map((f) => f.id)), q, 8, flagLabel),
+  ].join("");
+}
+
+function blockFacets(bs: Block[], q: string): string {
+  return [
+    facetGroup("Kind", "kind", countBy(bs, (b) => b.kind), q, 8, (v) => BLOCK_LABEL[v] ?? v),
+    facetGroup("Format", "format", countBy(bs, (b) => String(b.details.format ?? b.details.engine ?? b.details.using ?? "").split(" ")[0]), q),
+    facetGroup("Repository", "repo", countBy(bs, (b) => b.repo), q, 8, (v) => v.split("/")[1] ?? v),
+    facetGroup("Repo language", "lang", countBy(bs, (b) => b.repoRef.stack.primary_language), q),
+    facetGroup("Repo grade", "grade", countBy(bs, (b) => b.repoRef.practices.grade).sort((a, b) => a[0].localeCompare(b[0])), q),
+    facetGroup("Repo lifecycle", "lifecycle", countBy(bs, (b) => b.repoRef.lifecycle), q),
   ].join("");
 }
 
@@ -282,6 +357,8 @@ function repoCard(r: Repo): string {
       ${s.primary_language ? `<span class="chip lang">${esc(s.primary_language)}</span>` : ""}
       ${chips([...s.frameworks, ...s.databases, ...s.cloud].slice(0, 6))}
       ${r.ai.has_ai ? `<span class="chip ai">AI · ${num(r.ai.asset_count)}</span>` : ""}
+      ${r.used_by.length ? `<span class="chip reuse">used by ${num(r.used_by.length)}</span>` : ""}
+      ${sevChip(r.flags)}
     </div>
     <footer class="muted"><span class="caps">${r.capabilities.slice(0, 5).map(esc).join(" · ")}</span><span class="spacer"></span><span class="when">updated ${relTime(r.ownership.last_commit ?? r.pushed_at)}</span></footer>
   </article>`;
@@ -299,8 +376,47 @@ function assetCard(a: Asset): string {
     <p class="blurb">${esc(blurb)}</p>
     <div class="chips"><span class="chip eco">${esc(a.ecosystem)}</span>${chips([...a.tools, ...a.models].slice(0, 5))}
       ${a.duplicates.length ? `<span class="chip">${a.duplicates.length} cop${a.duplicates.length > 1 ? "ies" : "y"}</span>` : ""}
-      ${a.confidence !== "high" ? `<span class="chip muted-chip">${esc(a.confidence)} confidence</span>` : ""}</div>
+      ${a.confidence !== "high" ? `<span class="chip muted-chip">${esc(a.confidence)} confidence</span>` : ""}${sevChip(a.flags)}</div>
     <footer class="muted"><span class="path">${esc(a.repo)} · ${esc(a.path)}</span><span class="spacer"></span><span class="when">${a.last_modified ? `edited ${relTime(a.last_modified)}` : ""}</span></footer>
+  </article>`;
+}
+
+/** Chip for the worst findings on a card, e.g. "2 high". */
+function sevChip(flags: Flag[]): string {
+  for (const sev of ["high", "medium"] as const) {
+    const n = flags.filter((f) => f.severity === sev).length;
+    if (n) return `<span class="chip sev-${sev}" title="${esc(flags.filter((f) => f.severity === sev).map((f) => flagLabel(f.id)).join(", "))}">${n} ${sev}</span>`;
+  }
+  return "";
+}
+
+function blockSummary(b: Block): string {
+  const d = b.details;
+  const list = (v: unknown) => (Array.isArray(v) ? v.map(String) : []);
+  const parts: string[] = [];
+  if (d.format) parts.push(String(d.format));
+  if (d.engine) parts.push(String(d.engine));
+  if (d.using) parts.push(String(d.using));
+  if (typeof d.operations === "number") parts.push(`${num(d.operations)} operations`);
+  if (typeof d.variables === "number") parts.push(`${num(d.variables)} variables`);
+  else if (list(d.variables).length) parts.push(`${list(d.variables).length} variables`);
+  if (typeof d.outputs === "number") parts.push(`${num(d.outputs)} outputs`);
+  if (list(d.inputs).length) parts.push(`inputs: ${list(d.inputs).slice(0, 4).join(", ")}${list(d.inputs).length > 4 ? "…" : ""}`);
+  if (d.version) parts.push(`v${String(d.version)}`);
+  return parts.join(" · ");
+}
+
+function blockCard(b: Block): string {
+  const link = href({ open: b.id });
+  return `<article class="card">
+    <a class="card-link" href="${esc(link)}" data-focus="${esc(link)}" aria-label="Open ${esc(b.name)}"></a>
+    <header>
+      <div class="card-title"><span class="kind kind-block">${esc(BLOCK_LABEL[b.kind] ?? b.kind)}</span><h2>${esc(b.name)}</h2></div>
+      ${grade(b.repoRef.practices.grade, b.repoRef.practices.score)}
+    </header>
+    <p class="blurb">${esc(b.description ?? b.repoRef.summary.one_liner ?? "")}</p>
+    <div class="chips">${b.repoRef.stack.primary_language ? `<span class="chip lang">${esc(b.repoRef.stack.primary_language)}</span>` : ""}<span class="chip muted-chip">${esc(blockSummary(b))}</span></div>
+    <footer class="muted"><span class="path">${esc(b.repo)} · ${esc(b.path)}</span><span class="spacer"></span><span class="when">${esc(b.repoRef.lifecycle)}</span></footer>
   </article>`;
 }
 
@@ -309,7 +425,8 @@ function assetCard(a: Asset): string {
 function renderDrawer(state: State): void {
   const repo = state.open ? reposById.get(state.open) : undefined;
   const asset = state.open ? assetsById.get(state.open) : undefined;
-  const open = !!(repo || asset);
+  const block = state.open ? blocksById.get(state.open) : undefined;
+  const open = !!(repo || asset || block);
   const wasOpen = $drawer.classList.contains("open");
   $drawer.classList.toggle("open", open);
   $drawer.toggleAttribute("inert", !open);
@@ -325,7 +442,7 @@ function renderDrawer(state: State): void {
     return;
   }
   // focus guards at both ends keep Tab / Shift+Tab cycling inside the dialog
-  $drawer.innerHTML = `<span class="focus-guard" tabindex="0" data-guard="start"></span><button type="button" class="icon-btn close" aria-label="Close details">✕</button>${repo ? repoDetail(repo) : assetDetail(asset!)}<span class="focus-guard" tabindex="0" data-guard="end"></span>`;
+  $drawer.innerHTML = `<span class="focus-guard" tabindex="0" data-guard="start"></span><button type="button" class="icon-btn close" aria-label="Close details">✕</button>${repo ? repoDetail(repo) : block ? blockDetail(block) : assetDetail(asset!)}<span class="focus-guard" tabindex="0" data-guard="end"></span>`;
   $drawer.querySelectorAll<HTMLElement>("[data-guard]").forEach((guard) =>
     guard.addEventListener("focus", () => {
       const items = focusables();
@@ -394,10 +511,18 @@ function repoDetail(r: Repo): string {
       ${r.summary.key_features.length ? `<ul>${r.summary.key_features.map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : ""}
       ${r.summary.reuse_notes ? `<p class="callout"><strong>Reuse:</strong> ${esc(r.summary.reuse_notes)}</p>` : ""}
       ${r.summary.source === "llm" ? '<p class="muted small">Summary generated by Claude from the README and code facts.</p>' : ""}`)}
+    ${r.flags.length ? section(`Findings (${r.flags.length})`, flagList(r.flags, r)) : ""}
+    ${section(`Building blocks (${r.reusables.length})`, r.reusables.length ? `<ul class="mini-list">${r.reusables.map((x, i) =>
+      `<li><a href="${esc(href({ tab: "blocks", open: `${r.id}::${i}`, q: "" }))}"><span class="kind kind-block">${esc(BLOCK_LABEL[x.kind] ?? x.kind)}</span> ${esc(x.name)}</a> <span class="muted small">${esc(x.path)}</span></li>`).join("")}</ul>` : "")}
+    ${section("Relationships", kv([
+      ["Depends on", r.depends_on.map((l) => repoLink(l.repo, l.via)).join("<br>")],
+      ["Used by", r.used_by.map((l) => repoLink(l.repo, l.via)).join("<br>")],
+    ]))}
     ${section("Capabilities", `<div class="chips">${tagLinks([...r.capabilities, ...r.summary.domains], "cap")}</div>`)}
     ${section("Stack", `<dl class="kv">
       <dt>Languages</dt><dd>${s.languages.slice(0, 6).map((l) => `${esc(l.name)} <span class="muted">${num(l.percent)}%</span>`).join(", ") || "—"}</dd>
       ${Object.keys(s.runtimes).length ? `<dt>Runtimes</dt><dd>${Object.entries(s.runtimes).map(([k, v]) => `${esc(k)} ${esc(v)}`).join(", ")}</dd>` : ""}
+      ${s.runtime_versions.length ? `<dt>Pinned versions</dt><dd>${s.runtime_versions.slice(0, 12).map((v) => `${esc(v.runtime)} ${esc(v.version)} <span class="muted small">${esc(v.path)}</span>`).join("<br>")}</dd>` : ""}
       ${STACK_ROWS.filter(([k]) => (s[k] as string[]).length).map(([k, label, key]) => `<dt>${label}</dt><dd class="chips">${tagLinks(s[k] as string[], key)}</dd>`).join("")}
     </dl>`)}
     ${section(`Best practices · ${num(r.practices.score)}/100`, `<ul class="checks">${r.practices.checks.map((c) =>
@@ -448,6 +573,7 @@ function assetDetail(a: Asset): string {
         ${body ? '<button type="button" class="btn secondary" data-copy>Copy content</button>' : ""}
         <a class="btn secondary" href="${esc(href({ tab: "repos", open: a.repo, q: "" }))}">View repo</a></div>
     </div>
+    ${a.flags.length ? section(`Findings (${a.flags.length})`, flagList(a.flags, reposById.get(a.repo), "assets")) : ""}
     ${a.summary && a.description ? section("Description", `<p>${esc(a.description)}</p>`) : ""}
     ${a.use_cases.length ? section("Use cases", `<ul>${a.use_cases.map((u) => `<li>${esc(u)}</li>`).join("")}</ul>`) : ""}
     ${section("Details", kv([
@@ -470,12 +596,63 @@ function assetDetail(a: Asset): string {
     ${section("Content", `${a.content_truncated ? '<p class="muted small">Truncated; open on GitHub for the full file.</p>' : ""}${fm}${body ? rendered : '<p class="muted">No content captured.</p>'}`)}`;
 }
 
+function repoLink(id: string, via: string): string {
+  return `<a href="${esc(href({ tab: "repos", open: id, q: "" }))}">${esc(id)}</a> <span class="muted small">${esc(via)}</span>`;
+}
+
+function blobUrl(repo: Repo | undefined, path: string, line: number | null): string {
+  if (!repo) return "#";
+  const ref = (repo as Repo & { head_sha?: string | null }).head_sha || repo.default_branch || "HEAD";
+  const encoded = path.split("/").map(encodeURIComponent).join("/");
+  return safeUrl(`${repo.url}/blob/${encodeURIComponent(ref)}/${encoded}${line ? `#L${num(line)}` : ""}`);
+}
+
+function flagList(flags: Flag[], repo: Repo | undefined, tab: Tab = "repos"): string {
+  const sorted = [...flags].sort((a, b) => num(SEV_ORDER[a.severity]) - num(SEV_ORDER[b.severity]) || a.id.localeCompare(b.id));
+  return `<ul class="flag-list">${sorted.map((f) => {
+    const sev = f.severity in SEV_ORDER ? f.severity : "low";
+    const where = f.path
+      ? ` <a class="small" href="${esc(blobUrl(repo, f.path, f.line))}" target="_blank" rel="noopener noreferrer">${esc(f.path)}${f.line ? `:${num(f.line)}` : ""}</a>`
+      : "";
+    return `<li><span class="sev sev-${sev}">${sev}</span><span><strong>${esc(flagLabel(f.id))}</strong> · ${esc(f.message)}${where}
+      <a class="small muted" href="${esc(href({ tab, q: `flag:${f.id}`, open: null }))}">see all</a></span></li>`;
+  }).join("")}</ul>`;
+}
+
+function blockDetail(b: Block): string {
+  const d = b.details;
+  const isList = (v: unknown): v is unknown[] => Array.isArray(v);
+  const url = b.path === "." ? b.repoRef.url : blobUrl(b.repoRef, b.path, null).replace("/blob/", "/tree/");
+  const rows: [string, string | null][] = Object.entries(d)
+    .filter(([k, v]) => k !== "sample" && v !== null && v !== "" && !(isList(v) && !v.length))
+    .map(([k, v]) => [k.replace(/_/g, " "), isList(v) ? v.map((x) => `<code>${esc(x)}</code>`).join(" ") : esc(v)]);
+  const sample = isList(d.sample) && d.sample.length
+    ? section("Operations", `<ul class="mini-list">${d.sample.map((x) => `<li><code>${esc(x)}</code></li>`).join("")}</ul>${num(d.operations) > d.sample.length ? `<p class="muted small">…and ${num(d.operations) - d.sample.length} more</p>` : ""}`)
+    : "";
+  return `<div class="d-head">
+      <p class="eyebrow"><span class="kind kind-block">${esc(BLOCK_LABEL[b.kind] ?? b.kind)}</span> ${esc(b.repoRef.lifecycle)}</p>
+      <h2 id="drawer-title">${esc(b.name)}</h2>
+      <p class="lead">${esc(b.description ?? "")}</p>
+      <div class="actions">${extLink(url, "Open on GitHub", "btn")}
+        <a class="btn secondary" href="${esc(href({ tab: "repos", open: b.repo, q: "" }))}">View repo</a></div>
+    </div>
+    ${section("Details", kv([["Location", `${esc(b.repo)} · <code>${esc(b.path)}</code>`], ...rows]))}
+    ${sample}
+    ${section("About the repo", kv([
+      ["Summary", esc(b.repoRef.summary.one_liner)],
+      ["Practices", `${grade(b.repoRef.practices.grade, b.repoRef.practices.score)} ${num(b.repoRef.practices.score)}/100`],
+      ["Owner", esc(b.repoRef.declared.owner ?? b.repoRef.ownership.codeowners.join(", "))],
+      ["Last commit", relTime(b.repoRef.ownership.last_commit ?? b.repoRef.pushed_at)],
+      ["Used by", b.repoRef.used_by.length ? `${num(b.repoRef.used_by.length)} org repos` : null],
+    ]))}`;
+}
+
 // ------------------------------------------------------------------------------- insights
 
 function bars(title: string, entries: [string, number][], link: (v: string) => string, total: number, limit = 10): string {
   const rows = entries.slice(0, limit);
   if (!rows.length) return "";
-  const max = Math.max(1, rows[0]![1]);
+  const max = Math.max(1, ...rows.map(([, n]) => num(n))); // rows may be sorted by label, not size
   return `<figure class="panel"><figcaption>${esc(title)}</figcaption><ul class="bars">
     ${rows.map(([label, n]) => `<li><a href="${esc(link(label))}" title="${esc(label)}: ${num(n)} (${Math.round((100 * num(n)) / Math.max(total, 1))}%)">
       <span class="bar-label">${esc(label)}</span>
@@ -497,6 +674,10 @@ function renderInsights(): void {
   const failCounts = countBy(active, (r) => r.practices.checks.filter((c) => !c.passed).map((c) => c.label));
   const labelToId = new Map(active.flatMap((r) => r.practices.checks.map((c) => [c.label, c.id] as const)));
   const kindByLabel = new Map(Object.entries(KIND_LABEL).map(([k, l]) => [l, k]));
+  const flagIdByLabel = new Map([...rs.flatMap((r) => r.flags), ...as.flatMap((a) => a.flags)].map((f) => [flagLabel(f.id), f.id]));
+  const assetFlagsByRepo = new Map<string, Flag[]>();
+  for (const a of as) if (a.flags.length) assetFlagsByRepo.set(a.repo, [...(assetFlagsByRepo.get(a.repo) ?? []), ...a.flags]);
+  const blockKindByLabel = new Map(Object.entries(BLOCK_LABEL).map(([k, l]) => [l, k]));
 
   $main.innerHTML = `
     <h1 class="sr-only">Insights</h1>
@@ -522,9 +703,46 @@ function renderInsights(): void {
         ${bars("Models referenced (repos)", countBy(rs, (r) => r.ai.models), (v) => repoQ(`uses:${quote(v)}`), rs.length)}
         ${bars("Capabilities", countBy(rs, (r) => r.capabilities), (v) => repoQ(`cap:${quote(v)}`), rs.length, 14)}
         ${bars("Practices grade", countBy(rs, (r) => r.practices.grade).sort((a, b) => a[0].localeCompare(b[0])), (v) => repoQ(`grade:${v}`), rs.length)}
+        ${bars("Findings (active repos)", countBy(active, (r) => [...r.flags, ...(assetFlagsByRepo.get(r.id) ?? [])].map((f) => flagLabel(f.id))), (v) => repoQ(`flag:${flagIdByLabel.get(v) ?? v}`), active.length, 12)}
+        ${bars("Building blocks", countBy(blocks, (b) => BLOCK_LABEL[b.kind] ?? b.kind), (v) => href({ tab: "blocks", q: `kind:${blockKindByLabel.get(v) ?? v}`, open: null }), blocks.length)}
+        ${bars("Most depended-on repos", rs.filter((r) => r.used_by.length).map((r) => [r.id, r.used_by.length] as [string, number]).sort((a, b) => b[1] - a[1]), (v) => href({ tab: "repos", open: v, q: "" }), rs.length)}
       </div>
+      ${versionDrift(active)}
       <p class="muted small">Catalog generated ${relTime(catalog.meta.generated_at)} from ${esc(catalog.meta.source)} · scanner ${esc(catalog.meta.scanner_version)}${catalog.meta.llm_enriched ? " · summaries by Claude" : ""}. Click any bar to see the matching repos or assets.</p>
     </section>`;
+}
+
+/** Dependencies used across repos at different major versions: upgrade and consolidation targets. */
+function versionDrift(rs: Repo[]): string {
+  const byDep = new Map<string, Map<string, Set<string>>>();
+  for (const r of rs) {
+    for (const d of r.dependencies) {
+      if (d.scope === "transitive" || !d.version) continue;
+      const major = /(\d+)(?:\.(\d+))?/.exec(d.version.replace(/^[^\d]*/, ""));
+      if (!major) continue;
+      const key = major[1] === "0" && major[2] !== undefined ? `0.${major[2]}` : major[1]!;
+      const name = `${d.ecosystem}:${d.name}`;
+      const majors = byDep.get(name) ?? new Map<string, Set<string>>();
+      majors.set(key, (majors.get(key) ?? new Set()).add(r.id));
+      byDep.set(name, majors);
+    }
+  }
+  const rows = [...byDep.entries()]
+    .map(([name, majors]) => ({ name, majors, repos: new Set([...majors.values()].flatMap((s) => [...s])).size }))
+    .filter((x) => x.majors.size > 1 && x.repos > 1)
+    .sort((a, b) => b.majors.size - a.majors.size || b.repos - a.repos)
+    .slice(0, 15);
+  if (!rows.length) return "";
+  return `<figure class="panel wide"><figcaption>Version drift: same dependency on different major versions</figcaption>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Version drift"><table class="deps"><thead><tr><th>Dependency</th><th>Repos</th><th>Major versions (repos)</th></tr></thead><tbody>
+    ${rows.map((x) => {
+      const [eco, ...rest] = x.name.split(":");
+      const dep = rest.join(":");
+      const majors = [...x.majors.entries()].sort((a, b) => Number(b[0]) - Number(a[0]))
+        .map(([m, set]) => `<span class="chip" title="${esc([...set].join(", "))}">${esc(m)} · ${set.size}</span>`).join("");
+      return `<tr><td><a href="${esc(href({ tab: "repos", q: `tech:${/\s/.test(dep) ? `"${dep}"` : dep}`, open: null }))}">${esc(dep)}</a> <span class="muted small">${esc(eco)}</span></td><td>${x.repos}</td><td class="chips">${majors}</td></tr>`;
+    }).join("")}
+    </tbody></table></div></figure>`;
 }
 
 // ---------------------------------------------------------------------------------- export
@@ -535,8 +753,17 @@ function repoRow(r: Repo): Record<string, unknown> {
     language: r.stack.primary_language, frameworks: r.stack.frameworks.join("; "),
     databases: r.stack.databases.join("; "), cloud: r.stack.cloud.join("; "),
     capabilities: r.capabilities.join("; "), practices_score: r.practices.score,
-    grade: r.practices.grade, ai_assets: r.ai.asset_count, owner: r.declared.owner ?? r.ownership.codeowners.join("; "),
+    grade: r.practices.grade, ai_assets: r.ai.asset_count,
+    high_findings: r.flags.filter((f) => f.severity === "high").map((f) => flagLabel(f.id)).join("; "),
+    used_by: r.used_by.length, owner: r.declared.owner ?? r.ownership.codeowners.join("; "),
     last_commit: r.ownership.last_commit ?? r.pushed_at, summary: r.summary.purpose ?? r.summary.one_liner,
+  };
+}
+
+function blockRow(b: Block): Record<string, unknown> {
+  return {
+    kind: b.kind, name: b.name, repo: b.repo, path: b.path, description: b.description,
+    summary: blockSummary(b), repo_grade: b.repoRef.practices.grade, repo_lifecycle: b.repoRef.lifecycle,
   };
 }
 

@@ -5,6 +5,16 @@ export interface Dependency { name: string; version: string | null; ecosystem: s
 export interface Pkg { name: string; path: string; ecosystem: string; version: string | null; description: string | null }
 export interface PracticeCheck { id: string; category: string; label: string; passed: boolean; weight: number; evidence: string | null }
 
+export type Severity = "high" | "medium" | "low";
+export interface Flag { id: string; category: "security" | "maintenance" | "ownership" | "ai-governance"; severity: Severity; message: string; path: string | null; line: number | null }
+export type ReusableKind = "action" | "reusable-workflow" | "terraform-module" | "helm-chart" | "template" | "api" | "config-package";
+export interface Reusable { kind: ReusableKind; name: string; path: string; description: string | null; details: Record<string, unknown> }
+export interface RepoLink { repo: string; via: string }
+export interface RuntimeVersion { runtime: string; version: string; path: string }
+
+/** A building block flattened for the Building blocks view (not in the JSON as such). */
+export interface Block extends Reusable { id: string; repo: string; repoRef: Repo }
+
 export interface Stack {
   primary_language: string | null;
   languages: LanguageStat[];
@@ -12,6 +22,7 @@ export interface Stack {
   databases: string[]; messaging: string[]; cloud: string[]; infrastructure: string[];
   ci_cd: string[]; observability: string[]; auth: string[]; ai: string[]; build_tools: string[];
   package_managers: string[]; runtimes: Record<string, string>;
+  runtime_versions: RuntimeVersion[];
 }
 
 export interface Repo {
@@ -29,6 +40,7 @@ export interface Repo {
   practices: { score: number; grade: "A" | "B" | "C" | "D" | "F"; checks: PracticeCheck[] };
   ownership: { codeowners: string[]; top_contributors: { name: string; commits: number }[]; contributor_count: number; commit_count: number; first_commit: string | null; last_commit: string | null };
   ai: { has_ai: boolean; asset_count: number; asset_kinds: Record<string, number>; ecosystems: string[]; sdks: string[]; models: string[]; mcp_servers_provided: string[]; mcp_servers_consumed: string[] };
+  flags: Flag[]; reusables: Reusable[]; depends_on: RepoLink[]; used_by: RepoLink[];
   scanned_at: string; scan_errors: string[]; scan_fingerprint?: string | null;
 }
 
@@ -45,6 +57,7 @@ export interface Asset {
   last_modified: string | null; last_author: string | null; commit_count: number | null;
   quality_score: number; quality_notes: string[];
   summary: string | null; use_cases: string[]; category: string | null; duplicates: string[];
+  flags: Flag[];
 }
 
 export interface Meta { generated_at: string; source: string; repo_count: number; asset_count: number; llm_enriched: boolean; scanner_version: string }

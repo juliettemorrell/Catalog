@@ -21,10 +21,15 @@ INSTRUCTIONS = """\
 Catalog of every repository in the organization plus an AI asset library (skills, agents,
 prompts, rules files, MCP servers, hooks, LLM integrations).
 Typical flow: search_repos / search_ai_assets to find candidates, then get_repo / get_ai_asset
-for full detail. Use repos_using to find prior art for a technology ("stripe", "fastapi"),
-technology_usage to learn the org's standard stack, and sql for anything else
-(tables: repos, repo_tech, repo_capabilities, dependencies, packages, practice_checks,
-ai_assets, asset_tools, asset_models, asset_tags; views: tech_usage, dependency_usage).
+for full detail. Before writing new infrastructure, call find_building_blocks: the org may
+already have a GitHub Action, reusable workflow, Terraform module, Helm chart, template or API
+for it. Use repos_using to find prior art for a technology ("stripe", "fastapi"),
+technology_usage to learn the org's standard stack, repo_relationships for what a repo depends
+on and what depends on it (blast radius), list_flags for security/maintenance/AI-governance
+findings, and sql for anything else (tables: repos, repo_tech, repo_capabilities,
+dependencies, packages, practice_checks, flags, reusables, repo_links, runtime_versions,
+ai_assets, asset_tools, asset_models, asset_tags; views: tech_usage, dependency_usage,
+dependency_versions, flag_summary).
 """
 
 
@@ -117,6 +122,42 @@ def build_server(db_path: Path) -> MCPServer:
         linting, databases, messaging, cloud, infrastructure, ci_cd, observability, auth, ai,
         build_tools, package_managers, languages."""
         return query.technology_usage(con(), category, limit)
+
+    @server.tool(annotations=READ_ONLY)
+    def find_building_blocks(
+        query_text: str = "", kind: str | None = None, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Reusable building blocks across the org, e.g. "deploy ecs", "postgres rds",
+        "release npm". kind: action, reusable-workflow, terraform-module, helm-chart, template,
+        api, config-package. Details include inputs, variables or API operations."""
+        return query.find_building_blocks(con(), query_text, kind=kind, limit=min(limit, 100))
+
+    @server.tool(annotations=READ_ONLY)
+    def repo_relationships(repo_id: str) -> dict[str, Any] | str:
+        """Org repos this repo depends on (packages, actions, workflows, Terraform modules,
+        images, submodules) and the repos that depend on it."""
+        return query.repo_relationships(con(), repo_id) or f"No repo named {repo_id!r}."
+
+    @server.tool(annotations=READ_ONLY)
+    def list_flags(
+        severity: str | None = None,
+        category: str | None = None,
+        flag_id: str | None = None,
+        repo: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Findings worth attention, most severe first. severity: high, medium, low.
+        category: security, maintenance, ownership, ai-governance. flag_id e.g.
+        committed-secret, eol-runtime, deprecated-model, workflow-script-injection,
+        mcp-unpinned-package, ai-permissions-bypassed, single-maintainer."""
+        return query.list_flags(
+            con(),
+            severity=severity,
+            category=category,
+            flag_id=flag_id,
+            repo=repo,
+            limit=min(limit, 500),
+        )
 
     @server.tool(annotations=READ_ONLY)
     def sql(statement: str, limit: int = 200) -> list[dict[str, Any]]:

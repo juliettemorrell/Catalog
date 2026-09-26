@@ -15,6 +15,8 @@
   --good-soft: #e3f4e8;
   --warn: #9a6700;
   --warn-soft: #fbf1d9;
+  --good-ink: #11632a; /* small text on --good-soft */
+  --warn-ink: #7a5200; /* small text on --warn-soft */
   --bad: #c2352f;
   --bad-soft: #fbe6e5;
   --ai: #6b4fd8;
@@ -43,6 +45,8 @@
     --good-soft: #17301e;
     --warn: #e0a93a;
     --warn-soft: #36290e;
+  --good-ink: #4fbf6b;
+  --warn-ink: #e0a93a;
     --bad: #f07470;
     --bad-soft: #3a1b1a;
     --ai: #a896f5;
@@ -68,6 +72,8 @@
   --good-soft: #17301e;
   --warn: #e0a93a;
   --warn-soft: #36290e;
+  --good-ink: #4fbf6b;
+  --warn-ink: #e0a93a;
   --bad: #f07470;
   --bad-soft: #3a1b1a;
   --ai: #a896f5;
@@ -264,6 +270,15 @@ a.chip:hover { border-color: var(--accent); color: var(--accent-ink); text-decor
 .checks li { display: flex; gap: 8px; align-items: baseline; }
 .checks .pass > span:first-child { color: var(--good); font-weight: 700; }
 .checks .fail > span:first-child { color: var(--bad); font-weight: 700; }
+.sev { flex: none; font-size: 0.7rem; font-weight: 650; text-transform: uppercase; letter-spacing: 0.03em; padding: 1px 6px; border-radius: 6px; }
+.sev-high, .chip.sev-high { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
+.sev-medium, .chip.sev-medium { background: var(--warn-soft); color: var(--warn-ink); border-color: transparent; }
+.sev-low { background: var(--surface-2); color: var(--text-2); }
+.chip.reuse { background: var(--good-soft); color: var(--good-ink); border-color: transparent; }
+.kind-block { background: var(--good-soft); color: var(--good-ink); }
+.flag-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; font-size: 0.92rem; }
+.flag-list li { display: flex; gap: 8px; align-items: baseline; overflow-wrap: anywhere; }
+.panel.wide { margin-bottom: 16px; }
 .mini-list { list-style: none; padding: 0; margin: 0 0 10px; display: grid; gap: 6px; }
 .deps { width: 100%; border-collapse: collapse; font-size: 0.84rem; margin-top: 8px; }
 .deps th, .deps td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
@@ -297,7 +312,7 @@ pre {
 .bars a:hover { background: var(--surface-2); text-decoration: none; }
 .bars a:hover .bar { filter: brightness(1.1); }
 .bar-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
-.bar-track { height: 12px; }
+.bar-track { height: 12px; overflow: hidden; }
 .bar { display: block; height: 100%; background: var(--bar); border-radius: 0 4px 4px 0; }
 .bar-value { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-2); }
 

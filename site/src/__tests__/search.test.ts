@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { applyFilters, hasFilter, parseQuery, resolveQuery, REPO_FILTERS, ASSET_FILTERS, toggleFilter } from "../search";
-import type { Asset, Repo } from "../types";
+import { applyFilters, hasFilter, parseQuery, resolveQuery, REPO_FILTERS, ASSET_FILTERS, BLOCK_FILTERS, toggleFilter } from "../search";
+import type { Asset, Block, Flag, Repo } from "../types";
 
 const repo = (over: Partial<Repo> & { lang?: string; fw?: string[]; langs?: string[] }): Repo =>
   ({
@@ -14,6 +14,7 @@ const repo = (over: Partial<Repo> & { lang?: string; fw?: string[]; langs?: stri
     summary: { domains: [], key_features: [] }, structure: { repo_type: "service", is_monorepo: false },
     practices: { score: over.practices?.score ?? 50, grade: "C", checks: [] },
     ownership: { codeowners: [] }, declared: { owner: null }, ai: { has_ai: false, sdks: [], models: [], ecosystems: [] },
+    flags: over.flags ?? [], reusables: over.reusables ?? [], depends_on: [], used_by: over.used_by ?? [],
   }) as unknown as Repo;
 
 describe("query language", () => {
@@ -64,5 +65,38 @@ describe("filters", () => {
     const assets = [{ quality_score: 70 }, { quality_score: 10 }] as Asset[];
     const q = resolveQuery(parseQuery("minscore:5 minq:50"), ASSET_FILTERS);
     expect(applyFilters(assets, q.filters, ASSET_FILTERS)).toHaveLength(1);
+  });
+});
+
+describe("findings and building blocks", () => {
+  const flag = (id: string, severity: Flag["severity"]): Flag =>
+    ({ id, severity, category: "security", message: id, path: null, line: null });
+  const risky = repo({ id: "acme/risky", flags: [flag("committed-secret", "high"), flag("no-owner", "low")] });
+  const shared = repo({
+    id: "acme/shared", used_by: [{ repo: "acme/app", via: "npm @acme/ui" }],
+    reusables: [{ kind: "terraform-module", name: "rds", path: "modules/rds", description: null, details: {} }],
+  });
+  const all = [risky, shared];
+  const ids = (q: string) => applyFilters(all, parseQuery(q).filters, REPO_FILTERS).map((r) => r.id);
+
+  it("filters repos by finding id and severity", () => {
+    expect(ids("flag:committed-secret")).toEqual(["acme/risky"]);
+    expect(ids("sev:high")).toEqual(["acme/risky"]);
+    expect(ids("-sev:high")).toEqual(["acme/shared"]);
+  });
+
+  it("filters repos that ship building blocks or are depended on", () => {
+    expect(ids("reuse:terraform-module")).toEqual(["acme/shared"]);
+    expect(ids("usedby:yes")).toEqual(["acme/shared"]);
+  });
+
+  it("filters building blocks by kind and format", () => {
+    const block = (kind: Block["kind"], details: Record<string, unknown>): Block =>
+      ({ id: kind, kind, name: kind, path: ".", description: null, details, repo: shared.id, repoRef: shared });
+    const blocks = [block("api", { format: "openapi 3.0.0" }), block("action", { using: "composite" })];
+    const kinds = (q: string) => applyFilters(blocks, parseQuery(q).filters, BLOCK_FILTERS).map((b) => b.kind);
+    expect(kinds("format:openapi")).toEqual(["api"]);
+    expect(kinds("format:composite")).toEqual(["action"]);
+    expect(kinds("kind:action")).toEqual(["action"]);
   });
 });

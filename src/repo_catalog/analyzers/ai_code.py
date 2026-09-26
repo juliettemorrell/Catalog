@@ -209,6 +209,34 @@ SDK_IMPORT_RX = re.compile(
 _SDK_BY_GROUP = {g: k for k, g in _SDK_GROUP.items()}
 
 
+# Every alternative in SDKS import patterns contains one of these (lowercase); a unit test
+# enforces it so a new pattern cannot be silently filtered out.
+IMPORT_HINTS = (
+    "import",
+    "from",
+    "require",
+    "using",
+    "://",
+    "bedrock",
+    "azureopenai",
+    "cortex.complete",
+    "ai_complete",
+    "serving-endpoints",
+)
+
+
+def _import_lines(text: str, suffix: str) -> str:
+    """Only lines that can match an SDK import pattern: running the big alternation over
+    whole files dominated scan time. Go import blocks list bare quoted paths."""
+    quoted = suffix == ".go"
+    keep = []
+    for line in text.split("\n"):
+        low = line.lower()
+        if any(h in low for h in IMPORT_HINTS) or (quoted and '"' in line):
+            keep.append(line)
+    return "\n".join(keep)
+
+
 # Model identifiers. Kept deliberately specific to avoid false positives.
 MODEL_PATTERNS = [
     r"(?:(?:us|eu|apac|global)\.)?(?:anthropic\.)?claude-(?:opus|sonnet|haiku|fable|mythos|instant|"
@@ -327,7 +355,7 @@ def scan_code(files: RepoFiles, claimed: set[str]) -> CodeFindings:
             continue
         matched = {
             _SDK_BY_GROUP[g]
-            for mt in SDK_IMPORT_RX.finditer(text)
+            for mt in SDK_IMPORT_RX.finditer(_import_lines(text, entry.suffix))
             for g, v in mt.groupdict().items()
             if v is not None
         }

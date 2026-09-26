@@ -16,9 +16,12 @@ from . import __version__, git
 from .analyzers.ai_code import scan_code
 from .analyzers.ai_common import RepoContext
 from .analyzers.ai_files import FileDetector
+from .analyzers.ai_risk import asset_flags
 from .analyzers.docs import first_sentence, parse_codeowners, parse_declared, summarize_readme
+from .analyzers.flags import repo_flags, runtime_versions
 from .analyzers.manifests import parse_manifests
 from .analyzers.practices import assess_practices
+from .analyzers.reusables import find_references, find_reusables
 from .analyzers.stack import analyze_stack
 from .fs import RepoFiles
 from .github import RepoRef
@@ -189,8 +192,25 @@ def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanRes
         ]
         ownership.contributor_count = len(history.contributors)
 
-    # ---- summary ----
+    # ---- risk flags, building blocks, cross-repo references ----
     meta = ref.meta
+    workflows = stack_res.workflow_texts
+    stack.runtime_versions = runtime_versions(files, workflows, stack.runtimes)
+    flags = repo_flags(files, workflows, ownership, declared, bool(meta.get("archived")), errors)
+    for asset in assets:
+        asset.flags += asset_flags(asset)
+    reusables = find_reusables(
+        files,
+        workflows,
+        structure.api_specs,
+        structure.packages,
+        ref.name,
+        bool(meta.get("is_template")),
+        errors,
+    )
+    references = find_references(files, workflows)
+
+    # ---- summary ----
     manifest_desc = min(manifests.descriptions, default=(0, None))[1]
     if meta.get("description"):
         summary.one_liner, summary.source = meta["description"], "github"
@@ -245,6 +265,9 @@ def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanRes
         practices=practices,
         ownership=ownership,
         ai=ai_summary,
+        flags=flags,
+        reusables=reusables,
+        references=references,
         scanned_at=datetime.now(UTC),
         scan_fingerprint=opts.fingerprint(),
         scanner_version=__version__,

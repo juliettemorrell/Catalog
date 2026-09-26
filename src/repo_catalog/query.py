@@ -162,6 +162,87 @@ def search_assets(
     )
 
 
+def find_building_blocks(
+    con: sqlite3.Connection, query: str = "", *, kind: str | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
+    """Reusable actions, workflows, Terraform modules, Helm charts, templates and APIs.
+
+    Every word must appear in the name, description, repo, path or details."""
+    where, params = ["x.repo_id = r.id"], []
+    if kind:
+        where.append("x.kind = ?")
+        params.append(kind)
+    for word in [w for w in re.split(r"\s+", query.lower()) if w][:8]:
+        where.append(
+            "LOWER(x.name || ' ' || COALESCE(x.description, '') || ' ' || x.repo_id || ' ' || "
+            "x.path || ' ' || x.details) LIKE ? ESCAPE '\\'"
+        )
+        params.append("%" + re.sub(r"([%_\\])", r"\\\1", word) + "%")
+    rows = _rows(
+        con.execute(
+            "SELECT x.kind, x.name, x.repo_id AS repo, x.path, x.description, x.details, "
+            "r.url || '/tree/HEAD/' || x.path AS url, "
+            "r.lifecycle, r.practices_grade FROM reusables x, repos r WHERE "
+            + " AND ".join(where)
+            + " ORDER BY r.archived, r.practices_score DESC, x.kind, x.name LIMIT ?",
+            [*params, _clamp(limit)],
+        )
+    )
+    for row in rows:
+        row["details"] = json.loads(row["details"] or "{}")
+    return rows
+
+
+def list_flags(
+    con: sqlite3.Connection,
+    *,
+    severity: str | None = None,
+    category: str | None = None,
+    flag_id: str | None = None,
+    repo: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Risk and maintenance findings, most severe first."""
+    where, params = ["1=1"], []
+    for col, val in (("severity", severity), ("category", category), ("flag_id", flag_id)):
+        if val:
+            where.append(f"f.{col} = ?")
+            params.append(val)
+    if repo:
+        where.append("(f.repo_id = ? COLLATE NOCASE OR f.repo_id LIKE ? COLLATE NOCASE)")
+        params += [repo, f"%/{repo}"]
+    return _rows(
+        con.execute(
+            "SELECT f.repo_id AS repo, f.asset_id, f.flag_id, f.category, f.severity, "
+            "f.message, f.path, f.line FROM flags f WHERE "
+            + " AND ".join(where)
+            + " ORDER BY CASE f.severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, "
+            "f.repo_id, f.flag_id LIMIT ?",
+            [*params, _clamp(limit, 1000)],
+        )
+    )
+
+
+def repo_relationships(con: sqlite3.Connection, repo_id: str) -> dict[str, Any] | None:
+    """Which org repos this one depends on, and which depend on it (blast radius)."""
+    row = con.execute(
+        "SELECT id FROM repos WHERE id = ? COLLATE NOCASE OR name = ? COLLATE NOCASE",
+        (repo_id, repo_id),
+    ).fetchone()
+    if not row:
+        return None
+    rid = row[0]
+    return {
+        "repo": rid,
+        "depends_on": _rows(
+            con.execute("SELECT depends_on AS repo, via FROM repo_links WHERE repo_id = ?", (rid,))
+        ),
+        "used_by": _rows(
+            con.execute("SELECT repo_id AS repo, via FROM repo_links WHERE depends_on = ?", (rid,))
+        ),
+    }
+
+
 def get_repo(con: sqlite3.Connection, repo_id: str) -> dict[str, Any] | None:
     row = con.execute(
         "SELECT json FROM repos WHERE id = ? COLLATE NOCASE OR name = ? COLLATE NOCASE",

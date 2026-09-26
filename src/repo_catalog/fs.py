@@ -250,8 +250,10 @@ class RepoFiles:
                     best, found = key, f
         return found
 
-    def read(self, path: str, limit: int = MAX_READ_BYTES) -> str | None:
-        """Decoded text of a listed regular file, or None (binary, unlisted, unreadable)."""
+    def read(self, path: str, limit: int = MAX_READ_BYTES, *, cache: bool = True) -> str | None:
+        """Decoded text of a listed regular file, or None (binary, unlisted, unreadable).
+
+        ``cache=False`` is for whole-repo sweeps that must not keep every file in memory."""
         key = (path, limit)
         if key in self._text_cache:
             return self._text_cache[key]
@@ -268,7 +270,8 @@ class RepoFiles:
                     text = decode(raw)
             except (OSError, ValueError, RuntimeError):
                 text = None
-        self._text_cache[key] = text
+        if cache:
+            self._text_cache[key] = text
         return text
 
     def iter_text(

@@ -629,3 +629,31 @@ def test_sdk_internals_are_not_mcp_servers(make_repo: Maker, tmp_path: Path) -> 
         },
     )
     assert not [a for a in result.assets if a.kind == "mcp-server"]
+
+
+def test_sdk_line_prefilter_covers_every_import_pattern() -> None:
+    import re
+
+    from repo_catalog.analyzers.ai_code import IMPORT_HINTS, SDKS
+
+    def top_level_alternatives(pattern: str) -> list[str]:
+        out, depth, cur, i = [], 0, "", 0
+        while i < len(pattern):
+            c = pattern[i]
+            if c == "\\":
+                cur += pattern[i : i + 2]
+                i += 2
+                continue
+            depth += (c == "(") - (c == ")")
+            if c == "|" and depth == 0:
+                out.append(cur)
+                cur = ""
+            else:
+                cur += c
+            i += 1
+        return [*out, cur]
+
+    for key, (_, pattern, _) in SDKS.items():
+        for alt in top_level_alternatives(pattern):
+            plain = re.sub(r"\\(.)", r"\1", alt).lower()
+            assert any(h in plain for h in IMPORT_HINTS), (key, alt)

@@ -24,8 +24,16 @@ from typing import Any
 
 from ..fs import FileEntry, RepoFiles, escape_glob
 from ..models import AssetFile
-from ..textutil import load_json, load_yaml, redact_args, redact_url, sanitize_config
+from ..textutil import (
+    SECRET_NAME,
+    load_json,
+    load_yaml,
+    redact_args,
+    redact_url,
+    sanitize_config,
+)
 from .ai_common import AssetDraft, as_list, parse_frontmatter
+from .flags import find_secrets
 
 log = logging.getLogger(__name__)
 
@@ -491,6 +499,8 @@ class FileDetector:
                 or None,
                 "url": redact_url(str(url)) if url else None,
                 "env": sorted(env),  # names only, never values
+                # a literal credential in a committed file is a leak even though we drop it
+                "inline_secret": _has_inline_secret(cfg, env),
             }
             self.mcp_consumed.add(str(name))
         self.drafts.append(
@@ -1026,3 +1036,31 @@ def _str(v: Any) -> str | None:
     if v is None or v == "" or isinstance(v, dict | list):
         return None
     return str(v).strip() or None
+
+
+_ENV_REF = re.compile(r"^\s*(?:\$\{?|%|<|\{\{|\$env:|op://|vault:)|^\s*$")
+
+
+def _has_inline_secret(cfg: dict[str, Any], env: dict[str, Any]) -> bool:
+    raw = json.dumps(cfg, default=str)
+    if next(iter(find_secrets(raw)), None):
+        return True
+    for key, value in {**env, **_headers(cfg)}.items():
+        if not isinstance(value, str) or not SECRET_NAME.search(str(key)):
+            continue
+        value = re.sub(r"(?i)^(?:bearer|basic|token)\s+", "", value)
+        # credential-looking: long, no spaces, mixes letters and digits (not "github-app")
+        if (
+            len(value) >= 16
+            and not _ENV_REF.match(value)
+            and not re.search(r"\s", value)
+            and re.search(r"\d", value)
+            and re.search(r"[A-Za-z]", value)
+        ):
+            return True
+    return False
+
+
+def _headers(cfg: dict[str, Any]) -> dict[str, Any]:
+    h = cfg.get("headers") or cfg.get("http_headers")
+    return h if isinstance(h, dict) else {}

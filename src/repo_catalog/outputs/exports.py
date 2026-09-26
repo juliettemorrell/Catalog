@@ -67,9 +67,17 @@ def backstage_entities(repos: list[Repo]) -> list[dict[str, object]]:
     out = []
     base_names = [_bs_name(r.declared.name or r.name) for r in repos]
     clashes = {n for n in base_names if base_names.count(n) > 1}
-    for r, base in zip(repos, base_names, strict=True):
+    names = {
+        r.id: _bs_name(f"{r.owner}-{base}") if base in clashes else base
+        for r, base in zip(repos, base_names, strict=True)
+    }
+    for r in repos:
         d = r.declared
-        name = _bs_name(f"{r.owner}-{base}") if base in clashes else base
+        name = names[r.id]
+        # declared dependencies win; otherwise the links resolved from code
+        depends = d.depends_on or sorted(
+            {f"component:default/{names[ln.repo]}" for ln in r.depends_on if ln.repo in names}
+        )
         branch = r.default_branch or "main"
         tags = sorted(
             {
@@ -95,6 +103,9 @@ def backstage_entities(repos: list[Repo]) -> list[dict[str, object]]:
                     "backstage.io/source-location": f"url:{r.url}/tree/{branch}/",
                     "repo-catalog/practices-score": str(r.practices.score),
                     "repo-catalog/ai-assets": str(r.ai.asset_count),
+                    "repo-catalog/high-severity-flags": str(
+                        sum(f.severity == "high" for f in r.flags)
+                    ),
                 },
                 "links": [{"url": r.url, "title": "Repository"}]
                 + ([{"url": r.homepage, "title": "Homepage"}] if r.homepage else [])
@@ -109,6 +120,7 @@ def backstage_entities(repos: list[Repo]) -> list[dict[str, object]]:
                 **({"system": d.system} if d.system else {}),
                 **({"providesApis": d.provides_apis} if d.provides_apis else {}),
                 **({"consumesApis": d.consumes_apis} if d.consumes_apis else {}),
+                **({"dependsOn": depends} if depends else {}),
             },
         }
         out.append(entity)
