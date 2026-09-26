@@ -14,10 +14,11 @@ from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 
 from ..models import AIAsset, Flag, Repo, RepoLink, Severity
+from .ai_risk import launched_package
 from .flags import release_cycle
 from .reference import MODEL_DEPRECATIONS, RUNTIME_EOL
 
-DERIVED_FLAGS = {"eol-runtime", "deprecated-model", "depends-on-archived"}
+DERIVED_FLAGS = {"eol-runtime", "deprecated-model", "depends-on-archived", "vulnerable-dependency"}
 MAX_LINKS = 200
 _EOL_KEY = {"node": "nodejs"}
 _RUNTIME_LABEL = {
@@ -49,7 +50,7 @@ def link_org(repos: list[Repo], assets: list[AIAsset], today: date | None = None
             continue
         repo.flags += eol_flags(repo, today)
         repo.flags += model_flags(repo, by_repo.get(repo.id, []))
-    _link(repos)
+    _link(repos, by_repo)
 
 
 # ------------------------------------------------------------------------ end of life
@@ -160,12 +161,40 @@ def _model_flag(
 # ------------------------------------------------------------------------------ links
 
 
+def _entity_name(ref: str) -> str:
+    """``component:default/billing`` -> ``billing`` (Backstage entity refs)."""
+    return ref.rsplit("/", 1)[-1].split(":")[-1].lower()
+
+
+def _mcp_targets(
+    name: str,
+    cfg: object,
+    published: dict[tuple[str, str], str],
+    providers: dict[str, set[str]],
+) -> list[str]:
+    """Org repos behind an MCP server a repo configures: by launched package, else name."""
+    command = cfg.get("command") if isinstance(cfg, dict) else None
+    launched = launched_package(str(command or ""))
+    if launched and launched[0] in ("npm", "pypi"):
+        ecosystem, spec = launched
+        if ecosystem == "npm":
+            base = "@" + spec[1:].split("@")[0] if spec.startswith("@") else spec.split("@")[0]
+        else:
+            base = re.split(r"[=<>!~\[@ ]", spec, maxsplit=1)[0]
+        target = published.get((ecosystem, _norm(ecosystem, base)))
+        if target:
+            return [target]
+    owners = providers.get(name.lower(), set())
+    return sorted(owners) if len(owners) == 1 else []  # ambiguous names link nothing
+
+
 def _norm(ecosystem: str, name: str) -> str:
     name = name.lower()
     return re.sub(r"[-_.]+", "-", name) if ecosystem == "pypi" else name
 
 
-def _link(repos: list[Repo]) -> None:
+def _link(repos: list[Repo], assets_by_repo: dict[str, list[AIAsset]] | None = None) -> None:
+    assets_by_repo = assets_by_repo or {}
     by_id = {r.id.lower(): r for r in repos}
     published: dict[tuple[str, str], str] = {}
     for repo in repos:
@@ -185,6 +214,21 @@ def _link(repos: list[Repo]) -> None:
         if target_id and target_id.lower() != src.id.lower():
             edges.setdefault((src.id, by_id[target_id.lower()].id, via), None)
 
+    # names teams declared (Backstage metadata.name) and MCP servers repos implement
+    declared_names: dict[str, str] = {}
+    mcp_providers: dict[str, set[str]] = {}
+    api_providers: dict[str, set[str]] = {}
+    for repo in repos:
+        for name in {repo.declared.name, repo.name}:
+            if name:
+                declared_names.setdefault(name.lower(), repo.id)
+        for asset in assets_by_repo.get(repo.id, []):
+            # example servers (SDK samples, tutorials) are not something others deploy
+            if asset.kind == "mcp-server" and "example" not in asset.tags:
+                mcp_providers.setdefault(asset.name.lower(), set()).add(repo.id)
+        for api in repo.declared.provides_apis:
+            api_providers.setdefault(_entity_name(api), set()).add(repo.id)
+
     for repo in repos:
         for dep in repo.dependencies:
             key = (dep.ecosystem, _norm(dep.ecosystem, dep.name))
@@ -193,9 +237,17 @@ def _link(repos: list[Repo]) -> None:
                 target = next(
                     (rid for mod, rid in go_modules if key[1].startswith(mod + "/")), None
                 )
+            suffix = " (transitive)" if dep.scope == "transitive" else ""
             if target:
-                link(repo, target, f"{dep.ecosystem} {dep.name}")
+                link(repo, target, f"{dep.ecosystem} {dep.name}{suffix}")
                 continue
+            if dep.ecosystem == "docker" and dep.name.startswith("ghcr.io/"):
+                parts = dep.name.split("/")
+                if len(parts) >= 3 and f"{parts[1]}/{parts[2]}" in by_id:
+                    link(repo, f"{parts[1]}/{parts[2]}", f"image {dep.name}")
+                continue
+            if dep.ecosystem in ("terraform", "github-actions"):
+                continue  # resolved from `references`, which keep the exact file
             for text in (dep.name, dep.version or ""):
                 if m := _GITHUB_REF.search(text):
                     target_id = f"{m.group(1)}/{m.group(2)}".lower()
@@ -205,9 +257,29 @@ def _link(repos: list[Repo]) -> None:
         for ref in repo.references:
             if ref.target in by_id:
                 link(repo, ref.target, f"{ref.kind} {ref.target}")
+        for entity in repo.declared.depends_on:
+            target = declared_names.get(_entity_name(entity))
+            link(repo, target, f"declared dependsOn {entity}")
+        for api in repo.declared.consumes_apis:
+            for target in sorted(api_providers.get(_entity_name(api), ())):
+                link(repo, target, f"consumes API {api}")
+        for asset in assets_by_repo.get(repo.id, []):
+            if asset.kind != "mcp-config":
+                continue
+            servers = asset.frontmatter.get("servers")
+            for name, cfg in (servers if isinstance(servers, dict) else {}).items():
+                for target in _mcp_targets(str(name), cfg, published, mcp_providers):
+                    link(repo, target, f"MCP server {name}")
 
+    # a package used directly and transitively is one route: keep the direct one
+    direct_routes = {(s_, d_, v) for s_, d_, v in edges if not v.endswith(" (transitive)")}
     flagged: set[tuple[str, str]] = set()
     for src_id, dst_id, via in edges:
+        if (
+            via.endswith(" (transitive)")
+            and (src_id, dst_id, via.removesuffix(" (transitive)")) in direct_routes
+        ):
+            continue
         src, dst = by_id[src_id.lower()], by_id[dst_id.lower()]
         if len(src.depends_on) < MAX_LINKS:
             src.depends_on.append(RepoLink(repo=dst.id, via=via))

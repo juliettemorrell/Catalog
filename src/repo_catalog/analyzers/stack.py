@@ -11,6 +11,7 @@ from ..fs import RepoFiles
 from ..models import Package, Stack, Structure
 from .languages import analyze_languages
 from .manifests import NON_PRODUCT_DIR, ManifestResult
+from .purls import PACKAGE_ECOSYSTEMS
 from .rules import FILE_RULES, Rule, match_dependency
 
 _STACK_FIELDS = {
@@ -120,6 +121,9 @@ class _Collector:
         self.add(rule.category, rule.label, rule.capabilities)
 
 
+_SERVICE_CATEGORIES = {"databases", "messaging", "observability"}
+
+
 def analyze_stack(files: RepoFiles, manifests: ManifestResult) -> StackResult:
     col = _Collector()
 
@@ -127,6 +131,16 @@ def analyze_stack(files: RepoFiles, manifests: ManifestResult) -> StackResult:
     core: set[str] = set()  # labels backed by runtime deps or product files: drive repo_type
     product_stack = {"frameworks", "databases", "messaging", "auth"}
     for dep in manifests.dependencies:
+        if dep.ecosystem in ("docker", "helm"):
+            # a postgres/redis/kafka image or chart is a service the repo runs with;
+            # other images (node, python...) are runtimes, not technology choices
+            base = dep.name.rsplit("/", 1)[-1]
+            for rule in match_dependency(base):
+                if rule.category in _SERVICE_CATEGORIES and dep.scope != "build":
+                    col.add_rule(rule)
+            continue
+        if dep.ecosystem not in PACKAGE_ECOSYSTEMS:
+            continue  # actions, pre-commit hooks, Terraform providers: tooling, not code deps
         for rule in match_dependency(dep.name):
             # dev/build-only frameworks are tooling, and indirect deps are not the repo's choice
             if dep.scope == "transitive" or (

@@ -20,6 +20,9 @@ from typing import Any
 from ..fs import RepoFiles
 from ..models import Dependency, Package
 from ..textutil import load_json, load_yaml
+from .deps_more import extra_jobs
+from .lockfiles import apply_lockfiles
+from .purls import finalize_dependencies
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +47,10 @@ LOCKFILES = {
     "mix.lock": "mix",
     "conda-lock.yml": "conda",
     "pixi.lock": "pixi",
+    "package.resolved": "swiftpm",
+    "podfile.lock": "cocoapods",
+    "renv.lock": "renv",
+    ".terraform.lock.hcl": "terraform",
 }
 
 # Manifests below these folders describe examples/fixtures, not the repo's own stack.
@@ -144,6 +151,7 @@ def parse_manifests(files: RepoFiles) -> ManifestResult:
     jobs: list[tuple[str, Parser]] = []
     for names, parser in by_name:
         jobs += [(e.path, parser) for e in files.named(*names)[:MAX_MANIFESTS_PER_KIND]]
+    jobs += extra_jobs(files, MAX_MANIFESTS_PER_KIND)
     for entry in files.files:
         name = entry.name.lower()
         is_req = (name.startswith("requirements") and name.endswith((".txt", ".in"))) or (
@@ -167,11 +175,29 @@ def parse_manifests(files: RepoFiles) -> ManifestResult:
             parser(path, text, res, files)
         except Exception as exc:  # never fail the scan on a bad manifest
             res.errors.append(f"{path}: {type(exc).__name__}: {str(exc)[:200]}")
+    res.dependencies = _collapse_repeats(res.dependencies)
+    apply_lockfiles(files, res.lockfiles, res.dependencies, res.errors)
+    finalize_dependencies(res.dependencies)
     try:
         _runtime_files(files, res)
     except Exception as exc:
         res.errors.append(f"runtime version files: {type(exc).__name__}: {exc}")
     return res
+
+
+def _collapse_repeats(deps: list[Dependency]) -> list[Dependency]:
+    """One row per GitHub Action and ref: a repo with 100 workflows otherwise lists
+    actions/checkout@v4 a hundred times. Code package deps stay per manifest."""
+    seen: set[tuple[str, str, str | None]] = set()
+    out = []
+    for dep in deps:
+        if dep.ecosystem == "github-actions":
+            key = (dep.ecosystem, dep.name.lower(), dep.version)
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(dep)
+    return out
 
 
 # -- JavaScript ---------------------------------------------------------------------------
@@ -589,6 +615,17 @@ def _csproj(path: str, text: str, res: ManifestResult, files: RepoFiles) -> None
     root = ET.fromstring(text)
     stem = PurePosixPath(path).stem
     refs = [(r.attrib.get("Include"), r) for r in root.iter() if r.tag.endswith("PackageReference")]
+    # versioned MSBuild SDKs are NuGet packages too: <Project Sdk="Aspire.AppHost.Sdk/13.5.3">
+    sdks = [(root.attrib.get("Sdk") or "", "")] + [
+        (el.attrib.get("Name") or "", el.attrib.get("Version") or "")
+        for el in root.iter()
+        if el.tag.endswith("Sdk") and el is not root
+    ]
+    for sdk, version in sdks:
+        for part in sdk.split(";"):
+            sdk_name, _, inline = part.strip().partition("/")
+            if sdk_name and (inline or version) and not sdk_name.startswith("Microsoft.NET.Sdk"):
+                res.add_dep(sdk_name, inline or version, "nuget", "build", path)
     is_test = (
         bool(_TEST_PROJECT.search(stem))
         or any(

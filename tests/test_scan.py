@@ -11,7 +11,7 @@ import pytest
 import yaml
 
 from repo_catalog.github import RepoRef
-from repo_catalog.models import AIAsset
+from repo_catalog.models import AIAsset, Dependency
 from repo_catalog.outputs import exports, store
 from repo_catalog.outputs.sqlite import build_sqlite
 from repo_catalog.query import get_asset, repos_using, search_assets, search_repos
@@ -583,3 +583,394 @@ def test_org_links_time_based_flags_and_outputs(
     assert con.execute("SELECT COUNT(*) FROM flag_summary").fetchone()[0] > 0
     entity = next(e for e in exports.backstage_entities(repos) if e["metadata"]["name"] == "app")  # type: ignore[index]
     assert entity["spec"]["dependsOn"] == ["component:default/ui"]  # type: ignore[index]
+
+
+# ------------------------------------------------------------------ dependencies, deeply
+
+LOCKFILE_REPO = {
+    # npm + package-lock v3 (nested duplicate version, workspace link skipped)
+    "package.json": json.dumps(
+        {
+            "name": "web",
+            "dependencies": {"express": "^4.18.0"},
+            "devDependencies": {"@types/node": "^20"},
+        }
+    ),
+    "package-lock.json": json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "web"},
+                "node_modules/express": {"version": "4.19.2"},
+                "node_modules/@types/node": {"version": "20.11.5", "dev": True},
+                "node_modules/debug": {"version": "2.6.9"},
+                "node_modules/send/node_modules/debug": {"version": "4.3.4"},
+                "node_modules/@acme/shared": {"resolved": "packages/shared", "link": True},
+            },
+        }
+    ),
+    # yarn v1 in a sub-app
+    "admin/package.json": json.dumps({"dependencies": {"react": "^18.2.0"}}),
+    "admin/yarn.lock": '# yarn lockfile v1\n\n"js-tokens@^3.0.0 || ^4.0.0":\n  version "4.0.0"\n'
+    '\nreact@^18.2.0:\n  version "18.2.0"\n  dependencies:\n    loose-envify "^1.1.0"\n',
+    # pnpm v9
+    "docs/package.json": json.dumps({"dependencies": {"vite": "^5.0.0"}}),
+    "docs/pnpm-lock.yaml": "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n"
+    "      vite:\n        specifier: ^5.0.0\n        version: 5.1.0\n\npackages:\n\n"
+    "  vite@5.1.0:\n    resolution: {integrity: x}\n\n  '@esbuild/linux-x64@0.19.12':\n"
+    "    resolution: {integrity: y}\n\nsnapshots:\n\n  vite@5.1.0(@types/node@20.11.5):\n"
+    "    dependencies: {}\n",
+    # Python: uv.lock skips the project itself
+    "api/pyproject.toml": '[project]\nname = "api"\ndependencies = ["fastapi>=0.110", "Pydantic_Settings>=2"]\n',
+    "api/uv.lock": 'version = 1\n[[package]]\nname = "api"\nversion = "0.1.0"\nsource = { editable = "." }\n'
+    '[[package]]\nname = "fastapi"\nversion = "0.111.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+    '[[package]]\nname = "pydantic-settings"\nversion = "2.2.1"\nsource = { registry = "https://pypi.org/simple" }\n'
+    '[[package]]\nname = "starlette"\nversion = "0.37.2"\nsource = { registry = "https://pypi.org/simple" }\n',
+    "worker/requirements.txt": "celery==5.3.6\nredis>=5\n",
+    "worker/setup.cfg": "[options]\ninstall_requires =\n    boto3>=1.34\n[options.extras_require]\ntest =\n    moto\n",
+    # Ruby, Go (indirect), Rust workspace
+    "Gemfile": "gem 'rails', '~> 7.1'\n",
+    "Gemfile.lock": "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.1.3)\n"
+    "      actionpack (= 7.1.3)\n    actionpack (7.1.3)\n\nPLATFORMS\n  ruby\n",
+    "svc/go.mod": "module github.com/acme/svc\n\ngo 1.22\n\nrequire (\n\tgithub.com/google/uuid v1.6.0\n"
+    "\tgolang.org/x/sys v0.18.0 // indirect\n)\n",
+    # more ecosystems
+    "ios/Package.swift": 'let package = Package(dependencies: [\n  .package(url: "https://github.com/apple/swift-nio.git", from: "2.62.0"),\n])\n',
+    "ios/Package.resolved": json.dumps(
+        {
+            "pins": [
+                {
+                    "identity": "swift-nio",
+                    "location": "https://github.com/apple/swift-nio.git",
+                    "state": {"version": "2.64.0"},
+                }
+            ],
+            "version": 2,
+        }
+    ),
+    "ios/Podfile": "pod 'Alamofire', '~> 5.8'\n",
+    "ex/mix.exs": 'defp deps do\n  [{:phoenix, "~> 1.7"}, {:credo, "~> 1.7", only: [:dev, :test]}]\nend\n',
+    "r/DESCRIPTION": "Package: tool\nImports:\n    dplyr (>= 1.1.0),\n    ggplot2\nSuggests: testthat\n",
+    "ml/environment.yml": "dependencies:\n  - python=3.11\n  - numpy=1.26\n  - pip:\n    - torch==2.2.0\n",
+    "scala/build.sbt": 'libraryDependencies += "org.typelevel" %% "cats-core" % "2.10.0"\n',
+    "infra/main.tf": 'terraform {\n  required_providers {\n    aws = {\n      source  = "hashicorp/aws"\n      version = "~> 5.0"\n    }\n  }\n}\n'
+    'module "vpc" {\n  source  = "terraform-aws-modules/vpc/aws"\n  version = "5.5.0"\n}\n',
+    "infra/.terraform.lock.hcl": 'provider "registry.terraform.io/hashicorp/aws" {\n  version     = "5.31.0"\n  hashes = []\n}\n',
+    "charts/app/Chart.yaml": "apiVersion: v2\nname: app\nversion: 1.0.0\ndependencies:\n  - name: postgresql\n    version: 13.2.0\n    repository: https://charts.bitnami.com/bitnami\n",
+    "Dockerfile": "FROM golang:1.22 AS build\nFROM gcr.io/distroless/static:nonroot\n",
+    "docker-compose.yml": "services:\n  db:\n    image: postgres:16\n  cache:\n    image: redis\n",
+    "deploy/api.yaml": "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n        - name: api\n          image: ghcr.io/acme/api:1.4.2\n",
+    ".github/workflows/ci.yml": "on: push\njobs:\n  a:\n    steps:\n      - uses: actions/checkout@v4\n  b:\n    steps:\n      - uses: actions/checkout@v4\n",
+    ".pre-commit-config.yaml": "repos:\n  - repo: https://github.com/astral-sh/ruff-pre-commit\n    rev: v0.3.0\n",
+    "App/App.csproj": '<Project Sdk="Aspire.AppHost.Sdk/9.1.0"><ItemGroup><PackageReference Include="Serilog" Version="3.1.1" /></ItemGroup></Project>',
+    "examples/demo/package.json": json.dumps({"dependencies": {"left-pad": "1.0.0"}}),
+}
+
+
+def test_dependencies_from_manifests_and_lockfiles(
+    make_repo: Callable[..., tuple[RepoRef, Path]], tmp_path: Path
+) -> None:
+    ref, root = make_repo(LOCKFILE_REPO)
+    repo = analyze_checkout(ref, root, ScanOptions(workdir=tmp_path / "w")).repo
+    by = {}
+    for d in repo.dependencies:
+        by.setdefault((d.ecosystem, d.name), []).append(d)
+
+    def one(eco: str, name: str) -> Dependency:
+        assert (eco, name) in by, (eco, name)
+        return by[(eco, name)][0]
+
+    express = one("npm", "express")
+    assert (express.version, express.resolved, express.scope) == ("^4.18.0", "4.19.2", "runtime")
+    assert express.purl == "pkg:npm/express@4.19.2"
+    assert one("npm", "@types/node").purl == "pkg:npm/%40types/node@20.11.5"
+    assert sorted(d.resolved or "" for d in by[("npm", "debug")]) == ["2.6.9", "4.3.4"]
+    assert all(d.scope == "transitive" for d in by[("npm", "debug")])
+    assert ("npm", "@acme/shared") not in by  # workspace link is the repo's own code
+    assert one("npm", "react").resolved == "18.2.0" and one("npm", "js-tokens").resolved == "4.0.0"
+    assert one("npm", "vite").resolved == "5.1.0"
+    assert one("npm", "@esbuild/linux-x64").scope == "transitive"
+    assert one("pypi", "fastapi").resolved == "0.111.0"
+    assert one("pypi", "Pydantic_Settings").resolved == "2.2.1"  # PEP 503 name matching
+    assert one("pypi", "starlette").scope == "transitive" and ("pypi", "api") not in by
+    assert one("pypi", "celery").resolved == "5.3.6" and one("pypi", "redis").resolved is None
+    assert one("pypi", "boto3").scope == "runtime" and one("pypi", "moto").scope == "dev"
+    assert (
+        one("gem", "rails").resolved == "7.1.3" and one("gem", "actionpack").scope == "transitive"
+    )
+    assert one("go", "github.com/google/uuid").purl == "pkg:golang/github.com/google/uuid@1.6.0"
+    assert one("go", "golang.org/x/sys").scope == "transitive"
+    nio = one("swift", "github.com/apple/swift-nio")
+    assert nio.resolved == "2.64.0" and nio.purl == "pkg:swift/github.com/apple/swift-nio@2.64.0"
+    assert one("cocoapods", "Alamofire").version == "~> 5.8"
+    assert one("hex", "phoenix").scope == "runtime" and one("hex", "credo").scope == "dev"
+    assert one("cran", "dplyr").version == ">= 1.1.0" and one("cran", "testthat").scope == "dev"
+    assert one("conda", "numpy").version == "1.26" and one("pypi", "torch").resolved == "2.2.0"
+    assert one("maven", "org.typelevel:cats-core").resolved == "2.10.0"
+    aws = one("terraform", "hashicorp/aws")
+    assert (aws.version, aws.resolved) == ("~> 5.0", "5.31.0")
+    assert one("terraform", "terraform-aws-modules/vpc/aws").version == "5.5.0"
+    assert one("helm", "postgresql").version == "13.2.0"
+    assert one("docker", "golang").scope == "build"
+    assert one("docker", "gcr.io/distroless/static").resolved is None  # "nonroot" is a tag
+    assert one("docker", "postgres").purl == "pkg:docker/library/postgres@16"
+    assert one("docker", "redis").version is None
+    assert one("docker", "ghcr.io/acme/api").purl == (
+        "pkg:docker/acme/api@1.4.2?repository_url=ghcr.io"
+    )
+    assert len(by[("github-actions", "actions/checkout")]) == 1  # collapsed across jobs
+    assert one("pre-commit", "github.com/astral-sh/ruff-pre-commit").version == "v0.3.0"
+    assert one("nuget", "Aspire.AppHost.Sdk").version == "9.1.0"
+    assert ("npm", "left-pad") not in by  # examples are not the repo's dependencies
+    assert {"PostgreSQL", "Redis"} <= set(repo.stack.databases)  # from compose images
+
+    summary = repo.dependency_summary
+    assert summary.transitive >= 7 and summary.direct > 20
+    assert 0 < summary.lockfile_coverage <= 1
+    assert "hashicorp/aws" not in " ".join(repo.stack.libraries)
+
+
+def test_bad_lockfiles_never_lose_manifests(
+    make_repo: Callable[..., tuple[RepoRef, Path]], tmp_path: Path
+) -> None:
+    ref, root = make_repo(
+        {
+            "package.json": json.dumps({"dependencies": {"express": "^4.18.0"}}),
+            "package-lock.json": "{ not json",
+            "poetry.lock": "[[package]\nname=",
+            "pyproject.toml": '[tool.poetry.dependencies]\npython = "^3.11"\nhttpx = "^0.27"\n',
+        }
+    )
+    repo = analyze_checkout(ref, root, ScanOptions(workdir=tmp_path / "w")).repo
+    names = {d.name for d in repo.dependencies}
+    assert {"express", "httpx"} <= names
+    assert any("package-lock.json" in e for e in repo.scan_errors)
+    assert any("poetry.lock" in e for e in repo.scan_errors)
+
+
+def test_osv_vulnerabilities_sbom_and_usage(
+    make_repo: Callable[..., tuple[RepoRef, Path]], tmp_path: Path
+) -> None:
+    import httpx
+
+    from repo_catalog.analyzers.org import link_org
+    from repo_catalog.query import dependency_usage, get_repo
+    from repo_catalog.vulns import apply_vulnerabilities
+
+    ref, root = make_repo(
+        {
+            "package.json": json.dumps({"dependencies": {"lodash": "4.17.20", "left": "^1"}}),
+            "requirements.txt": "requests==2.31.0\n",
+        }
+    )
+    repo = analyze_checkout(ref, root, ScanOptions(workdir=tmp_path / "w")).repo
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/querybatch"):
+            queries = json.loads(request.content)["queries"]
+            assert {q["package"]["name"] for q in queries} == {"lodash", "requests"}  # exact only
+            results = [
+                {"vulns": [{"id": "GHSA-35jh-r3h4-6jhm"}]}
+                if q["package"]["name"] == "lodash"
+                else {}
+                for q in queries
+            ]
+            return httpx.Response(200, json={"results": results})
+        return httpx.Response(
+            200,
+            json={
+                "id": "GHSA-35jh-r3h4-6jhm",
+                "database_specific": {"severity": "HIGH"},
+                "affected": [
+                    {
+                        "package": {"name": "lodash", "ecosystem": "npm"},
+                        "ranges": [
+                            {
+                                "type": "SEMVER",
+                                "events": [{"introduced": "0"}, {"fixed": "4.17.21"}],
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+    cache = tmp_path / "osv"
+    assert apply_vulnerabilities([repo], cache, httpx.MockTransport(handler)) == 1
+    lodash = next(d for d in repo.dependencies if d.name == "lodash")
+    assert lodash.vulns == ["GHSA-35jh-r3h4-6jhm"] and repo.dependency_summary.vulnerable == 1
+    flag = next(f for f in repo.flags if f.id == "vulnerable-dependency")
+    assert flag.severity == "high" and "fixed in 4.17.21" in flag.message
+    n_calls = len(calls)
+    apply_vulnerabilities([repo], cache, httpx.MockTransport(handler))
+    assert len(calls) == n_calls  # served from cache
+    assert sum(f.id == "vulnerable-dependency" for f in repo.flags) == 1  # idempotent
+
+    def down(_: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("blocked")
+
+    assert apply_vulnerabilities([repo], tmp_path / "osv2", httpx.MockTransport(down)) == 0
+
+    apply_vulnerabilities([repo], cache, httpx.MockTransport(handler))
+    sbom = exports.repo_sbom(repo)
+    purls = {c.get("purl") for c in sbom["components"]}  # type: ignore[union-attr]
+    assert "pkg:npm/lodash@4.17.20" in purls and "pkg:pypi/requests@2.31.0" in purls
+    assert sbom["vulnerabilities"][0]["affects"] == [{"ref": "pkg:npm/lodash@4.17.20"}]  # type: ignore[index]
+
+    db = tmp_path / "c.db"
+    link_org([repo], [])
+    build_sqlite(db, [repo], [], {})
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    rows = dependency_usage(con, "LODASH", version_prefix="4.17")
+    assert rows[0]["resolved"] == "4.17.20" and rows[0]["vulns"] == "GHSA-35jh-r3h4-6jhm"
+    assert dependency_usage(con, "lodash", version_prefix="4.18") == []
+    assert con.execute("SELECT COUNT(*) FROM vulnerable_dependencies").fetchone()[0] == 1
+    full = get_repo(con, repo.id)
+    assert full and all(d["scope"] != "transitive" for d in full["dependencies"])
+
+
+def test_github_dependency_graph_merge() -> None:
+    import httpx
+
+    from repo_catalog.analyzers.purls import merge_github_sbom, parse_purl
+    from repo_catalog.github import GitHubClient
+
+    assert parse_purl("pkg:maven/org.slf4j/slf4j-api@2.0.9") == (
+        "maven",
+        "org.slf4j:slf4j-api",
+        "2.0.9",
+    )
+    assert parse_purl("pkg:npm/%40acme/ui@1.0.0") == ("npm", "@acme/ui", "1.0.0")
+    assert parse_purl("not a purl") is None
+
+    sbom = {
+        "packages": [
+            {"SPDXID": "SPDXRef-com.github.acme-app", "name": "com.github.acme/app"},
+            {
+                "SPDXID": "SPDXRef-npm-a",
+                "externalRefs": [
+                    {"referenceType": "purl", "referenceLocator": "pkg:npm/express@4.19.2"}
+                ],
+            },
+            {
+                "SPDXID": "SPDXRef-gem-b",
+                "externalRefs": [
+                    {"referenceType": "purl", "referenceLocator": "pkg:gem/nokogiri@1.16.2"}
+                ],
+            },
+        ],
+        "relationships": [
+            {
+                "spdxElementId": "SPDXRef-com.github.acme-app",
+                "relationshipType": "DEPENDS_ON",
+                "relatedSpdxElement": "SPDXRef-gem-b",
+            }
+        ],
+    }
+    client = GitHubClient(
+        "t",
+        transport=httpx.MockTransport(
+            lambda r: (
+                httpx.Response(200, json={"sbom": sbom})
+                if r.url.path.endswith("/sbom")
+                else httpx.Response(404)
+            )
+        ),
+    )
+    got = client.dependency_sbom("acme/app")
+    assert got is not None
+    deps = [Dependency(name="express", version="^4", ecosystem="npm", manifest="package.json")]
+    assert merge_github_sbom(deps, got) == 1  # express already known from the manifest
+    nokogiri = deps[-1]
+    assert (nokogiri.name, nokogiri.scope, nokogiri.resolved) == ("nokogiri", "runtime", "1.16.2")
+    assert nokogiri.manifest == "github-dependency-graph"
+    missing = GitHubClient("t", transport=httpx.MockTransport(lambda r: httpx.Response(404)))
+    assert missing.dependency_sbom("acme/app") is None
+
+
+def test_mcp_and_declared_relationships(
+    make_repo: Callable[..., tuple[RepoRef, Path]], tmp_path: Path
+) -> None:
+    from repo_catalog.analyzers.org import link_org
+
+    opts = ScanOptions(workdir=tmp_path / "w")
+    server = analyze_checkout(
+        *make_repo(
+            {
+                "package.json": json.dumps({"name": "@acme/tickets-mcp", "version": "1.0.0"}),
+                "src/index.ts": 'import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";\n'
+                'const s = new McpServer({ name: "tickets", version: "1" });\n',
+                "catalog-info.yaml": "apiVersion: backstage.io/v1alpha1\nkind: Component\n"
+                "metadata:\n  name: tickets\nspec:\n  owner: team-a\n  providesApis: [tickets-api]\n",
+            },
+            name="tickets-mcp",
+        ),
+        opts,
+    )
+    client = analyze_checkout(
+        *make_repo(
+            {
+                ".mcp.json": json.dumps(
+                    {
+                        "mcpServers": {
+                            "tix": {"command": "npx", "args": ["-y", "@acme/tickets-mcp@1.0.0"]}
+                        }
+                    }
+                ),
+                "catalog-info.yaml": "apiVersion: backstage.io/v1alpha1\nkind: Component\n"
+                "metadata:\n  name: portal\nspec:\n  owner: team-b\n  dependsOn: [component:default/tickets]\n"
+                "  consumesApis: [tickets-api]\n",
+            },
+            name="portal",
+        ),
+        opts,
+    )
+    link_org([server.repo, client.repo], server.assets + client.assets)
+    vias = {ln.via for ln in client.repo.depends_on}
+    assert {
+        "MCP server tix",
+        "declared dependsOn component:default/tickets",
+        "consumes API tickets-api",
+    } <= vias
+    assert {ln.repo for ln in server.repo.used_by} == {"acme/portal"}
+
+
+def test_example_mcp_servers_are_not_providers(
+    make_repo: Callable[..., tuple[RepoRef, Path]], tmp_path: Path
+) -> None:
+    from repo_catalog.analyzers.org import link_org
+
+    opts = ScanOptions(workdir=tmp_path / "w")
+    sdk = analyze_checkout(
+        *make_repo(
+            {
+                "examples/servers/github/server.py": 'from mcp.server.fastmcp import FastMCP\nmcp = FastMCP("github")\n',
+                "pyproject.toml": '[project]\nname = "mcp"\nversion = "1.0.0"\n',
+            },
+            name="sdk",
+        ),
+        opts,
+    )
+    app = analyze_checkout(
+        *make_repo(
+            {
+                ".mcp.json": json.dumps(
+                    {
+                        "mcpServers": {
+                            "github": {"url": "https://api.githubcopilot.com/mcp/"},
+                            # a word in a local script's args is not a launched package
+                            "local": {"command": "npx", "args": ["tsx", "src/main.ts", "mcp"]},
+                        }
+                    }
+                )
+            },
+            name="app",
+        ),
+        opts,
+    )
+    assert any(a.kind == "mcp-server" for a in sdk.assets)
+    link_org([sdk.repo, app.repo], sdk.assets + app.assets)
+    assert app.repo.depends_on == []

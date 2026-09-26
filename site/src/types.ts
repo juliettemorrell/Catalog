@@ -1,7 +1,12 @@
 // Mirrors the Python models (see ../schema/*.schema.json). Only fields the UI reads.
 
 export interface LanguageStat { name: string; files: number; lines: number; percent: number }
-export interface Dependency { name: string; version: string | null; ecosystem: string; scope: "runtime" | "dev" | "build" | "peer" | "optional" | "transitive"; manifest: string }
+export interface Dependency {
+  name: string; version: string | null; ecosystem: string;
+  scope: "runtime" | "dev" | "build" | "peer" | "optional" | "transitive"; manifest: string;
+  resolved: string | null; purl: string | null; vulns: string[];
+}
+export interface DependencySummary { direct: number; transitive: number; ecosystems: Record<string, number>; lockfile_coverage: number; vulnerable: number }
 export interface Pkg { name: string; path: string; ecosystem: string; version: string | null; description: string | null }
 export interface PracticeCheck { id: string; category: string; label: string; passed: boolean; weight: number; evidence: string | null }
 
@@ -35,7 +40,8 @@ export interface Repo {
   declared: { owner: string | null; system: string | null; lifecycle: string | null; tier: string | null; source_files: string[]; links: { url: string; title: string }[]; custom_properties: Record<string, unknown> };
   summary: { one_liner: string | null; readme_title: string | null; readme_excerpt: string | null; purpose: string | null; key_features: string[]; reuse_notes: string | null; domains: string[]; source: string };
   stack: Stack;
-  dependencies: Dependency[];
+  dependencies: Dependency[]; // direct only in catalog.json; transitive are counted in dependency_summary
+  dependency_summary: DependencySummary;
   structure: { repo_type: string; is_monorepo: boolean; packages: Pkg[]; entrypoints: string[]; api_specs: string[]; dockerfiles: string[]; top_level: string[]; docs: string[]; file_count: number; total_lines: number };
   practices: { score: number; grade: "A" | "B" | "C" | "D" | "F"; checks: PracticeCheck[] };
   ownership: { codeowners: string[]; top_contributors: { name: string; commits: number }[]; contributor_count: number; commit_count: number; first_commit: string | null; last_commit: string | null };

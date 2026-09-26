@@ -21,15 +21,17 @@ from .analyzers.docs import first_sentence, parse_codeowners, parse_declared, su
 from .analyzers.flags import repo_flags, runtime_versions
 from .analyzers.manifests import parse_manifests
 from .analyzers.practices import assess_practices
+from .analyzers.purls import PACKAGE_ECOSYSTEMS, merge_github_sbom, summarize
 from .analyzers.reusables import find_references, find_reusables
 from .analyzers.stack import analyze_stack
 from .fs import RepoFiles
-from .github import RepoRef
+from .github import GitHubClient, RepoRef
 from .models import AIAsset, AIUsageSummary, Contributor, Ownership, Repo
 
 log = logging.getLogger(__name__)
 
 MAX_PROVENANCE_LOOKUPS = 2000
+MAX_DEPENDENCIES = 15_000
 
 
 @dataclass
@@ -41,10 +43,14 @@ class ScanOptions:
     max_files: int = 100_000
     force: bool = False
     provenance: bool = True
+    github_sbom: bool = False  # merge GitHub's dependency graph (needs a token)
 
     def fingerprint(self) -> str:
         """Options that change the output; a stored record is reused only if they match."""
-        return f"{__version__}|shallow={self.shallow}|prov={self.provenance}|max={self.max_files}"
+        return (
+            f"{__version__}|shallow={self.shallow}|prov={self.provenance}|max={self.max_files}"
+            f"|sbom={self.github_sbom}"
+        )
 
 
 @dataclass
@@ -65,6 +71,7 @@ def scan_all(
     refs: list[RepoRef], opts: ScanOptions, previous: dict[str, tuple[Repo, list[AIAsset]]]
 ) -> ScanReport:
     report = ScanReport()
+    gh = GitHubClient(opts.token) if opts.github_sbom and opts.token else None
 
     def one(ref: RepoRef) -> ScanResult:
         prev = previous.get(ref.full_name)
@@ -83,7 +90,12 @@ def scan_all(
             shallow=opts.shallow,
         )
         ref.head_sha = sha
-        return analyze_checkout(ref, checkout, opts)
+        result = analyze_checkout(ref, checkout, opts)
+        if gh is not None:
+            sbom = gh.dependency_sbom(ref.full_name)
+            if sbom and merge_github_sbom(result.repo.dependencies, sbom):
+                result.repo.dependency_summary = summarize(result.repo.dependencies)
+        return result
 
     with ThreadPoolExecutor(max_workers=max(1, opts.workers)) as pool:
         futures = {pool.submit(one, ref): ref for ref in refs}
@@ -192,6 +204,9 @@ def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanRes
         ]
         ownership.contributor_count = len(history.contributors)
 
+    # direct deps first so the cap never drops them in favour of lockfile entries
+    deps = sorted(manifests.dependencies, key=lambda d: d.scope == "transitive")[:MAX_DEPENDENCIES]
+
     # ---- risk flags, building blocks, cross-repo references ----
     meta = ref.meta
     workflows = stack_res.workflow_texts
@@ -225,7 +240,13 @@ def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanRes
         structure,
         manifests.lockfiles,
         stack_res.workflow_texts,
-        len([d for d in manifests.dependencies if d.scope != "build"]),
+        len(
+            [
+                d
+                for d in manifests.dependencies
+                if d.scope not in ("build", "transitive") and d.ecosystem in PACKAGE_ECOSYSTEMS
+            ]
+        ),
         description=meta.get("description"),
         topics=meta.get("topics") or [],
         has_descriptor=bool(declared.source_files),
@@ -260,7 +281,8 @@ def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanRes
         declared=declared,
         summary=summary,
         stack=stack,
-        dependencies=manifests.dependencies[:2000],
+        dependencies=deps,
+        dependency_summary=summarize(deps),
         structure=structure,
         practices=practices,
         ownership=ownership,

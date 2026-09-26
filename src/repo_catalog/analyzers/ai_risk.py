@@ -106,8 +106,10 @@ _DOCKER_VALUE_FLAGS = {
 }
 
 
-def unpinned_package(command: str) -> str | None:
-    """The package/image an MCP launcher fetches without pinning a version, if any."""
+def launched_package(command: str) -> tuple[str, str] | None:
+    """(ecosystem, spec) of what an MCP launcher runs: ``npx -y @acme/mcp@1`` ->
+    ("npm", "@acme/mcp@1"); ``uvx pkg==2`` -> ("pypi", "pkg==2"); images -> ("docker", ..).
+    Local scripts and runners (``npx tsx src/server.ts``) return None."""
     try:
         argv = shlex.split(command)
     except ValueError:
@@ -119,10 +121,8 @@ def unpinned_package(command: str) -> str | None:
     if exe in ("npx", "bunx", "pnpx") or argv[:2] in (["pnpm", "dlx"], ["yarn", "dlx"]):
         rest = rest[1:] if exe in ("pnpm", "yarn") else rest
         pkg = _first_positional(rest, {"-p", "--package"})
-        if pkg and pkg.split("@")[0] not in _RUNNERS:
-            _, _, version = pkg[1:].partition("@") if pkg.startswith("@") else pkg.partition("@")
-            if not version or version == "latest":
-                return pkg
+        if pkg and pkg.split("@")[0] not in _RUNNERS and not pkg.startswith((".", "/")):
+            return "npm", pkg
         return None
     if exe in ("uvx", "pipx") or argv[:2] == ["uv", "tool"]:
         if exe == "pipx":
@@ -134,15 +134,27 @@ def unpinned_package(command: str) -> str | None:
             spec = rest[i + 1] if i + 1 < len(rest) else ""
         else:
             spec = _first_positional(rest, {"--python", "--with", "--index-url"}) or ""
-        if spec and not re.search(r"==|@|\.whl$|^git\+|^\.|/", spec):
-            return spec
-        return None
+        return ("pypi", spec) if spec and not spec.startswith((".", "/")) else None
     if exe in ("docker", "podman") and rest[:1] == ["run"]:
         image = _first_positional(rest[1:], _DOCKER_VALUE_FLAGS)
-        if image and "@sha256:" not in image:
-            last = image.rsplit("/", 1)[-1]
-            if ":" not in last or last.endswith(":latest"):
-                return image
+        return ("docker", image) if image else None
+    return None
+
+
+def unpinned_package(command: str) -> str | None:
+    """The package/image an MCP launcher fetches without pinning a version, if any."""
+    launched = launched_package(command)
+    if not launched:
+        return None
+    ecosystem, spec = launched
+    if ecosystem == "npm":
+        _, _, version = spec[1:].partition("@") if spec.startswith("@") else spec.partition("@")
+        return spec if not version or version == "latest" else None
+    if ecosystem == "pypi":
+        return spec if not re.search(r"==|@|\.whl$|^git\+|/", spec) else None
+    last = spec.rsplit("/", 1)[-1]
+    if "@sha256:" not in spec and (":" not in last or last.endswith(":latest")):
+        return spec
     return None
 
 

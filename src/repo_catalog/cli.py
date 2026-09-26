@@ -22,6 +22,7 @@ from .models import AIAsset, Repo
 from .outputs import exports, store
 from .outputs.sqlite import build_sqlite, dump_meta
 from .scanner import ScanOptions, ScanResult, analyze_checkout, mark_duplicates, scan_all
+from .vulns import apply_vulnerabilities
 
 log = logging.getLogger("repo_catalog")
 
@@ -93,6 +94,16 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--no-provenance", action="store_true", help="Skip per-file git history.")
     s.add_argument("--max-files", type=int, default=100_000)
     s.add_argument(
+        "--github-sbom",
+        action="store_true",
+        help="Also merge GitHub's dependency graph (needs a token with contents: read).",
+    )
+    s.add_argument(
+        "--osv",
+        action="store_true",
+        help="Check locked dependency versions against OSV.dev for known vulnerabilities.",
+    )
+    s.add_argument(
         "--llm",
         action="store_true",
         help="Enrich with Claude summaries (needs ANTHROPIC_API_KEY and the [llm] extra).",
@@ -104,6 +115,7 @@ def _parser() -> argparse.ArgumentParser:
     b = sub.add_parser("build", help="Rebuild aggregates, SQLite and exports from data/repos.")
     b.add_argument("--out", type=Path, default=Path("data"))
     b.add_argument("--source", default="catalog")
+    b.add_argument("--osv", action="store_true", help="Check dependencies against OSV.dev.")
     b.set_defaults(func=cmd_build)
 
     q = sub.add_parser("search", help="Full-text search the catalog.")
@@ -130,6 +142,15 @@ def _parser() -> argparse.ArgumentParser:
     bl.add_argument("--limit", type=_positive, default=20)
     bl.add_argument("--out", type=Path, default=Path("data"))
     bl.set_defaults(func=cmd_blocks)
+
+    du = sub.add_parser("deps", help="Which repos ship a package, at which versions.")
+    du.add_argument("package")
+    du.add_argument("--ecosystem")
+    du.add_argument("--version", dest="version_prefix", help="Version prefix, e.g. 4.17")
+    du.add_argument("--direct", action="store_true", help="Skip transitive dependencies.")
+    du.add_argument("--limit", type=_positive, default=200)
+    du.add_argument("--out", type=Path, default=Path("data"))
+    du.set_defaults(func=cmd_deps)
 
     fl = sub.add_parser("flags", help="List security, maintenance and AI-governance findings.")
     fl.add_argument("--severity", choices=["high", "medium", "low"])
@@ -180,6 +201,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         max_files=args.max_files,
         force=args.force,
         provenance=not args.no_provenance,
+        github_sbom=args.github_sbom,
     )
     previous = store.load_previous(args.out)
     results: list[ScanResult] = []
@@ -234,7 +256,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             log.info("pruned %d repos no longer in %s", len(removed), ", ".join(sorted(owners)))
 
     source = ",".join([f"org:{o}" for o in args.org] + args.repo + [str(p) for p in args.local])
-    _build(args.out, source, llm=args.llm)
+    _build(args.out, source, llm=args.llm, osv=args.osv)
     log.info(
         "done: %d repos (%d scanned, %d reused), %d failed",
         len(results),
@@ -340,11 +362,11 @@ def _enrich(args: argparse.Namespace, results: list[ScanResult]) -> bool:
 def cmd_build(args: argparse.Namespace) -> int:
     if not (args.out / store.REPOS_DIR).is_dir():
         sys.exit(f"{args.out / store.REPOS_DIR} not found; run `repo-catalog scan` first.")
-    _build(args.out, args.source, llm=False)
+    _build(args.out, args.source, llm=False, osv=args.osv)
     return 0
 
 
-def _build(out: Path, source: str, llm: bool) -> None:
+def _build(out: Path, source: str, llm: bool, osv: bool = False) -> None:
     prev = store.load_previous(out)
     repos: list[Repo] = sorted((r for r, _ in prev.values()), key=lambda r: r.id.lower())
     assets: list[AIAsset] = [
@@ -352,11 +374,15 @@ def _build(out: Path, source: str, llm: bool) -> None:
     ]
     mark_duplicates(assets)
     link_org(repos, assets)
+    if osv:
+        hits = apply_vulnerabilities(repos, Path(".cache/osv"))
+        log.info("OSV: %d vulnerable dependency versions", hits)
     llm = llm or any(r.summary.source == "llm" for r in repos)
     meta = store.write_aggregates(out, repos, assets, source, llm)
     build_sqlite(out / DB_FILE, repos, assets, dump_meta(meta.model_dump(mode="json")))
     exports.write_backstage(out / "backstage-entities.yaml", repos)
     exports.write_aibom(out / "ai-bom.cdx.json", repos, assets, source)
+    exports.write_sboms(out / "sbom", repos)
     log.info("wrote %d repos and %d AI assets to %s", len(repos), len(assets), out)
 
 
@@ -382,6 +408,21 @@ def cmd_blocks(args: argparse.Namespace) -> int:
     from .query import find_building_blocks
 
     rows = find_building_blocks(_connect(args.out), args.query, kind=args.kind, limit=args.limit)
+    print(json.dumps(rows, indent=2))
+    return 0
+
+
+def cmd_deps(args: argparse.Namespace) -> int:
+    from .query import dependency_usage
+
+    rows = dependency_usage(
+        _connect(args.out),
+        args.package,
+        ecosystem=args.ecosystem,
+        version_prefix=args.version_prefix,
+        include_transitive=not args.direct,
+        limit=args.limit,
+    )
     print(json.dumps(rows, indent=2))
     return 0
 

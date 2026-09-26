@@ -77,9 +77,7 @@ def write_aggregates(
     )
     meta_json = meta.model_dump(mode="json")
     (out_dir / CATALOG_FILE).write_text(
-        json.dumps(
-            {"meta": meta_json, "repos": [r.model_dump(mode="json") for r in repos]}, indent=1
-        )
+        json.dumps({"meta": meta_json, "repos": [_site_repo(r) for r in repos]}, indent=1)
     )
     (out_dir / ASSETS_FILE).write_text(
         json.dumps(
@@ -87,6 +85,14 @@ def write_aggregates(
         )
     )
     return meta
+
+
+def _site_repo(r: Repo) -> dict[str, object]:
+    """catalog.json feeds the browser: locked transitive deps (often thousands per repo)
+    stay in the per-repo files, SQLite and SBOMs; counts are in dependency_summary."""
+    data = r.model_dump(mode="json")
+    data["dependencies"] = [d for d in data["dependencies"] if d["scope"] != "transitive"]
+    return data
 
 
 def load_aggregates(out_dir: Path) -> tuple[list[Repo], list[AIAsset]]:

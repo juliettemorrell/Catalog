@@ -26,10 +26,12 @@ already have a GitHub Action, reusable workflow, Terraform module, Helm chart, t
 for it. Use repos_using to find prior art for a technology ("stripe", "fastapi"),
 technology_usage to learn the org's standard stack, repo_relationships for what a repo depends
 on and what depends on it (blast radius), list_flags for security/maintenance/AI-governance
-findings, and sql for anything else (tables: repos, repo_tech, repo_capabilities,
+findings, dependency_usage for exactly which repos ship a package version (direct or
+transitive, from lockfiles), and sql for anything else (tables: repos, repo_tech, repo_capabilities,
 dependencies, packages, practice_checks, flags, reusables, repo_links, runtime_versions,
 ai_assets, asset_tools, asset_models, asset_tags; views: tech_usage, dependency_usage,
-dependency_versions, flag_summary).
+dependency_versions, vulnerable_dependencies, flag_summary). Dependencies carry resolved
+(locked) versions and purls; full per-repo SBOMs are in data/sbom/.
 """
 
 
@@ -110,6 +112,29 @@ def build_server(db_path: Path) -> MCPServer:
     def get_ai_asset(asset_id: str) -> dict[str, Any] | str:
         """Full AI asset including its content (skill body, prompt text, agent definition...)."""
         return query.get_asset(con(), asset_id) or f"No asset with id {asset_id!r}."
+
+    @server.tool(annotations=READ_ONLY)
+    def dependency_usage(
+        package: str,
+        ecosystem: str | None = None,
+        version_prefix: str | None = None,
+        include_transitive: bool = True,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Which repos ship a package, at which versions, direct or transitive, and with
+        which known advisories. package is the exact name (e.g. "lodash", "requests",
+        "org.springframework.boot:spring-boot-starter-web", "postgres" for images).
+        ecosystem: npm, pypi, go, cargo, maven, nuget, gem, composer, docker,
+        github-actions, terraform, helm... version_prefix: e.g. "4.17" or "2.".
+        Use it for upgrade planning and "are we exposed to CVE-X in package Y?"."""
+        return query.dependency_usage(
+            con(),
+            package,
+            ecosystem=ecosystem,
+            version_prefix=version_prefix,
+            include_transitive=include_transitive,
+            limit=min(limit, 1000),
+        )
 
     @server.tool(annotations=READ_ONLY)
     def repos_using(technology: str) -> list[dict[str, Any]]:

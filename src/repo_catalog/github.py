@@ -307,6 +307,20 @@ class GitHubClient:
             for row in rows
         }
 
+    def dependency_sbom(self, full_name: str) -> dict[str, Any] | None:
+        """GitHub's dependency graph as SPDX JSON (needs the dependency graph enabled and
+        `contents: read`). None when unavailable, so scans never depend on it."""
+        try:
+            resp = self._request("GET", f"/repos/{full_name}/dependency-graph/sbom")
+        except GitHubError as exc:
+            log.info("Dependency graph unavailable for %s (%s)", full_name, exc)
+            return None
+        if resp.status_code != 200:
+            log.info("Dependency graph unavailable for %s (HTTP %s)", full_name, resp.status_code)
+            return None
+        sbom = resp.json().get("sbom")
+        return sbom if isinstance(sbom, dict) else None
+
 
 def _ref_from_node(node: dict[str, Any]) -> RepoRef:
     branch = node.get("defaultBranchRef") or {}

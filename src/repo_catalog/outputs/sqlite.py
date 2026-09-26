@@ -28,7 +28,7 @@ CREATE TABLE repo_capabilities (repo_id TEXT, capability TEXT);
 CREATE TABLE repo_topics (repo_id TEXT, topic TEXT);
 CREATE TABLE repo_languages (repo_id TEXT, language TEXT, lines INTEGER, percent REAL);
 CREATE TABLE dependencies (repo_id TEXT, name TEXT, version TEXT, ecosystem TEXT,
-  scope TEXT, manifest TEXT);
+  scope TEXT, manifest TEXT, resolved TEXT, purl TEXT, vulns TEXT);
 CREATE TABLE packages (repo_id TEXT, name TEXT, path TEXT, ecosystem TEXT, version TEXT,
   description TEXT);
 CREATE TABLE practice_checks (repo_id TEXT, check_id TEXT, category TEXT, label TEXT,
@@ -58,6 +58,7 @@ CREATE INDEX idx_tech ON repo_tech(name COLLATE NOCASE);
 CREATE INDEX idx_tech_repo ON repo_tech(repo_id);
 CREATE INDEX idx_cap ON repo_capabilities(capability);
 CREATE INDEX idx_dep ON dependencies(name COLLATE NOCASE);
+CREATE INDEX idx_dep_purl ON dependencies(purl);
 CREATE INDEX idx_asset_kind ON ai_assets(kind, ecosystem);
 CREATE INDEX idx_asset_repo ON ai_assets(repo_id);
 CREATE INDEX idx_flags ON flags(flag_id, severity);
@@ -69,10 +70,15 @@ CREATE VIEW flag_summary AS
   CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, findings DESC;
 CREATE VIEW dependency_versions AS
   SELECT ecosystem, name, COUNT(DISTINCT repo_id) AS repo_count,
-         COUNT(DISTINCT version) AS version_count, GROUP_CONCAT(DISTINCT version) AS versions
-  FROM dependencies WHERE version IS NOT NULL AND scope != 'transitive'
+         COUNT(DISTINCT COALESCE(resolved, version)) AS version_count,
+         GROUP_CONCAT(DISTINCT COALESCE(resolved, version)) AS versions
+  FROM dependencies WHERE COALESCE(resolved, version) IS NOT NULL AND scope != 'transitive'
   GROUP BY ecosystem, name HAVING COUNT(DISTINCT repo_id) > 1
   ORDER BY version_count DESC, repo_count DESC;
+CREATE VIEW vulnerable_dependencies AS
+  SELECT d.repo_id, d.ecosystem, d.name, COALESCE(d.resolved, d.version) AS version, d.scope,
+         d.manifest, d.vulns FROM dependencies d WHERE d.vulns IS NOT NULL
+  ORDER BY d.repo_id, d.name;
 CREATE VIEW tech_usage AS
   SELECT category, name, COUNT(DISTINCT repo_id) AS repo_count
   FROM repo_tech GROUP BY category, name ORDER BY repo_count DESC;
@@ -169,8 +175,21 @@ def _insert_repo(con: sqlite3.Connection, r: Repo) -> None:
         [(r.id, lang.name, lang.lines, lang.percent) for lang in s.languages],
     )
     con.executemany(
-        "INSERT INTO dependencies VALUES (?,?,?,?,?,?)",
-        [(r.id, d.name, d.version, d.ecosystem, d.scope, d.manifest) for d in r.dependencies],
+        "INSERT INTO dependencies VALUES (?,?,?,?,?,?,?,?,?)",
+        [
+            (
+                r.id,
+                d.name,
+                d.version,
+                d.ecosystem,
+                d.scope,
+                d.manifest,
+                d.resolved,
+                d.purl,
+                " ".join(d.vulns) or None,
+            )
+            for d in r.dependencies
+        ],
     )
     con.executemany(
         "INSERT INTO packages VALUES (?,?,?,?,?,?)",

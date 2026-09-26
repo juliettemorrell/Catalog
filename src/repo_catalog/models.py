@@ -26,11 +26,25 @@ class _Model(BaseModel):
 
 class Dependency(_Model):
     name: str
-    version: str | None = None
-    ecosystem: str  # npm, pypi, go, cargo, maven, gem, composer, nuget
-    # transitive: indirect deps pinned by the manifest (e.g. Go "// indirect")
+    version: str | None = None  # as declared (a range such as ^1.2 or an exact pin)
+    # npm, pypi, go, cargo, maven, gem, composer, nuget, pub, swift, cocoapods, hex, cran,
+    # conda, bazel, vcpkg, conan, jsr, terraform, helm, docker, github-actions, pre-commit,
+    # ansible-galaxy
+    ecosystem: str
+    # transitive: pulled in by another dependency (lockfile entries, Go "// indirect")
     scope: Literal["runtime", "dev", "optional", "peer", "build", "transitive"] = "runtime"
-    manifest: str  # path of the manifest the dependency came from
+    manifest: str  # path of the manifest (or lockfile, for transitive deps) it came from
+    resolved: str | None = None  # exact version from a lockfile, when there is one
+    purl: str | None = None  # package URL (https://github.com/package-url/purl-spec)
+    vulns: list[str] = Field(default_factory=list)  # known advisories (OSV ids), --osv
+
+
+class DependencySummary(_Model):
+    direct: int = 0
+    transitive: int = 0
+    ecosystems: dict[str, int] = Field(default_factory=dict)  # direct deps per ecosystem
+    lockfile_coverage: float = 0.0  # share of direct package deps with a resolved version
+    vulnerable: int = 0  # deps with known advisories (--osv)
 
 
 class Package(_Model):
@@ -242,6 +256,7 @@ class Repo(_Model):
     summary: Summary = Field(default_factory=Summary)
     stack: Stack = Field(default_factory=Stack)
     dependencies: list[Dependency] = Field(default_factory=list)
+    dependency_summary: DependencySummary = Field(default_factory=DependencySummary)
     structure: Structure = Field(default_factory=Structure)
     practices: Practices = Field(default_factory=Practices)
     ownership: Ownership = Field(default_factory=Ownership)

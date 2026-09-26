@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "repo-catalog"
-version = "0.2.0"
+version = "0.3.0"
 description = "Scan every repository in a GitHub org and build two catalogs: a general repo catalog and an AI asset library."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -49,3 +49,5 @@ addopts = "-q"
 [tool.ruff.lint.per-file-ignores]
 "src/repo_catalog/analyzers/rules.py" = ["E501"]  # knowledge-base tables read best unwrapped
 "src/repo_catalog/analyzers/flags.py" = ["E501"]  # secret patterns read best unwrapped
+"src/repo_catalog/analyzers/deps_more.py" = ["E501"]  # manifest regexes read best unwrapped
+"tests/test_scan.py" = ["E501"]  # fixture file contents read best unwrapped

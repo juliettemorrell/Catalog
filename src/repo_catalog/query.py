@@ -243,12 +243,53 @@ def repo_relationships(con: sqlite3.Connection, repo_id: str) -> dict[str, Any] 
     }
 
 
-def get_repo(con: sqlite3.Connection, repo_id: str) -> dict[str, Any] | None:
+def get_repo(
+    con: sqlite3.Connection, repo_id: str, *, include_transitive: bool = False
+) -> dict[str, Any] | None:
+    """Full record. Locked transitive dependencies (often thousands) are left out unless
+    asked for; `dependency_summary` has their count and `dependency_usage` queries them."""
     row = con.execute(
         "SELECT json FROM repos WHERE id = ? COLLATE NOCASE OR name = ? COLLATE NOCASE",
         (repo_id, repo_id),
     ).fetchone()
-    return json.loads(row[0]) if row else None
+    if not row:
+        return None
+    data: dict[str, Any] = json.loads(row[0])
+    if not include_transitive:
+        data["dependencies"] = [d for d in data["dependencies"] if d["scope"] != "transitive"]
+    return data
+
+
+def dependency_usage(
+    con: sqlite3.Connection,
+    name: str,
+    *,
+    ecosystem: str | None = None,
+    version_prefix: str | None = None,
+    include_transitive: bool = True,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Every repo that ships a package (exact name, case-insensitive), with the declared and
+    locked version, whether it is direct or transitive, where, and known advisories."""
+    where, params = ["d.name = ? COLLATE NOCASE"], [name]
+    if ecosystem:
+        where.append("d.ecosystem = ?")
+        params.append(ecosystem)
+    if version_prefix:
+        where.append("COALESCE(d.resolved, d.version) LIKE ? ESCAPE '\\'")
+        params.append(re.sub(r"([%_\\])", r"\\\1", version_prefix) + "%")
+    if not include_transitive:
+        where.append("d.scope != 'transitive'")
+    return _rows(
+        con.execute(
+            "SELECT d.repo_id AS repo, d.ecosystem, d.name, d.version AS declared, d.resolved, "
+            "d.scope, d.manifest, d.purl, d.vulns, r.lifecycle FROM dependencies d "
+            "JOIN repos r ON r.id = d.repo_id WHERE "
+            + " AND ".join(where)
+            + " ORDER BY r.archived, d.repo_id, d.scope LIMIT ?",
+            [*params, _clamp(limit, 2000)],
+        )
+    )
 
 
 def get_asset(con: sqlite3.Connection, asset_id: str) -> dict[str, Any] | None:
@@ -276,9 +317,11 @@ def repos_using(con: sqlite3.Connection, name: str) -> list[dict[str, Any]]:
         con.execute(
             "SELECT DISTINCT r.id, r.url, r.one_liner, t.category, t.name AS matched "
             "FROM repo_tech t JOIN repos r ON r.id = t.repo_id WHERE t.name LIKE ? COLLATE NOCASE "
-            "UNION SELECT DISTINCT r.id, r.url, r.one_liner, 'dependency', d.name || ' ' || "
-            "COALESCE(d.version, '') FROM dependencies d JOIN repos r ON r.id = d.repo_id "
-            "WHERE d.name LIKE ? COLLATE NOCASE ORDER BY 1",
+            "UNION SELECT DISTINCT r.id, r.url, r.one_liner, "
+            "CASE d.scope WHEN 'transitive' THEN 'transitive dependency' ELSE 'dependency' END, "
+            "d.name || ' ' || COALESCE(d.resolved, d.version, '') "
+            "FROM dependencies d JOIN repos r ON r.id = d.repo_id "
+            "WHERE d.name LIKE ? COLLATE NOCASE ORDER BY 1 LIMIT 500",
             (f"%{name}%", f"%{name}%"),
         )
     )

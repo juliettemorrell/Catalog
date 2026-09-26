@@ -107,6 +107,8 @@ async function load(): Promise<void> {
   for (const r of catalog.repos) { // catalogs from older scanner versions lack these fields
     r.flags ??= []; r.reusables ??= []; r.depends_on ??= []; r.used_by ??= [];
     r.stack.runtime_versions ??= [];
+    r.dependency_summary ??= { direct: r.dependencies.length, transitive: 0, ecosystems: {}, lockfile_coverage: 0, vulnerable: 0 };
+    for (const d of r.dependencies) { d.vulns ??= []; d.resolved ??= null; d.purl ??= null; }
   }
   for (const a of catalog.assets) a.flags ??= [];
   blocks = catalog.repos.flatMap((r) => r.reusables.map((x, i) => ({ ...x, id: `${r.id}::${i}`, repo: r.id, repoRef: r })));
@@ -496,8 +498,8 @@ function repoDetail(r: Repo): string {
   const s = r.stack;
   const assets = catalog.assets.filter((a) => a.repo === r.id);
   const failing = r.practices.checks.filter((c) => !c.passed);
-  const deps = r.dependencies.filter((d) => d.scope !== "dev");
-  const devDeps = r.dependencies.filter((d) => d.scope === "dev");
+  const ds = r.dependency_summary;
+  const deps = [...r.dependencies].sort((a, b) => num(b.vulns.length) - num(a.vulns.length) || a.ecosystem.localeCompare(b.ecosystem) || a.name.localeCompare(b.name));
   return `<div class="d-head">
       <p class="eyebrow">${esc(r.structure.repo_type)} · ${esc(r.lifecycle)}${r.declared.system ? ` · system ${esc(r.declared.system)}` : ""}</p>
       <h2 id="drawer-title">${esc(r.id)}</h2>
@@ -540,10 +542,15 @@ function repoDetail(r: Repo): string {
       ["Docs", r.structure.docs.map((e) => `<code>${esc(e)}</code>`).join(" ")],
       ["Top level", r.structure.top_level.slice(0, 30).map((e) => `<code>${esc(e)}</code>`).join(" ")],
     ]))}
-    ${section(`Dependencies (${r.dependencies.length})`, r.dependencies.length ? `<details><summary>${deps.length} runtime · ${devDeps.length} dev</summary>
-      <div class="table-wrap" tabindex="0" role="region" aria-label="Dependencies"><table class="deps"><thead><tr><th>Name</th><th>Version</th><th>Scope</th><th>Manifest</th></tr></thead><tbody>
-      ${r.dependencies.slice(0, 400).map((d) => `<tr><td>${esc(d.name)}</td><td>${esc(d.version ?? "")}</td><td>${esc(d.scope)}</td><td class="muted">${esc(d.manifest)}</td></tr>`).join("")}
-      </tbody></table></div></details>` : "")}
+    ${section(`Dependencies (${fmtNum(ds.direct)} direct${ds.transitive ? ` · ${fmtNum(ds.transitive)} transitive` : ""})`, r.dependencies.length ? `
+      <p class="small muted">${Object.entries(ds.ecosystems).map(([e, n]) => `<a href="${esc(href({ tab: "repos", q: `depeco:${e}`, open: null }))}">${esc(e)}</a> ${num(n)}`).join(" · ")}
+        ${ds.lockfile_coverage ? ` · ${Math.round(num(ds.lockfile_coverage) * 100)}% of packages locked to an exact version` : ""}
+        ${ds.vulnerable ? ` · <strong class="sev sev-high">${num(ds.vulnerable)} with known advisories</strong>` : ""}</p>
+      <details><summary>Show ${fmtNum(deps.length)} direct dependencies</summary>
+      <div class="table-wrap" tabindex="0" role="region" aria-label="Dependencies"><table class="deps"><thead><tr><th>Name</th><th>Declared</th><th>Locked</th><th>Scope</th><th>Ecosystem</th><th>Manifest</th></tr></thead><tbody>
+      ${deps.slice(0, 500).map((d) => `<tr><td><a href="${esc(href({ tab: "repos", q: `dep:${/\s/.test(d.name) ? `"${d.name}"` : d.name}`, open: null }))}">${esc(d.name)}</a>${d.vulns.length ? ` <a class="sev sev-high" href="${esc(safeUrl(`https://osv.dev/vulnerability/${encodeURIComponent(d.vulns[0]!)}`))}" target="_blank" rel="noopener noreferrer" title="${esc(d.vulns.join(", "))}">${d.vulns.length} advisor${d.vulns.length > 1 ? "ies" : "y"}</a>` : ""}</td>
+        <td>${esc(d.version ?? "")}</td><td>${esc(d.resolved ?? "")}</td><td>${esc(d.scope)}</td><td>${esc(d.ecosystem)}</td><td class="muted">${esc(d.manifest)}</td></tr>`).join("")}
+      </tbody></table></div>${ds.transitive ? `<p class="small muted">Transitive dependencies are in the per-repo JSON, <code>catalog.db</code> and <code>data/sbom/</code>.</p>` : ""}</details>` : "")}
     ${section("Ownership", kv([
       ["Declared owner", esc(r.declared.owner)],
       ["CODEOWNERS", r.ownership.codeowners.map(esc).join(", ")],
@@ -705,6 +712,8 @@ function renderInsights(): void {
         ${bars("Practices grade", countBy(rs, (r) => r.practices.grade).sort((a, b) => a[0].localeCompare(b[0])), (v) => repoQ(`grade:${v}`), rs.length)}
         ${bars("Findings (active repos)", countBy(active, (r) => [...r.flags, ...(assetFlagsByRepo.get(r.id) ?? [])].map((f) => flagLabel(f.id))), (v) => repoQ(`flag:${flagIdByLabel.get(v) ?? v}`), active.length, 12)}
         ${bars("Building blocks", countBy(blocks, (b) => BLOCK_LABEL[b.kind] ?? b.kind), (v) => href({ tab: "blocks", q: `kind:${blockKindByLabel.get(v) ?? v}`, open: null }), blocks.length)}
+        ${bars("Dependency ecosystems (repos)", countBy(rs, (r) => Object.keys(r.dependency_summary.ecosystems)), (v) => repoQ(`depeco:${v}`), rs.length, 12)}
+        ${bars("Packages with known advisories (repos)", countBy(rs, (r) => r.dependencies.filter((d) => d.vulns.length).map((d) => d.name)), (v) => repoQ(`dep:${quote(v)} vuln:yes`), rs.length)}
         ${bars("Most depended-on repos", rs.filter((r) => r.used_by.length).map((r) => [r.id, r.used_by.length] as [string, number]).sort((a, b) => b[1] - a[1]), (v) => href({ tab: "repos", open: v, q: "" }), rs.length)}
       </div>
       ${versionDrift(active)}
@@ -717,8 +726,9 @@ function versionDrift(rs: Repo[]): string {
   const byDep = new Map<string, Map<string, Set<string>>>();
   for (const r of rs) {
     for (const d of r.dependencies) {
-      if (d.scope === "transitive" || !d.version) continue;
-      const major = /(\d+)(?:\.(\d+))?/.exec(d.version.replace(/^[^\d]*/, ""));
+      const version = d.resolved ?? d.version;
+      if (d.scope === "transitive" || !version || d.ecosystem === "github-actions") continue;
+      const major = /(\d+)(?:\.(\d+))?/.exec(version.replace(/^[^\d]*/, ""));
       if (!major) continue;
       const key = major[1] === "0" && major[2] !== undefined ? `0.${major[2]}` : major[1]!;
       const name = `${d.ecosystem}:${d.name}`;
@@ -754,6 +764,8 @@ function repoRow(r: Repo): Record<string, unknown> {
     databases: r.stack.databases.join("; "), cloud: r.stack.cloud.join("; "),
     capabilities: r.capabilities.join("; "), practices_score: r.practices.score,
     grade: r.practices.grade, ai_assets: r.ai.asset_count,
+    direct_dependencies: r.dependency_summary.direct, transitive_dependencies: r.dependency_summary.transitive,
+    vulnerable_dependencies: r.dependency_summary.vulnerable,
     high_findings: r.flags.filter((f) => f.severity === "high").map((f) => flagLabel(f.id)).join("; "),
     used_by: r.used_by.length, owner: r.declared.owner ?? r.ownership.codeowners.join("; "),
     last_commit: r.ownership.last_commit ?? r.pushed_at, summary: r.summary.purpose ?? r.summary.one_liner,

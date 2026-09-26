@@ -336,3 +336,5 @@ pre {
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 
 .focus-guard { position: absolute; width: 1px; height: 1px; overflow: hidden; }
+/* links inside running text or table cells must not rely on color alone (WCAG 1.4.1) */
+.d-section p a, table.deps td a:not(.sev) { text-decoration: underline; text-underline-offset: 2px; }

@@ -5,7 +5,7 @@ import type { Asset, Block, Flag, Repo } from "../types";
 const repo = (over: Partial<Repo> & { lang?: string; fw?: string[]; langs?: string[] }): Repo =>
   ({
     id: over.id ?? "acme/x", name: "x", owner: "acme", topics: [], archived: false, fork: false,
-    visibility: "private", capabilities: [], dependencies: [], lifecycle: "active",
+    visibility: "private", capabilities: [], dependencies: over.dependencies ?? [], lifecycle: "active",
     stack: {
       primary_language: over.lang ?? "Python", languages: (over.langs ?? [over.lang ?? "Python"]).map((n) => ({ name: n, files: 1, lines: 1, percent: 1 })),
       frameworks: over.fw ?? [], libraries: [], testing: [], linting: [], databases: [], messaging: [],
@@ -15,6 +15,7 @@ const repo = (over: Partial<Repo> & { lang?: string; fw?: string[]; langs?: stri
     practices: { score: over.practices?.score ?? 50, grade: "C", checks: [] },
     ownership: { codeowners: [] }, declared: { owner: null }, ai: { has_ai: false, sdks: [], models: [], ecosystems: [] },
     flags: over.flags ?? [], reusables: over.reusables ?? [], depends_on: [], used_by: over.used_by ?? [],
+    dependency_summary: over.dependency_summary ?? { direct: 0, transitive: 0, ecosystems: {}, lockfile_coverage: 0, vulnerable: 0 },
   }) as unknown as Repo;
 
 describe("query language", () => {
@@ -98,5 +99,23 @@ describe("findings and building blocks", () => {
     expect(kinds("format:openapi")).toEqual(["api"]);
     expect(kinds("format:composite")).toEqual(["action"]);
     expect(kinds("kind:action")).toEqual(["action"]);
+  });
+});
+
+describe("dependency filters", () => {
+  const dep = (name: string, ecosystem: string, vulns: string[] = []) =>
+    ({ name, ecosystem, version: null, resolved: null, purl: null, scope: "runtime", manifest: "x", vulns });
+  const web = repo({
+    id: "acme/web", dependencies: [dep("express", "npm", ["GHSA-1"]), dep("postgres", "docker")] as never,
+    dependency_summary: { direct: 2, transitive: 40, ecosystems: { npm: 1, docker: 1 }, lockfile_coverage: 1, vulnerable: 1 },
+  });
+  const tool = repo({ id: "acme/tool", dependencies: [dep("expressive", "npm")] as never });
+  const ids = (q: string) => applyFilters([web, tool], parseQuery(q).filters, REPO_FILTERS).map((r) => r.id);
+
+  it("matches exact dependency names, ecosystems and advisories", () => {
+    expect(ids("dep:express")).toEqual(["acme/web"]); // not "expressive"
+    expect(ids("dep:Postgres depeco:docker")).toEqual(["acme/web"]);
+    expect(ids("vuln:yes")).toEqual(["acme/web"]);
+    expect(ids("vuln:no")).toEqual(["acme/tool"]);
   });
 });

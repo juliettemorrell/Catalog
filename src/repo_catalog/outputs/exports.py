@@ -208,3 +208,105 @@ def aibom(repos: list[Repo], assets: list[AIAsset], source: str) -> dict[str, ob
 
 def write_aibom(path: Path, repos: list[Repo], assets: list[AIAsset], source: str) -> None:
     path.write_text(json.dumps(aibom(repos, assets, source), indent=1))
+
+
+_CDX_SCOPE = {"dev": "optional", "build": "excluded", "optional": "optional"}
+
+
+def repo_sbom(r: Repo) -> dict[str, object]:
+    """CycloneDX 1.6 SBOM for one repo: every direct and locked transitive dependency with
+    its purl, plus known advisories when the catalog was built with ``--osv``."""
+    root = f"repo:{r.id}"
+    components: list[dict[str, object]] = []
+    refs: dict[tuple[str, str, str | None], str] = {}
+    direct: list[str] = []
+    vulns: dict[str, list[str]] = {}
+    for d in r.dependencies:
+        key = (d.ecosystem, d.name, d.resolved or d.version)
+        if key in refs:
+            ref = refs[key]
+        else:
+            ref = d.purl or f"{d.ecosystem}:{d.name}@{d.resolved or d.version or ''}"
+            if ref in refs.values():
+                ref = f"{ref}#{len(refs)}"
+            refs[key] = ref
+            comp: dict[str, object] = {
+                "bom-ref": ref,
+                "type": "container" if d.ecosystem == "docker" else "library",
+                "name": d.name,
+                "properties": [
+                    {"name": "repo-catalog:ecosystem", "value": d.ecosystem},
+                    {"name": "repo-catalog:manifest", "value": d.manifest},
+                    {"name": "repo-catalog:scope", "value": d.scope},
+                    *(
+                        [{"name": "repo-catalog:declared", "value": d.version}]
+                        if d.version and d.version != d.resolved
+                        else []
+                    ),
+                ],
+            }
+            if d.resolved or d.version:
+                comp["version"] = d.resolved or d.version
+            if d.purl:
+                comp["purl"] = d.purl
+            if d.scope in _CDX_SCOPE:
+                comp["scope"] = _CDX_SCOPE[d.scope]
+            components.append(comp)
+        if d.scope != "transitive" and ref not in direct:
+            direct.append(ref)
+        for vuln in d.vulns:
+            vulns.setdefault(vuln, [])
+            if ref not in vulns[vuln]:
+                vulns[vuln].append(ref)
+    return {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.6",
+        "serialNumber": f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, f'{r.url}@{r.head_sha}')}",
+        "version": 1,
+        "metadata": {
+            "timestamp": r.scanned_at.isoformat(),
+            "tools": {
+                "components": [
+                    {"type": "application", "name": "repo-catalog", "version": __version__}
+                ]
+            },
+            "component": {
+                "bom-ref": root,
+                "type": "application",
+                "name": r.name,
+                "group": r.owner,
+                **({"version": r.head_sha} if r.head_sha else {}),
+                "purl": f"pkg:github/{r.owner}/{r.name}" + (f"@{r.head_sha}" if r.head_sha else ""),
+                "externalReferences": [{"type": "vcs", "url": r.url}],
+            },
+        },
+        "components": components,
+        "dependencies": [{"ref": root, "dependsOn": direct}],
+        **(
+            {
+                "vulnerabilities": [
+                    {
+                        "id": vuln,
+                        "source": {"name": "OSV", "url": f"https://osv.dev/vulnerability/{vuln}"},
+                        "affects": [{"ref": ref} for ref in affected],
+                    }
+                    for vuln, affected in sorted(vulns.items())
+                ]
+            }
+            if vulns
+            else {}
+        ),
+    }
+
+
+def write_sboms(folder: Path, repos: list[Repo]) -> None:
+    """One ``<owner>__<name>.cdx.json`` per repo; stale files from removed repos are dropped."""
+    folder.mkdir(parents=True, exist_ok=True)
+    wanted = set()
+    for r in repos:
+        name = re.sub(r"[^A-Za-z0-9._-]+", "__", r.id) + ".cdx.json"
+        wanted.add(name)
+        (folder / name).write_text(json.dumps(repo_sbom(r), indent=1))
+    for old in folder.glob("*.cdx.json"):
+        if old.name not in wanted:
+            old.unlink()

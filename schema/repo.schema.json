@@ -292,6 +292,37 @@
         "manifest": {
           "title": "Manifest",
           "type": "string"
+        },
+        "resolved": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolved"
+        },
+        "purl": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Purl"
+        },
+        "vulns": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Vulns",
+          "type": "array"
         }
       },
       "required": [
@@ -300,6 +331,40 @@
         "manifest"
       ],
       "title": "Dependency",
+      "type": "object"
+    },
+    "DependencySummary": {
+      "additionalProperties": false,
+      "properties": {
+        "direct": {
+          "default": 0,
+          "title": "Direct",
+          "type": "integer"
+        },
+        "transitive": {
+          "default": 0,
+          "title": "Transitive",
+          "type": "integer"
+        },
+        "ecosystems": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Ecosystems",
+          "type": "object"
+        },
+        "lockfile_coverage": {
+          "default": 0.0,
+          "title": "Lockfile Coverage",
+          "type": "number"
+        },
+        "vulnerable": {
+          "default": 0,
+          "title": "Vulnerable",
+          "type": "integer"
+        }
+      },
+      "title": "DependencySummary",
       "type": "object"
     },
     "Flag": {
@@ -1190,6 +1255,9 @@
       },
       "title": "Dependencies",
       "type": "array"
+    },
+    "dependency_summary": {
+      "$ref": "#/$defs/DependencySummary"
     },
     "structure": {
       "$ref": "#/$defs/Structure"

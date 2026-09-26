@@ -16,6 +16,7 @@ Python scanner (`src/repo_catalog`) + static site (`site/`) that catalog every r
 - `models.py`: output contract (Repo, AIAsset). Mirror field changes in `site/src/types.ts`.
 - `analyzers/rules.py`: technology/capability tables (plain text, one line per technology).
 - `analyzers/ai_files.py`: AI conventions found in files; `ai_code.py`: AI found in source code.
+- `analyzers/manifests.py` + `deps_more.py` (declared deps, 25 ecosystems), `lockfiles.py` (locked and transitive versions), `purls.py` (purls, exact versions, summary, GitHub SBOM merge). `vulns.py`: opt-in OSV lookup at build time.
 - `analyzers/flags.py` (repo findings), `ai_risk.py` (AI asset findings), `reusables.py` (building blocks, cross-repo refs), `org.py` (build-time links and calendar-based flags), `reference.py` (EOL and model retirement dates: update when vendors announce changes).
 - `scanner.py` orchestrates; `outputs/` writes JSON, SQLite, Backstage, CycloneDX; `query.py` is shared by the CLI and `mcp_server.py`.
 

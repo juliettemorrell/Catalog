@@ -1,7 +1,7 @@
 ---
 name: repo-catalog
 description: Search the org-wide repository catalog and AI asset library for prior art. Use when planning or implementing a change and you want existing code, services, libraries, skills, prompts or MCP servers to reuse, or to learn how the org usually builds something (standard stack, conventions, owners).
-allowed-tools: mcp__repo-catalog__search_repos mcp__repo-catalog__get_repo mcp__repo-catalog__search_ai_assets mcp__repo-catalog__get_ai_asset mcp__repo-catalog__repos_using mcp__repo-catalog__technology_usage mcp__repo-catalog__find_building_blocks mcp__repo-catalog__repo_relationships mcp__repo-catalog__list_flags mcp__repo-catalog__sql
+allowed-tools: mcp__repo-catalog__search_repos mcp__repo-catalog__get_repo mcp__repo-catalog__search_ai_assets mcp__repo-catalog__get_ai_asset mcp__repo-catalog__repos_using mcp__repo-catalog__technology_usage mcp__repo-catalog__find_building_blocks mcp__repo-catalog__repo_relationships mcp__repo-catalog__list_flags mcp__repo-catalog__dependency_usage mcp__repo-catalog__sql
 ---
 
 # Repo catalog: finding prior art
@@ -14,6 +14,7 @@ The `repo-catalog` MCP server exposes a catalog of every repository in the org a
 2. **Search broadly, then narrow.**
    - `search_repos(query_text=..., capability=..., technology=..., language=...)` returns candidates with their purpose and practices score.
    - `repos_using(technology="stripe")` shows every repo that depends on a library or framework.
+   - `dependency_usage(package="lodash", version_prefix="4.17")` answers exactly which repos ship a package at which versions (direct or transitive, from lockfiles) and with which known advisories. Use it for upgrade planning and security exposure questions.
    - `technology_usage(category="frameworks")` shows what the org standardizes on. Prefer the majority choice unless there's a reason not to.
    - `find_building_blocks(query_text=..., kind=...)` finds GitHub Actions, reusable workflows, Terraform modules, Helm charts, templates and APIs to adopt instead of writing CI/CD, infrastructure or clients from scratch.
 3. **Inspect the best 2–3 candidates** with `get_repo(repo_id)`. Look at `summary.reuse_notes`, `structure.packages` (importable libraries), `structure.entrypoints` and `api_specs`, and `practices` (prefer grade A/B, active lifecycle). The owners are in `declared.owner` and `ownership.codeowners`.

@@ -90,6 +90,9 @@ export const REPO_FILTERS: Record<string, FilterDef<Repo>> = {
   sev: { get: (r) => r.flags.map((f) => f.severity), exact: true, help: "has a finding of severity high, medium or low" },
   reuse: { get: (r) => r.reusables.map((x) => x.kind), exact: true, help: "ships a building block: action, terraform-module, helm-chart, api…" },
   usedby: { get: (r) => (r.used_by.length ? "yes" : "no"), exact: true, help: "other org repos depend on it (yes/no)" },
+  dep: { get: (r) => r.dependencies.map((d) => d.name), exact: true, help: "direct dependency, exact name (e.g. dep:express, dep:postgres)" },
+  depeco: { get: (r) => Object.keys(r.dependency_summary.ecosystems), exact: true, help: "dependency ecosystem: npm, pypi, docker, terraform, github-actions…" },
+  vuln: { get: (r) => (r.dependency_summary.vulnerable ? "yes" : "no"), exact: true, help: "ships a dependency with known advisories (yes/no; needs --osv)" },
 };
 
 export const ASSET_FILTERS: Record<string, FilterDef<Asset>> = {

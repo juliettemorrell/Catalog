@@ -12,6 +12,9 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 | `catalog.db` | SQLite with FTS5 (tables below). |
 | `backstage-entities.yaml` | One Backstage `Component` per repo. |
 | `ai-bom.cdx.json` | CycloneDX 1.6 AI bill of materials. |
+| `sbom/<owner>__<name>.cdx.json` | CycloneDX 1.6 SBOM per repo: every dependency with purl, version, scope, and OSV advisories when built with `--osv`. |
+
+`catalog.json` leaves out locked transitive dependencies (often thousands per repo) to keep the web UI fast; they are in the per-repo files, `catalog.db` and the SBOMs.
 
 ## Repo
 
@@ -27,7 +30,8 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 | `summary.readme_title/excerpt/key_features` | First heading, first paragraphs and the "Features" bullets of the README | README |
 | `summary.purpose/domains/reuse_notes` | Plain-language purpose, domain tags and what others could borrow | Claude (`--llm`), `summary.source = "llm"` |
 | `stack.*` | `primary_language`, `languages` (files/lines/%), `frameworks`, `libraries`, `databases`, `messaging`, `auth`, `ai`, `cloud`, `infrastructure`, `ci_cd`, `testing`, `linting`, `build_tools`, `observability`, `package_managers`, `runtimes` | manifests, config files, workflow `uses:` |
-| `dependencies[]` | `name`, `version` (as declared), `ecosystem`, `scope` (runtime/dev/peer/optional/build, or transitive for Go `// indirect`; transitive deps never count toward the stack), `manifest` path | manifests |
+| `dependencies[]` | `name`, `version` (as declared), `resolved` (exact version from a lockfile or an exact pin), `ecosystem`, `scope` (runtime/dev/peer/optional/build/transitive), `manifest` (for transitive deps: the lockfile), `purl`, `vulns` (OSV ids, with `--osv`). Ecosystems: npm, pypi, go, cargo, maven, gem, composer, nuget, pub, swift, cocoapods, hex, cran, conda, bazel, vcpkg, conan, jsr, deno, docker, terraform, helm, github-actions, pre-commit, ansible-galaxy. Only code-package ecosystems drive the tech stack; database/queue images and charts count as data stores | manifests, lockfiles, GitHub dependency graph (`--github-sbom`) |
+| `dependency_summary` | `direct`, `transitive`, `ecosystems` (direct deps per ecosystem), `lockfile_coverage` (share of direct package deps with an exact version), `vulnerable` | derived |
 | `structure.repo_type` | `service`, `web-app`, `full-stack-app`, `library`, `cli`, `mcp-server`, `monorepo`, `data-app`, `mobile-app`, `desktop-app`, `infrastructure`, `data-science`, `docs`, `scripts` | heuristics over the above |
 | `structure.*` | `packages`, `entrypoints`, `api_specs`, `dockerfiles`, `docs`, `top_level`, `file_count`, `total_lines` | file tree |
 | `practices` | `score` 0–100, `grade` A–F (≥85/70/55/40), `checks[]` with `id`, `category`, `label`, `passed`, `weight`, `evidence` | see below |
@@ -62,6 +66,7 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 | `mcp-inline-secret` | ai-governance | high | A literal credential in an MCP server's env/headers/args instead of `${VAR}` |
 | `mcp-plaintext-http` | ai-governance | medium | Remote MCP server over `http://` (localhost excluded) |
 | `secret-in-asset` | security | high | An AI file contained a credential (redacted in the catalog) |
+| `vulnerable-dependency` | security | from the advisory (GHSA CRITICAL/HIGH = high, MODERATE = medium, LOW = low) | A locked dependency version has known OSV advisories (`--osv`); the message names the fixed version |
 
 ### Practice checks
 
@@ -117,7 +122,7 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 
 ## SQLite (`catalog.db`)
 
-Tables: `repos` (flat columns + `json`), `repo_tech(repo_id, category, name)`, `repo_capabilities`, `repo_topics`, `repo_languages`, `dependencies`, `packages`, `practice_checks`, `ai_assets` (flat columns + `content` + `json`), `asset_tools`, `asset_models`, `asset_tags`, `flags(repo_id, asset_id, flag_id, category, severity, message, path, line)`, `reusables(repo_id, kind, name, path, description, details)`, `repo_links(repo_id, depends_on, via)`, `runtime_versions`, and `meta`. Full-text search: `repos_fts`, `assets_fts` (unicode61, prefix matching). Views: `tech_usage`, `dependency_usage`, `dependency_versions` (version drift), `flag_summary`.
+Tables: `repos` (flat columns + `json`), `repo_tech(repo_id, category, name)`, `repo_capabilities`, `repo_topics`, `repo_languages`, `dependencies`, `packages`, `practice_checks`, `ai_assets` (flat columns + `content` + `json`), `asset_tools`, `asset_models`, `asset_tags`, `flags(repo_id, asset_id, flag_id, category, severity, message, path, line)`, `reusables(repo_id, kind, name, path, description, details)`, `repo_links(repo_id, depends_on, via)`, `dependencies` (also `resolved`, `purl`, `vulns`), `runtime_versions`, and `meta`. Full-text search: `repos_fts`, `assets_fts` (unicode61, prefix matching). Views: `tech_usage`, `dependency_usage`, `dependency_versions` (version drift, by locked version), `vulnerable_dependencies`, `flag_summary`.
 
 ```sql
 -- Which repos already integrate Stripe, newest first?
@@ -134,6 +139,10 @@ WHERE r.repo_type = 'service' AND c.check_id = 'tests' AND c.passed = 0;
 -- High-severity security findings across the org
 SELECT repo_id, flag_id, message, path, line FROM flags
 WHERE category = 'security' AND severity = 'high' ORDER BY repo_id;
+
+-- Exposure: which repos ship log4j-core 2.x, directly or transitively
+SELECT repo_id, COALESCE(resolved, version) AS version, scope, manifest FROM dependencies
+WHERE name = 'org.apache.logging.log4j:log4j-core' AND COALESCE(resolved, version) LIKE '2.%';
 
 -- Blast radius: who depends on this repo, and how
 SELECT repo_id, via FROM repo_links WHERE depends_on = 'acme/shared-ui';
