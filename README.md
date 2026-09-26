@@ -1,5 +1,7 @@
 # Repo Catalog
 
+> Integrating this into existing work? Start with [HANDOFF.md](HANDOFF.md).
+
 Scan every repository in a GitHub org and produce two catalogs:
 
 1. **AI Asset Library**: every skill, subagent, slash command, prompt, rules/instructions file, MCP server, MCP config, hook, plugin, eval, agent workflow and LLM SDK integration in the org. Each one is parsed, scored and linked back to its source.
