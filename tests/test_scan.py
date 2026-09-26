@@ -316,3 +316,24 @@ def test_mcp_server_tools(scanned: ScanResult, tmp_path: Path) -> None:
         "sql",
     } <= names
     assert "acme/billing" in str(result)
+
+
+def test_rule_tables_and_tests_are_not_ai_usage(
+    make_repo: Callable[..., tuple[RepoRef, Path]], tmp_path: Path
+) -> None:
+    """Strings that merely *mention* SDKs (rule tables, docs, tests) must not count as usage."""
+    ref, root = make_repo(
+        {
+            "src/rules.py": 'PATTERNS = ["semantic_kernel", "AzureOpenAI", "ClientSession",\n'
+            '    "from anthropic import", "ollama", "bedrock-runtime", "AI_COMPLETE"]\n',
+            "tests/test_server.py": 'SRC = """from mcp.server.fastmcp import FastMCP\n'
+            'server = FastMCP(\\"fake\\")"""\nimport anthropic\n',
+            "src/app.ts": "import Anthropic from '@anthropic-ai/sdk';\n"
+            "const client = new Anthropic();\nawait client.messages.create({});\n",
+        },
+        name="rules",
+    )
+    result = analyze_checkout(ref, root, ScanOptions(workdir=tmp_path / "w"))
+    kinds = {(a.kind, a.ecosystem) for a in result.assets}
+    assert kinds == {("sdk-usage", "anthropic")}
+    assert result.repo.ai.sdks == ["Anthropic SDK"]

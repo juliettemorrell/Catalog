@@ -303,7 +303,10 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 def cmd_sql(args: argparse.Namespace) -> int:
     con = _connect(args.out)
-    rows = [dict(r) for r in con.execute(args.query).fetchall()]
+    try:
+        rows = [dict(r) for r in con.execute(args.query).fetchall()]
+    except sqlite3.Error as exc:
+        sys.exit(f"SQL error: {exc}")
     print(json.dumps(rows, indent=2, default=str))
     return 0
 

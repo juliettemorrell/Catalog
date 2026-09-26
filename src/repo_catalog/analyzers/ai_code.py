@@ -33,123 +33,169 @@ CONFIG_EXT = {".yaml", ".yml", ".json", ".toml", ".env.example", ".properties", 
 MAX_FILE = 400_000
 MAX_FILES = 6_000
 
-# provider -> (display name, import regex, call-site regex)
+
+def _py(module: str) -> str:
+    """Python ``import x`` / ``from x import`` for a dotted module (regex-escaped here)."""
+    return rf"^\s*(?:from|import)\s+{re.escape(module)}\b"
+
+
+def _js(package: str) -> str:
+    """JS/TS ``from 'pkg'`` / ``require('pkg')`` / ``import('pkg')``; ``package`` is a regex."""
+    return rf"(?:\bfrom|\brequire\(|\bimport\(?)\s*['\"`]{package}['\"`]"
+
+
+def _go(path: str) -> str:
+    return rf"^\s*(?:import\s+)?(?:\w+\s+)?\"{re.escape(path)}"
+
+
+def _any(*patterns: str) -> str:
+    return "|".join(f"(?:{p})" for p in patterns)
+
+
+# provider -> (display name, import regex, call-site regex). Import patterns require real
+# import syntax so that documentation, rule tables and string literals are not counted.
 SDKS: dict[str, tuple[str, str, str]] = {
     "anthropic": (
         "Anthropic SDK",
-        r"^\s*(?:from|import)\s+anthropic\b|['\"]@anthropic-ai/sdk['\"]|anthropic-sdk-go"
-        r"|com\.anthropic\.",
+        _any(
+            _py("anthropic"),
+            _js("@anthropic-ai/sdk(?:/[\\w/-]*)?"),
+            _go("github.com/anthropics/anthropic-sdk-go"),
+            r"^\s*import\s+com\.anthropic\.",
+        ),
         r"messages\.(?:create|stream|parse|batches)|Messages\.New|beta\.messages",
     ),
     "claude-agent-sdk": (
         "Claude Agent SDK",
-        r"claude_agent_sdk|claude_code_sdk|['\"]@anthropic-ai/claude-agent-sdk['\"]"
-        r"|['\"]@anthropic-ai/claude-code['\"]",
+        _any(
+            _py("claude_agent_sdk"),
+            _py("claude_code_sdk"),
+            _js("@anthropic-ai/claude-(?:agent-sdk|code)"),
+        ),
         r"\bquery\(|ClaudeSDKClient|ClaudeAgentOptions|AgentDefinition",
     ),
     "openai": (
         "OpenAI SDK",
-        r"^\s*(?:from|import)\s+openai\b|['\"]openai['\"]\s*\)?;?$|from\s+['\"]openai['\"]"
-        r"|openai-go|go-openai|com\.openai",
+        _any(
+            _py("openai"),
+            _js("openai(?:/[\\w/-]*)?"),
+            _go("github.com/openai/openai-go"),
+            _go("github.com/sashabaranov/go-openai"),
+            r"^\s*import\s+com\.openai\.",
+        ),
         r"chat\.completions\.create|responses\.create|embeddings\.create|"
         r"images\.generate|audio\.\w+\.create|\.beta\.\w+",
     ),
     "openai-agents": (
         "OpenAI Agents SDK",
-        r"^\s*from\s+agents\s+import|['\"]@openai/agents['\"]",
+        _any(r"^\s*from\s+agents\s+import\s+.*\b(?:Agent|Runner)\b", _js("@openai/agents")),
         r"\bRunner\.run|\brun\(|\bAgent\(",
     ),
     "google-genai": (
         "Google Gen AI",
-        r"from\s+google\s+import\s+genai|google\.generativeai|['\"]@google/genai['\"]"
-        r"|['\"]@google/generative-ai['\"]",
+        _any(
+            r"^\s*from\s+google\s+import\s+genai",
+            _py("google.generativeai"),
+            _js("@google/genai"),
+            _js("@google/generative-ai"),
+        ),
         r"generate_content|generateContent|models\.generate",
     ),
     "vertex-ai": (
         "Vertex AI",
-        r"^\s*(?:from|import)\s+vertexai|google\.cloud\.aiplatform",
+        _any(_py("vertexai"), _py("google.cloud.aiplatform"), _js("@google-cloud/vertexai")),
         r"GenerativeModel|generate_content",
     ),
-    "google-adk": ("Google ADK", r"from\s+google\.adk", r"LlmAgent|Agent\("),
+    "google-adk": ("Google ADK", _py("google.adk"), r"LlmAgent|Agent\("),
     "bedrock": (
         "Amazon Bedrock",
-        r"bedrock-runtime|client-bedrock-runtime|BedrockRuntime",
+        _any(
+            r"""\.client\(\s*['"]bedrock(?:-agent)?-runtime['"]""",
+            _js("@aws-sdk/client-bedrock(?:-agent)?-runtime"),
+            r"\bnew\s+BedrockRuntimeClient\(",
+        ),
         r"invoke_model|converse|InvokeModel|Converse",
     ),
     "azure-openai": (
         "Azure OpenAI",
-        r"AzureOpenAI|@azure/openai|Azure\.AI\.OpenAI",
+        _any(r"\bAzureOpenAI\s*\(", _js("@azure/openai"), r"^\s*using\s+Azure\.AI\.OpenAI"),
         r"chat\.completions\.create|GetChatCompletions",
     ),
     "langchain": (
         "LangChain",
-        r"^\s*(?:from|import)\s+langchain|['\"]@langchain/(?!langgraph)",
+        _any(
+            r"^\s*(?:from|import)\s+langchain",
+            _js("(?:langchain|@langchain/(?!langgraph))[\\w/-]*"),
+        ),
         r"\.invoke\(|\.stream\(|ChatPromptTemplate|create_\w+_agent",
     ),
     "langgraph": (
         "LangGraph",
-        r"^\s*(?:from|import)\s+langgraph|['\"]@langchain/langgraph",
+        _any(_py("langgraph"), _js("@langchain/langgraph[\\w/-]*")),
         r"StateGraph|add_node|create_react_agent",
     ),
     "llamaindex": (
         "LlamaIndex",
-        r"llama_index|['\"]llamaindex['\"]",
+        _any(_py("llama_index"), _js("llamaindex[\\w/-]*")),
         r"VectorStoreIndex|as_query_engine|as_chat_engine|FunctionAgent|ReActAgent",
     ),
-    "crewai": ("CrewAI", r"^\s*(?:from|import)\s+crewai", r"\bCrew\(|\bAgent\(|\bTask\("),
+    "crewai": ("CrewAI", _py("crewai"), r"\bCrew\(|\bAgent\(|\bTask\("),
     "autogen": ("AutoGen", r"^\s*(?:from|import)\s+autogen", r"AssistantAgent|UserProxyAgent"),
-    "pydantic-ai": ("PydanticAI", r"^\s*(?:from|import)\s+pydantic_ai", r"\bAgent\("),
-    "smolagents": (
-        "smolagents",
-        r"^\s*(?:from|import)\s+smolagents",
-        r"CodeAgent|ToolCallingAgent",
-    ),
+    "pydantic-ai": ("PydanticAI", _py("pydantic_ai"), r"\bAgent\("),
+    "smolagents": ("smolagents", _py("smolagents"), r"CodeAgent|ToolCallingAgent"),
     "semantic-kernel": (
         "Semantic Kernel",
-        r"semantic_kernel|Microsoft\.SemanticKernel",
+        _any(_py("semantic_kernel"), r"^\s*using\s+Microsoft\.SemanticKernel"),
         r"Kernel|ChatCompletionAgent",
     ),
     "vercel-ai": (
         "Vercel AI SDK",
-        r"from\s+['\"]ai['\"]|['\"]@ai-sdk/",
+        _any(_js("ai"), _js("@ai-sdk/[\\w-]+")),
         r"generateText|streamText|generateObject|streamObject|useChat",
     ),
-    "mastra": ("Mastra", r"['\"]@mastra/", r"new Agent\(|createWorkflow|createTool"),
-    "litellm": ("LiteLLM", r"^\s*(?:from|import)\s+litellm", r"completion\(|acompletion\("),
-    "mistral": ("Mistral", r"^\s*(?:from|import)\s+mistralai|['\"]@mistralai/", r"chat\.complete"),
-    "cohere": ("Cohere", r"^\s*(?:from|import)\s+cohere\b|['\"]cohere-ai['\"]", r"\.chat\(|embed"),
-    "groq": ("Groq", r"^\s*(?:from|import)\s+groq\b|['\"]groq-sdk['\"]", r"chat\.completions"),
-    "ollama": ("Ollama", r"^\s*(?:from|import)\s+ollama\b|['\"]ollama['\"]", r"\.chat\(|generate"),
-    "dspy": ("DSPy", r"^\s*(?:from|import)\s+dspy", r"dspy\.\w+"),
-    "instructor": ("Instructor", r"^\s*(?:from|import)\s+instructor", r"from_\w+|patch\("),
+    "mastra": ("Mastra", _js("@mastra/[\\w/-]+"), r"new Agent\(|createWorkflow|createTool"),
+    "litellm": ("LiteLLM", _py("litellm"), r"completion\(|acompletion\("),
+    "mistral": ("Mistral", _any(_py("mistralai"), _js("@mistralai/mistralai")), r"chat\.complete"),
+    "cohere": ("Cohere", _any(_py("cohere"), _js("cohere-ai")), r"\.chat\(|embed"),
+    "groq": ("Groq", _any(_py("groq"), _js("groq-sdk")), r"chat\.completions"),
+    "ollama": ("Ollama", _any(_py("ollama"), _js("ollama(?:/browser)?")), r"\.chat\(|generate"),
+    "dspy": ("DSPy", _py("dspy"), r"dspy\.\w+"),
+    "instructor": ("Instructor", _py("instructor"), r"from_\w+|patch\("),
     "huggingface": (
         "Hugging Face",
-        r"^\s*from\s+transformers\s+import|['\"]@huggingface/",
+        _any(r"^\s*from\s+transformers\s+import", _js("@huggingface/[\\w-]+")),
         r"pipeline\(|from_pretrained",
     ),
     "anthropic-http": (
         "Anthropic API (raw HTTP)",
-        r"api\.anthropic\.com",
+        r"['\"`]https://api\.anthropic\.com",
         r"api\.anthropic\.com|/v1/messages",
     ),
     "openai-http": (
         "OpenAI API (raw HTTP)",
-        r"api\.openai\.com",
+        r"['\"`]https://api\.openai\.com",
         r"api\.openai\.com|/v1/(?:chat/completions|responses)",
     ),
     "snowflake-cortex": (
         "Snowflake Cortex",
-        r"(?i)snowflake\.cortex|cortex\.complete|\bAI_COMPLETE\b",
+        _any(_py("snowflake.cortex"), r"(?i:\bcortex\.complete\s*\()", r"(?i:\bAI_COMPLETE\s*\()"),
         r"(?i)cortex\.complete|\bcomplete\(|AI_COMPLETE",
     ),
     "databricks": (
         "Databricks Model Serving",
-        r"databricks\.sdk|mlflow\.deployments|serving-endpoints",
+        _any(
+            _py("databricks.sdk"),
+            _py("mlflow.deployments"),
+            r"/serving-endpoints/[\w-]+/invocations",
+        ),
         r"serving_endpoints\.query|predict\(|/invocations",
     ),
     "mcp-client": (
         "MCP client",
-        r"ClientSession|['\"]@modelcontextprotocol/sdk/client",
+        _any(
+            r"^\s*from\s+mcp\s+import\s+.*\bClientSession\b",
+            _js("@modelcontextprotocol/sdk/client[\\w/.-]*"),
+        ),
         r"call_tool|callTool|list_tools|listTools",
     ),
 }
@@ -339,7 +385,15 @@ def _models(text: str) -> set[str]:
 
 
 def _is_test_fixture(path: str) -> bool:
-    return bool(re.search(r"(^|/)(fixtures?|__snapshots__|testdata|mocks?)/", path, re.I))
+    """Tests and fixtures often embed fake SDK calls, servers and prompts: not assets."""
+    return bool(
+        re.search(
+            r"(^|/)(tests?|__tests__|spec|fixtures?|__snapshots__|testdata|mocks?)/|"
+            r"(^|/)test_[^/]+\.py$|_test\.(py|go)$|\.(test|spec)\.[cm]?[jt]sx?$",
+            path,
+            re.I,
+        )
+    )
 
 
 def _snippet(path: str, text: str, line: int, context: int = 4) -> str:
