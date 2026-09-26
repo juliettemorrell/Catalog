@@ -84,12 +84,13 @@ def test_manifests(tmp_path: Path) -> None:
     assert deps[("npm", "vitest")].scope == "dev"
     assert deps[("pypi", "anthropic")].version == ">=1.0"
     assert deps[("pypi", "pytest")].scope == "dev"
-    assert deps[("go", "golang.org/x/sys")].scope == "optional"
+    assert deps[("go", "golang.org/x/sys")].scope == "transitive"
     assert deps[("maven", "org.junit.jupiter:junit-jupiter")].scope == "dev"
     assert deps[("pypi", "requests")].version == "==2.32.0"
     assert res.runtimes == {"node": ">=22", "python": ">=3.12", "go": "1.23"}
     assert {"pnpm", "pip", "go modules", "maven"} <= res.package_managers
-    assert res.workspaces and res.lockfiles == ["pnpm-lock.yaml"]
+    # a fully pinned requirements.txt (pip-compile style) counts as a lock
+    assert res.workspaces and sorted(res.lockfiles) == ["pnpm-lock.yaml", "requirements.txt"]
     assert {p.name for p in res.packages} >= {"web", "svc", "github.com/acme/tool", "api"}
     assert not res.errors
 

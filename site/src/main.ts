@@ -1,10 +1,10 @@
 import "./styles.css";
-import type MiniSearch from "minisearch";
 import {
-  ASSET_FILTERS, REPO_FILTERS, assetIndex, hasFilter, parseQuery, repoIndex, runSearch, toggleFilter,
+  ASSET_FILTERS, LazyIndex, REPO_FILTERS, assetIndex, hasFilter, parseQuery, repoIndex, resolveQuery,
+  runSearch, toggleFilter,
 } from "./search";
 import type { Asset, Catalog, Repo } from "./types";
-import { chips, countBy, downloadCsv, esc, fmtNum, markdown, relTime } from "./util";
+import { chips, copyText, countBy, downloadCsv, esc, fmtNum, markdown, num, relTime, safeUrl } from "./util";
 
 type Tab = "repos" | "assets" | "insights";
 interface State { tab: Tab; q: string; open: string | null }
@@ -15,23 +15,33 @@ const KIND_LABEL: Record<string, string> = {
   "mcp-server": "MCP server", "mcp-config": "MCP config", hook: "Hook", plugin: "Plugin", eval: "Eval",
   workflow: "Workflow", "sdk-usage": "LLM SDK usage",
 };
-const STACK_ROWS: [keyof Repo["stack"], string][] = [
-  ["frameworks", "Frameworks"], ["libraries", "Libraries"], ["databases", "Data"], ["messaging", "Messaging"],
-  ["auth", "Auth"], ["ai", "AI / ML"], ["cloud", "Cloud"], ["infrastructure", "Infrastructure"],
-  ["ci_cd", "CI/CD"], ["testing", "Testing"], ["linting", "Quality tooling"], ["build_tools", "Build"],
-  ["observability", "Observability"], ["package_managers", "Package managers"],
+const TAB_TITLE: Record<Tab, string> = { repos: "Repositories", assets: "AI Asset Library", insights: "Insights" };
+const GRADES = new Set(["A", "B", "C", "D", "F"]);
+const STACK_ROWS: [keyof Repo["stack"], string, string][] = [
+  ["frameworks", "Frameworks", "fw"], ["libraries", "Libraries", "tech"], ["databases", "Data", "data"],
+  ["messaging", "Messaging", "data"], ["auth", "Auth", "tech"], ["ai", "AI / ML", "tech"],
+  ["cloud", "Cloud", "infra"], ["infrastructure", "Infrastructure", "infra"], ["ci_cd", "CI/CD", "tech"],
+  ["testing", "Testing", "tech"], ["linting", "Quality tooling", "tech"], ["build_tools", "Build", "tech"],
+  ["observability", "Observability", "tech"], ["package_managers", "Package managers", "tech"],
 ];
 
 let catalog: Catalog;
-let repoIdx: MiniSearch<Repo>;
-let assetIdx: MiniSearch<Asset>;
+let repoIdx: LazyIndex<Repo>;
+let assetIdx: LazyIndex<Asset>;
 let assetsById = new Map<string, Asset>();
 let reposById = new Map<string, Repo>();
 let shown = PAGE;
+let lastList = ""; // tab+query of the rendered list: paging resets only when it changes
+let lastRendered = "";
+let returnFocus: string | null = null; // href of the card that opened the drawer
 
 const $main = document.getElementById("main")!;
 const $drawer = document.getElementById("drawer")!;
 const $scrim = document.getElementById("scrim")!;
+
+function onIndexReady(): void {
+  if (readState().q.trim()) render(true); // upgrade substring results to ranked results
+}
 
 // ------------------------------------------------------------------------------------ state
 
@@ -63,18 +73,23 @@ function navigate(s: Partial<State>, replace = false): void {
 async function load(): Promise<void> {
   try {
     const [c, a] = await Promise.all([fetchJson("data/catalog.json"), fetchJson("data/ai-assets.json")]);
-    catalog = { meta: c.meta, repos: c.repos, assets: a.assets };
+    if (!Array.isArray(c?.repos) || !Array.isArray(a?.assets)) {
+      throw new Error("catalog files are not in the expected format (repos[] / assets[])");
+    }
+    catalog = { meta: c.meta ?? {}, repos: c.repos, assets: a.assets };
   } catch (err) {
-    $main.innerHTML = `<div class="empty"><h2>No catalog data found</h2>
+    $main.innerHTML = `<div class="empty"><h1>No catalog data found</h1>
       <p>Run <code>repo-catalog scan --org &lt;your-org&gt;</code> to produce <code>data/catalog.json</code>
       and <code>data/ai-assets.json</code>, then reload.</p><p class="muted">${esc(err)}</p></div>`;
     return;
   }
   reposById = new Map(catalog.repos.map((r) => [r.id, r]));
   assetsById = new Map(catalog.assets.map((a) => [a.id, a]));
-  repoIdx = repoIndex(catalog.repos);
-  assetIdx = assetIndex(catalog.assets);
+  repoIdx = new LazyIndex(repoIndex(), catalog.repos, onIndexReady);
+  assetIdx = new LazyIndex(assetIndex(), catalog.assets, onIndexReady);
   render();
+  // build search indexes after first paint, repos first (smaller, default tab)
+  setTimeout(() => void repoIdx.start().then(() => assetIdx.start()), 50);
 }
 
 async function fetchJson(url: string) {
@@ -85,84 +100,118 @@ async function fetchJson(url: string) {
 
 // ------------------------------------------------------------------------------------ render
 
-function render(): void {
+function render(force = false): void {
   if (!catalog) return;
+  if (!force && location.href === lastRendered) return; // popstate + hashchange both fire
+  lastRendered = location.href;
   const state = readState();
+  const listKey = `${state.tab}|${state.q}`;
+  if (listKey !== lastList) shown = PAGE;
+  lastList = listKey;
+
   document.querySelectorAll<HTMLAnchorElement>(".tabs a").forEach((a) => {
     const active = a.dataset.tab === state.tab;
     a.classList.toggle("active", active);
-    a.setAttribute("aria-current", active ? "page" : "false");
+    if (active) {
+      a.setAttribute("aria-current", "page");
+      a.scrollIntoView({ block: "nearest", inline: "nearest" });
+    } else a.removeAttribute("aria-current");
     a.href = `#/${a.dataset.tab}`;
   });
+  document.title = `${TAB_TITLE[state.tab]} · Repo Catalog`;
+
+  const focusedHref = (document.activeElement as HTMLElement | null)?.getAttribute?.("data-focus") ?? null;
+  if (state.open && !$drawer.classList.contains("open")) returnFocus = focusedHref; // before re-render
   if (state.tab === "insights") renderInsights();
   else renderSearch(state);
   renderDrawer(state);
+  if (focusedHref && !state.open) {
+    // keep keyboard users where they were after a facet/"more" click re-rendered the list
+    $main.querySelector<HTMLElement>(`[data-focus="${CSS.escape(focusedHref)}"]`)?.focus();
+  }
 }
 
 function renderSearch(state: State): void {
   const isRepos = state.tab === "repos";
-  const q = parseQuery(state.q);
+  const q = resolveQuery(parseQuery(state.q), isRepos ? REPO_FILTERS : ASSET_FILTERS);
   const results: (Repo | Asset)[] = isRepos
-    ? runSearch(catalog.repos, repoIdx, q, REPO_FILTERS, (a, b) => (b.pushed_at ?? "").localeCompare(a.pushed_at ?? ""))
-    : runSearch(catalog.assets, assetIdx, q, ASSET_FILTERS, (a, b) => b.quality_score - a.quality_score || a.name.localeCompare(b.name));
+    ? runSearch(catalog.repos, repoIdx, q, REPO_FILTERS,
+      (a, b) => (b.pushed_at ?? "").localeCompare(a.pushed_at ?? ""))
+    : runSearch(catalog.assets, assetIdx, q, ASSET_FILTERS,
+      (a, b) => num(b.quality_score) - num(a.quality_score) || a.name.localeCompare(b.name));
 
   const existing = document.getElementById("q") as HTMLInputElement | null;
   const keepFocus = existing && document.activeElement === existing;
-  const caret = existing?.selectionStart ?? null;
+  const sel = existing ? [existing.selectionStart, existing.selectionEnd, existing.selectionDirection] as const : null;
 
   const examples = isRepos
-    ? ["payments", "lang:python tech:fastapi", "type:service missing:tests", "cap:pdf", "ai:yes uses:anthropic"]
+    ? ["payments", "lang:python fw:fastapi", "type:service missing:tests", "cap:pdf", "ai:yes uses:anthropic"]
     : ["kind:skill", "code review", "kind:mcp-server", "eco:cursor", "kind:prompt minq:60", "dup:yes"];
-  const help = Object.entries(isRepos ? REPO_FILTERS : ASSET_FILTERS)
-    .map(([k, d]) => `<li><code>${k}:</code> ${esc(d.help)}</li>`).join("")
-    + (isRepos ? "<li><code>minscore:</code> minimum practices score</li>" : "<li><code>minq:</code> minimum quality score</li>")
-    + "<li>Prefix with <code>-</code> to exclude. Repeat a key to OR values.</li>";
+  const defs: Record<string, { help: string }> = isRepos ? REPO_FILTERS : ASSET_FILTERS;
+  const help = Object.entries(defs).map(([k, d]) => `<li><code>${k}:</code> ${esc(d.help)}</li>`).join("")
+    + "<li>Prefix with <code>-</code> to exclude. Repeat a key to OR values. Quote values with spaces.</li>";
+  const idx = isRepos ? repoIdx : assetIdx;
+  const indexing = q.text.trim() && !idx.ready
+    ? `<p class="notice" role="status">Building the search index (${Math.round(idx.progress * 100)}%). Showing exact matches until it is ready.</p>`
+    : "";
+  const unknown = q.unknown.length
+    ? `<p class="notice" role="status">Not a filter here: ${q.unknown.map((k) => `<code>${esc(k)}:</code>`).join(", ")}. Searched as text.</p>`
+    : "";
 
   $main.innerHTML = `
+    <h1 class="sr-only">${esc(TAB_TITLE[state.tab])}</h1>
     <section class="search">
       <label class="sr-only" for="q">Search ${isRepos ? "repositories" : "AI assets"}</label>
       <div class="search-box">
         <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
         <input id="q" type="search" autocomplete="off" spellcheck="false" value="${esc(state.q)}"
           placeholder="${isRepos ? "Search repos: what they do, stack, capabilities…" : "Search skills, agents, prompts, rules, MCP servers…"}" />
-        <kbd>/</kbd>
+        <kbd aria-hidden="true">/</kbd>
       </div>
       <div class="search-meta">
         <span><strong>${fmtNum(results.length)}</strong> of ${fmtNum(isRepos ? catalog.repos.length : catalog.assets.length)} ${isRepos ? "repositories" : "AI assets"}</span>
         <span class="examples">Try ${examples.map((e) => `<a href="${esc(href({ q: e, open: null }))}">${esc(e)}</a>`).join(" ")}</span>
         <details class="help"><summary>Query syntax</summary><ul>${help}</ul></details>
-        <button type="button" class="btn-link" id="csv">Export CSV</button>
+        <button type="button" class="btn-link" id="csv" ${results.length ? "" : "disabled"}>Export CSV</button>
       </div>
+      ${unknown}${indexing}
     </section>
     <div class="layout">
       <aside class="facets" aria-label="Filters">${isRepos ? repoFacets(results as Repo[], state.q) : assetFacets(results as Asset[], state.q)}</aside>
-      <section class="results" aria-live="polite">
+      <section class="results" aria-live="polite" aria-label="Results">
         ${results.length ? results.slice(0, shown).map((r) => (isRepos ? repoCard(r as Repo) : assetCard(r as Asset))).join("")
           : `<div class="empty"><h2>No matches</h2><p>Remove a filter or try broader words.</p></div>`}
-        ${results.length > shown ? `<button type="button" class="more-btn" id="more">Show ${Math.min(PAGE, results.length - shown)} more</button>` : ""}
+        ${results.length > shown ? `<button type="button" class="more-btn" id="more" data-focus="more">Show ${Math.min(PAGE, results.length - shown)} more</button>` : ""}
       </section>
     </div>`;
 
   const input = document.getElementById("q") as HTMLInputElement;
   if (keepFocus) {
     input.focus();
-    if (caret !== null) input.setSelectionRange(caret, caret);
+    if (sel && sel[0] !== null && sel[1] !== null) input.setSelectionRange(sel[0], sel[1], sel[2] ?? "none");
   }
   let timer: number | undefined;
   input.addEventListener("input", () => {
     clearTimeout(timer);
-    timer = window.setTimeout(() => { shown = PAGE; navigate({ q: input.value, open: null }, true); }, 140);
+    timer = window.setTimeout(() => navigate({ q: input.value, open: null }, true), 140);
   });
-  document.getElementById("more")?.addEventListener("click", () => { shown += PAGE; render(); });
+  document.getElementById("more")?.addEventListener("click", () => {
+    shown += PAGE;
+    render(true);
+    document.getElementById("more")?.focus();
+  });
+  document.getElementById("csv")?.addEventListener("click", () => {
+    if (isRepos) downloadCsv("repos.csv", (results as Repo[]).map(repoRow));
+    else downloadCsv("ai-assets.csv", (results as Asset[]).map(assetRow));
+  });
   document.querySelector(".facets")?.addEventListener("click", (e) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-more]");
     if (!btn) return;
     const group = btn.closest(".facet-group")!;
-    btn.textContent = group.classList.toggle("expanded") ? "Less" : "More";
+    const expanded = group.classList.toggle("expanded");
+    btn.textContent = expanded ? "Less" : "More";
+    btn.setAttribute("aria-expanded", String(expanded));
   });
-  document.getElementById("csv")?.addEventListener("click", () =>
-    isRepos ? downloadCsv("repos.csv", (results as Repo[]).map(repoRow)) : downloadCsv("ai-assets.csv", (results as Asset[]).map(assetRow)),
-  );
 }
 
 // --------------------------------------------------------------------------------- facets
@@ -171,22 +220,23 @@ function facetGroup(title: string, key: string, entries: [string, number][], q: 
   if (!entries.length) return "";
   const items = entries.slice(0, 40).map(([value, n], i) => {
     const on = hasFilter(q, key, value);
-    return `<li${i >= limit && !on ? ' class="extra"' : ""}><a class="facet${on ? " on" : ""}" aria-pressed="${on}"
-      href="${esc(href({ q: toggleFilter(q, key, value), open: null }))}"><span>${esc(label(value))}</span><span class="n">${n}</span></a></li>`;
+    const target = href({ q: toggleFilter(q, key, value), open: null });
+    return `<li${i >= limit && !on ? ' class="extra"' : ""}><a class="facet${on ? " on" : ""}" data-focus="facet:${esc(key)}:${esc(value)}"
+      href="${esc(target)}"><span>${esc(label(value))}${on ? '<span class="sr-only"> (selected, click to remove)</span>' : ""}</span><span class="n">${num(n)}</span></a></li>`;
   }).join("");
   // "More" also serves the compact mobile layout, which shows 4 per group
-  const more = entries.length > 4 ? `<button type="button" class="btn-link facet-more" data-more>More</button>` : "";
-  return `<div class="facet-group${entries.length <= limit ? " few" : ""}"><h3>${esc(title)}</h3><ul>${items}</ul>${more}</div>`;
+  const more = entries.length > 4 ? `<button type="button" class="btn-link facet-more" data-more aria-expanded="false">More</button>` : "";
+  return `<div class="facet-group${entries.length <= limit ? " few" : ""}"><h2>${esc(title)}</h2><ul>${items}</ul>${more}</div>`;
 }
 
 function repoFacets(rs: Repo[], q: string): string {
   return [
     facetGroup("Type", "type", countBy(rs, (r) => r.structure.repo_type), q),
     facetGroup("Language", "lang", countBy(rs, (r) => r.stack.primary_language), q),
-    facetGroup("Framework", "tech", countBy(rs, (r) => r.stack.frameworks), q),
+    facetGroup("Framework", "fw", countBy(rs, (r) => r.stack.frameworks), q),
     facetGroup("Capability", "cap", countBy(rs, (r) => r.capabilities), q),
-    facetGroup("Data & messaging", "tech", countBy(rs, (r) => [...r.stack.databases, ...r.stack.messaging]), q),
-    facetGroup("Cloud & infra", "tech", countBy(rs, (r) => [...r.stack.cloud, ...r.stack.infrastructure]), q),
+    facetGroup("Data & messaging", "data", countBy(rs, (r) => [...r.stack.databases, ...r.stack.messaging]), q),
+    facetGroup("Cloud & infra", "infra", countBy(rs, (r) => [...r.stack.cloud, ...r.stack.infrastructure]), q),
     facetGroup("Uses AI", "ai", countBy(rs, (r) => (r.ai.has_ai ? "yes" : "no")), q, 8, (v) => (v === "yes" ? "Yes" : "No")),
     facetGroup("Practices grade", "grade", countBy(rs, (r) => r.practices.grade).sort((a, b) => a[0].localeCompare(b[0])), q),
     facetGroup("Missing practice", "missing", countBy(rs, (r) => r.practices.checks.filter((c) => !c.passed).map((c) => c.id)), q),
@@ -211,14 +261,16 @@ function assetFacets(as: Asset[], q: string): string {
 // ---------------------------------------------------------------------------------- cards
 
 function grade(g: string, score: number): string {
-  return `<span class="grade grade-${g}" title="Best-practices score ${score}/100">${g}<span class="sr-only"> grade, ${score} of 100</span></span>`;
+  const safe = GRADES.has(g) ? g : "F";
+  return `<span class="grade grade-${safe}" title="Best-practices score ${num(score)}/100">${safe}<span class="sr-only"> grade, ${num(score)} of 100</span></span>`;
 }
 
 function repoCard(r: Repo): string {
   const s = r.stack;
   const blurb = r.summary.purpose ?? r.summary.one_liner ?? r.summary.readme_excerpt ?? "No description.";
+  const link = href({ open: r.id });
   return `<article class="card">
-    <a class="card-link" href="${esc(href({ open: r.id }))}" aria-label="Open ${esc(r.id)}"></a>
+    <a class="card-link" href="${esc(link)}" data-focus="${esc(link)}" aria-label="Open ${esc(r.id)}"></a>
     <header>
       <div class="card-title"><h2>${esc(r.name)}</h2><span class="muted">${esc(r.owner)}</span>
         ${r.archived ? '<span class="badge">archived</span>' : ""}${r.visibility === "private" ? '<span class="badge">private</span>' : ""}</div>
@@ -229,25 +281,26 @@ function repoCard(r: Repo): string {
       <span class="chip type">${esc(r.structure.repo_type)}</span>
       ${s.primary_language ? `<span class="chip lang">${esc(s.primary_language)}</span>` : ""}
       ${chips([...s.frameworks, ...s.databases, ...s.cloud].slice(0, 6))}
-      ${r.ai.has_ai ? `<span class="chip ai">AI · ${r.ai.asset_count}</span>` : ""}
+      ${r.ai.has_ai ? `<span class="chip ai">AI · ${num(r.ai.asset_count)}</span>` : ""}
     </div>
-    <footer class="muted">${r.capabilities.slice(0, 5).map(esc).join(" · ")}<span class="spacer"></span>updated ${relTime(r.ownership.last_commit ?? r.pushed_at)}</footer>
+    <footer class="muted"><span class="caps">${r.capabilities.slice(0, 5).map(esc).join(" · ")}</span><span class="spacer"></span><span class="when">updated ${relTime(r.ownership.last_commit ?? r.pushed_at)}</span></footer>
   </article>`;
 }
 
 function assetCard(a: Asset): string {
   const blurb = a.summary ?? a.description ?? a.excerpt ?? "";
+  const link = href({ open: a.id });
   return `<article class="card">
-    <a class="card-link" href="${esc(href({ open: a.id }))}" aria-label="Open ${esc(a.name)}"></a>
+    <a class="card-link" href="${esc(link)}" data-focus="${esc(link)}" aria-label="Open ${esc(a.name)}"></a>
     <header>
       <div class="card-title"><span class="kind kind-${esc(a.kind)}">${esc(KIND_LABEL[a.kind] ?? a.kind)}</span><h2>${esc(a.name)}</h2></div>
-      <span class="quality" title="Quality heuristic ${a.quality_score}/100">${a.quality_score}</span>
+      <span class="quality" title="Quality heuristic ${num(a.quality_score)}/100">${num(a.quality_score)}</span>
     </header>
     <p class="blurb">${esc(blurb)}</p>
     <div class="chips"><span class="chip eco">${esc(a.ecosystem)}</span>${chips([...a.tools, ...a.models].slice(0, 5))}
       ${a.duplicates.length ? `<span class="chip">${a.duplicates.length} cop${a.duplicates.length > 1 ? "ies" : "y"}</span>` : ""}
       ${a.confidence !== "high" ? `<span class="chip muted-chip">${esc(a.confidence)} confidence</span>` : ""}</div>
-    <footer class="muted"><span class="path">${esc(a.repo)} · ${esc(a.path)}</span><span class="spacer"></span>${a.last_modified ? `edited ${relTime(a.last_modified)}` : ""}</footer>
+    <footer class="muted"><span class="path">${esc(a.repo)} · ${esc(a.path)}</span><span class="spacer"></span><span class="when">${a.last_modified ? `edited ${relTime(a.last_modified)}` : ""}</span></footer>
   </article>`;
 }
 
@@ -257,21 +310,52 @@ function renderDrawer(state: State): void {
   const repo = state.open ? reposById.get(state.open) : undefined;
   const asset = state.open ? assetsById.get(state.open) : undefined;
   const open = !!(repo || asset);
+  const wasOpen = $drawer.classList.contains("open");
   $drawer.classList.toggle("open", open);
-  $drawer.setAttribute("aria-hidden", String(!open));
+  $drawer.toggleAttribute("inert", !open);
   $scrim.hidden = !open;
   document.body.classList.toggle("drawer-open", open);
-  if (!open) { $drawer.innerHTML = ""; return; }
-  $drawer.innerHTML = `<button type="button" class="icon-btn close" aria-label="Close details">✕</button>${repo ? repoDetail(repo) : assetDetail(asset!)}`;
+  if (!open) {
+    $drawer.innerHTML = "";
+    if (wasOpen) {
+      const back = returnFocus && $main.querySelector<HTMLElement>(`[data-focus="${CSS.escape(returnFocus)}"]`);
+      (back || document.getElementById("q") || $main).focus();
+      returnFocus = null;
+    }
+    return;
+  }
+  // focus guards at both ends keep Tab / Shift+Tab cycling inside the dialog
+  $drawer.innerHTML = `<span class="focus-guard" tabindex="0" data-guard="start"></span><button type="button" class="icon-btn close" aria-label="Close details">✕</button>${repo ? repoDetail(repo) : assetDetail(asset!)}<span class="focus-guard" tabindex="0" data-guard="end"></span>`;
+  $drawer.querySelectorAll<HTMLElement>("[data-guard]").forEach((guard) =>
+    guard.addEventListener("focus", () => {
+      const items = focusables();
+      (guard.dataset.guard === "start" ? items[items.length - 1] : items[0])?.focus();
+    }),
+  );
   $drawer.querySelector(".close")!.addEventListener("click", closeDrawer);
   $drawer.querySelector<HTMLButtonElement>("[data-copy]")?.addEventListener("click", async (e) => {
-    await navigator.clipboard.writeText(asset?.content ?? "");
-    (e.target as HTMLButtonElement).textContent = "Copied";
+    const btn = e.currentTarget as HTMLButtonElement;
+    btn.textContent = (await copyText(asset?.content ?? "")) ? "Copied" : "Copy failed";
   });
   $drawer.focus();
 }
 
-function closeDrawer(): void { navigate({ open: null }); }
+function closeDrawer(): void {
+  navigate({ open: null }, true); // replace: Back should not re-open what was just closed
+}
+
+function focusables(): HTMLElement[] {
+  return [...$drawer.querySelectorAll<HTMLElement>(
+    'a[href], button:not([disabled]), summary, [tabindex]:not([tabindex="-1"])',
+  )].filter((el) => !el.dataset.guard && el.getClientRects().length > 0);
+}
+
+// Belt and braces: if focus lands outside the open dialog by any route, bring it back.
+document.addEventListener("focusin", (e) => {
+  if ($drawer.classList.contains("open") && !$drawer.contains(e.target as Node)) {
+    (focusables()[0] ?? $drawer).focus();
+  }
+});
 
 function section(title: string, body: string): string {
   return body.trim() ? `<section class="d-section"><h3>${esc(title)}</h3>${body}</section>` : "";
@@ -286,20 +370,25 @@ function tagLinks(values: string[], key: string, tab: Tab = "repos"): string {
   return values.map((v) => `<a class="chip" href="${esc(href({ tab, q: `${key}:${/\s/.test(v) ? `"${v}"` : v}`, open: null }))}">${esc(v)}</a>`).join("");
 }
 
+function extLink(url: unknown, label: string, cls = "btn secondary"): string {
+  const u = safeUrl(url);
+  return u === "#" ? "" : `<a class="${cls}" href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`;
+}
+
 function repoDetail(r: Repo): string {
   const s = r.stack;
   const assets = catalog.assets.filter((a) => a.repo === r.id);
   const failing = r.practices.checks.filter((c) => !c.passed);
   const deps = r.dependencies.filter((d) => d.scope !== "dev");
   const devDeps = r.dependencies.filter((d) => d.scope === "dev");
-  return `<header class="d-head">
+  return `<div class="d-head">
       <p class="eyebrow">${esc(r.structure.repo_type)} · ${esc(r.lifecycle)}${r.declared.system ? ` · system ${esc(r.declared.system)}` : ""}</p>
-      <h2>${esc(r.id)}</h2>
+      <h2 id="drawer-title">${esc(r.id)}</h2>
       <p class="lead">${esc(r.summary.one_liner ?? r.description ?? "")}</p>
-      <div class="actions"><a class="btn" href="${esc(r.url)}" target="_blank" rel="noopener">Open on GitHub</a>
-        ${r.homepage ? `<a class="btn secondary" href="${esc(r.homepage)}" target="_blank" rel="noopener">Homepage</a>` : ""}
-        ${r.declared.links.map((l) => `<a class="btn secondary" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.title || "Link")}</a>`).join("")}</div>
-    </header>
+      <div class="actions">${extLink(r.url, "Open on GitHub", "btn")}
+        ${extLink(r.homepage, "Homepage")}
+        ${r.declared.links.map((l) => extLink(l.url, l.title || "Link")).join("")}</div>
+    </div>
     ${section("What it does", `${r.summary.purpose ? `<p>${esc(r.summary.purpose)}</p>` : ""}
       ${r.summary.readme_excerpt && r.summary.readme_excerpt !== r.summary.purpose ? `<p class="muted">${esc(r.summary.readme_excerpt)}</p>` : ""}
       ${r.summary.key_features.length ? `<ul>${r.summary.key_features.map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : ""}
@@ -307,11 +396,11 @@ function repoDetail(r: Repo): string {
       ${r.summary.source === "llm" ? '<p class="muted small">Summary generated by Claude from the README and code facts.</p>' : ""}`)}
     ${section("Capabilities", `<div class="chips">${tagLinks([...r.capabilities, ...r.summary.domains], "cap")}</div>`)}
     ${section("Stack", `<dl class="kv">
-      <dt>Languages</dt><dd>${s.languages.slice(0, 6).map((l) => `${esc(l.name)} <span class="muted">${l.percent}%</span>`).join(", ") || "—"}</dd>
+      <dt>Languages</dt><dd>${s.languages.slice(0, 6).map((l) => `${esc(l.name)} <span class="muted">${num(l.percent)}%</span>`).join(", ") || "—"}</dd>
       ${Object.keys(s.runtimes).length ? `<dt>Runtimes</dt><dd>${Object.entries(s.runtimes).map(([k, v]) => `${esc(k)} ${esc(v)}`).join(", ")}</dd>` : ""}
-      ${STACK_ROWS.filter(([k]) => (s[k] as string[]).length).map(([k, label]) => `<dt>${label}</dt><dd class="chips">${tagLinks(s[k] as string[], "tech")}</dd>`).join("")}
+      ${STACK_ROWS.filter(([k]) => (s[k] as string[]).length).map(([k, label, key]) => `<dt>${label}</dt><dd class="chips">${tagLinks(s[k] as string[], key)}</dd>`).join("")}
     </dl>`)}
-    ${section(`Best practices · ${r.practices.score}/100`, `<ul class="checks">${r.practices.checks.map((c) =>
+    ${section(`Best practices · ${num(r.practices.score)}/100`, `<ul class="checks">${r.practices.checks.map((c) =>
       `<li class="${c.passed ? "pass" : "fail"}"><span aria-hidden="true">${c.passed ? "✓" : "✗"}</span><span class="sr-only">${c.passed ? "Passed" : "Failed"}:</span> ${esc(c.label)}${c.evidence ? ` <span class="muted small">${esc(c.evidence)}</span>` : ""}</li>`).join("")}</ul>
       ${failing.length ? `<p class="muted small">${failing.length} check(s) failing. Weighted by importance; see docs/catalog-data.md.</p>` : ""}`)}
     ${section(`AI assets (${assets.length})`, assets.length ? `<ul class="mini-list">${assets.map((a) =>
@@ -327,13 +416,13 @@ function repoDetail(r: Repo): string {
       ["Top level", r.structure.top_level.slice(0, 30).map((e) => `<code>${esc(e)}</code>`).join(" ")],
     ]))}
     ${section(`Dependencies (${r.dependencies.length})`, r.dependencies.length ? `<details><summary>${deps.length} runtime · ${devDeps.length} dev</summary>
-      <table class="deps"><thead><tr><th>Name</th><th>Version</th><th>Scope</th><th>Manifest</th></tr></thead><tbody>
+      <div class="table-wrap" tabindex="0" role="region" aria-label="Dependencies"><table class="deps"><thead><tr><th>Name</th><th>Version</th><th>Scope</th><th>Manifest</th></tr></thead><tbody>
       ${r.dependencies.slice(0, 400).map((d) => `<tr><td>${esc(d.name)}</td><td>${esc(d.version ?? "")}</td><td>${esc(d.scope)}</td><td class="muted">${esc(d.manifest)}</td></tr>`).join("")}
-      </tbody></table></details>` : "")}
+      </tbody></table></div></details>` : "")}
     ${section("Ownership", kv([
       ["Declared owner", esc(r.declared.owner)],
       ["CODEOWNERS", r.ownership.codeowners.map(esc).join(", ")],
-      ["Top contributors", r.ownership.top_contributors.slice(0, 6).map((c) => `${esc(c.name)} <span class="muted">(${c.commits})</span>`).join(", ")],
+      ["Top contributors", r.ownership.top_contributors.slice(0, 6).map((c) => `${esc(c.name)} <span class="muted">(${num(c.commits)})</span>`).join(", ")],
       ["History", r.ownership.commit_count ? `${fmtNum(r.ownership.commit_count)} commits, last ${relTime(r.ownership.last_commit)}` : null],
       ["License", esc(r.license)],
       ["Descriptor", r.declared.source_files.map(esc).join(", ")],
@@ -343,22 +432,22 @@ function repoDetail(r: Repo): string {
 }
 
 function assetDetail(a: Asset): string {
-  const isMarkdown = /\.(md|mdc|prompt|prompty)$/i.test(a.path) || ["skill", "agent", "command", "instructions"].includes(a.kind) && !/\.(json|ya?ml|toml|py|ts|js)$/i.test(a.path);
+  const isMarkdown = /\.(md|mdc|prompt|prompty)$/i.test(a.path)
+    || (["skill", "agent", "command", "instructions"].includes(a.kind) && !/\.(json|ya?ml|toml|py|[cm]?[jt]sx?|go)$/i.test(a.path));
   const body = a.content ?? "";
-  const lang = a.path.split(".").pop() ?? "";
   const rendered = isMarkdown ? `<div class="md">${markdown(body.replace(/^---[\s\S]*?\n---\s*\n/, ""))}</div>`
-    : `<pre><code class="lang-${esc(lang)}">${esc(body)}</code></pre>`;
+    : `<pre tabindex="0"><code>${esc(body)}</code></pre>`;
   const dupes = a.duplicates.map((id) => assetsById.get(id)).filter((x): x is Asset => !!x);
-  const fm = Object.keys(a.frontmatter).length ? `<details><summary>Metadata / frontmatter</summary><pre><code>${esc(JSON.stringify(a.frontmatter, null, 2))}</code></pre></details>` : "";
-  return `<header class="d-head">
+  const fm = Object.keys(a.frontmatter).length ? `<details><summary>Metadata / frontmatter</summary><pre tabindex="0"><code>${esc(JSON.stringify(a.frontmatter, null, 2))}</code></pre></details>` : "";
+  return `<div class="d-head">
       <p class="eyebrow"><span class="kind kind-${esc(a.kind)}">${esc(KIND_LABEL[a.kind] ?? a.kind)}</span> ${esc(a.ecosystem)} · ${esc(a.scope)} scope</p>
-      <h2>${esc(a.title ?? a.name)}</h2>
+      <h2 id="drawer-title">${esc(a.title ?? a.name)}</h2>
       ${a.title ? `<p class="muted">${esc(a.name)}</p>` : ""}
       <p class="lead">${esc(a.summary ?? a.description ?? "")}</p>
-      <div class="actions"><a class="btn" href="${esc(a.url)}" target="_blank" rel="noopener">Open on GitHub</a>
+      <div class="actions">${extLink(a.url, "Open on GitHub", "btn")}
         ${body ? '<button type="button" class="btn secondary" data-copy>Copy content</button>' : ""}
         <a class="btn secondary" href="${esc(href({ tab: "repos", open: a.repo, q: "" }))}">View repo</a></div>
-    </header>
+    </div>
     ${a.summary && a.description ? section("Description", `<p>${esc(a.description)}</p>`) : ""}
     ${a.use_cases.length ? section("Use cases", `<ul>${a.use_cases.map((u) => `<li>${esc(u)}</li>`).join("")}</ul>`) : ""}
     ${section("Details", kv([
@@ -372,10 +461,10 @@ function assetDetail(a: Asset): string {
       ["Category", esc(a.category)],
       ["Version / license", [a.version, a.license].filter(Boolean).map(esc).join(" · ")],
       ["Size", `${fmtNum(a.line_count)} lines · ${fmtNum(a.word_count)} words · ~${fmtNum(a.token_estimate)} tokens`],
-      ["Last edit", a.last_modified ? `${relTime(a.last_modified)} by ${esc(a.last_author)} · ${a.commit_count ?? 0} commit(s)` : null],
+      ["Last edit", a.last_modified ? `${relTime(a.last_modified)} by ${esc(a.last_author)} · ${num(a.commit_count)} commit(s)` : null],
       ["Detected by", `${esc(a.detector)} · ${esc(a.confidence)} confidence`],
     ]))}
-    ${section(`Quality · ${a.quality_score}/100`, a.quality_notes.length ? `<ul class="checks">${a.quality_notes.map((n) => `<li class="fail"><span aria-hidden="true">!</span> ${esc(n)}</li>`).join("")}</ul>` : "<p class=\"muted\">No issues found by the heuristics.</p>")}
+    ${section(`Quality · ${num(a.quality_score)}/100`, a.quality_notes.length ? `<ul class="checks">${a.quality_notes.map((n) => `<li class="fail"><span aria-hidden="true">!</span> ${esc(n)}</li>`).join("")}</ul>` : '<p class="muted">No issues found by the heuristics.</p>')}
     ${a.files.length ? section(`Bundled files (${a.files.length})`, `<ul class="mini-list">${a.files.map((f) => `<li><code>${esc(f.path)}</code> <span class="muted small">${fmtNum(f.size)} B</span></li>`).join("")}</ul>`) : ""}
     ${dupes.length ? section("Identical copies", `<ul class="mini-list">${dupes.map((d) => `<li><a href="${esc(href({ open: d.id }))}">${esc(d.repo)} · ${esc(d.path)}</a></li>`).join("")}</ul>`) : ""}
     ${section("Content", `${a.content_truncated ? '<p class="muted small">Truncated; open on GitHub for the full file.</p>' : ""}${fm}${body ? rendered : '<p class="muted">No content captured.</p>'}`)}`;
@@ -386,11 +475,11 @@ function assetDetail(a: Asset): string {
 function bars(title: string, entries: [string, number][], link: (v: string) => string, total: number, limit = 10): string {
   const rows = entries.slice(0, limit);
   if (!rows.length) return "";
-  const max = rows[0]![1];
+  const max = Math.max(1, rows[0]![1]);
   return `<figure class="panel"><figcaption>${esc(title)}</figcaption><ul class="bars">
-    ${rows.map(([label, n]) => `<li><a href="${esc(link(label))}" title="${esc(label)}: ${n} (${Math.round((100 * n) / Math.max(total, 1))}%)">
+    ${rows.map(([label, n]) => `<li><a href="${esc(link(label))}" title="${esc(label)}: ${num(n)} (${Math.round((100 * num(n)) / Math.max(total, 1))}%)">
       <span class="bar-label">${esc(label)}</span>
-      <span class="bar-track"><span class="bar" style="width:${Math.max(2, (100 * n) / max)}%"></span></span>
+      <span class="bar-track" aria-hidden="true"><span class="bar" style="width:${Math.max(2, (100 * num(n)) / max).toFixed(1)}%"></span></span>
       <span class="bar-value">${fmtNum(n)}</span></a></li>`).join("")}
   </ul></figure>`;
 }
@@ -401,14 +490,16 @@ function renderInsights(): void {
   const active = rs.filter((r) => !r.archived);
   const pct = (n: number) => `${Math.round((100 * n) / Math.max(active.length, 1))}%`;
   const passing = (id: string) => active.filter((r) => r.practices.checks.some((c) => c.id === id && c.passed)).length;
-  const avg = Math.round(active.reduce((s, r) => s + r.practices.score, 0) / Math.max(active.length, 1));
+  const avg = Math.round(active.reduce((s, r) => s + num(r.practices.score), 0) / Math.max(active.length, 1));
   const repoQ = (q: string) => href({ tab: "repos", q, open: null });
   const assetQ = (q: string) => href({ tab: "assets", q, open: null });
   const quote = (v: string) => (/\s/.test(v) ? `"${v}"` : v);
   const failCounts = countBy(active, (r) => r.practices.checks.filter((c) => !c.passed).map((c) => c.label));
   const labelToId = new Map(active.flatMap((r) => r.practices.checks.map((c) => [c.label, c.id] as const)));
+  const kindByLabel = new Map(Object.entries(KIND_LABEL).map(([k, l]) => [l, k]));
 
   $main.innerHTML = `
+    <h1 class="sr-only">Insights</h1>
     <section class="insights">
       <div class="kpis">
         <div class="kpi"><span class="kpi-value">${fmtNum(rs.length)}</span><span class="kpi-label">repositories · ${fmtNum(active.length)} active</span></div>
@@ -420,12 +511,12 @@ function renderInsights(): void {
       </div>
       <div class="grid">
         ${bars("Primary languages", countBy(rs, (r) => r.stack.primary_language), (v) => repoQ(`lang:${quote(v)}`), rs.length)}
-        ${bars("Frameworks", countBy(rs, (r) => r.stack.frameworks), (v) => repoQ(`tech:${quote(v)}`), rs.length)}
+        ${bars("Frameworks", countBy(rs, (r) => r.stack.frameworks), (v) => repoQ(`fw:${quote(v)}`), rs.length)}
         ${bars("Repo types", countBy(rs, (r) => r.structure.repo_type), (v) => repoQ(`type:${v}`), rs.length)}
-        ${bars("Data stores", countBy(rs, (r) => r.stack.databases), (v) => repoQ(`tech:${quote(v)}`), rs.length)}
-        ${bars("Cloud & infrastructure", countBy(rs, (r) => [...r.stack.cloud, ...r.stack.infrastructure]), (v) => repoQ(`tech:${quote(v)}`), rs.length)}
+        ${bars("Data stores", countBy(rs, (r) => r.stack.databases), (v) => repoQ(`data:${quote(v)}`), rs.length)}
+        ${bars("Cloud & infrastructure", countBy(rs, (r) => [...r.stack.cloud, ...r.stack.infrastructure]), (v) => repoQ(`infra:${quote(v)}`), rs.length)}
         ${bars("Most common gaps (active repos)", failCounts, (v) => repoQ(`missing:${labelToId.get(v) ?? v} -is:archived`), active.length)}
-        ${bars("AI assets by kind", countBy(as, (a) => KIND_LABEL[a.kind] ?? a.kind), (v) => assetQ(`kind:${Object.entries(KIND_LABEL).find(([, l]) => l === v)?.[0] ?? v}`), as.length)}
+        ${bars("AI assets by kind", countBy(as, (a) => KIND_LABEL[a.kind] ?? a.kind), (v) => assetQ(`kind:${kindByLabel.get(v) ?? v}`), as.length)}
         ${bars("AI ecosystems", countBy(as, (a) => a.ecosystem), (v) => assetQ(`eco:${v}`), as.length)}
         ${bars("LLM SDKs (repos)", countBy(rs, (r) => r.ai.sdks), (v) => repoQ(`uses:${quote(v)}`), rs.length)}
         ${bars("Models referenced (repos)", countBy(rs, (r) => r.ai.models), (v) => repoQ(`uses:${quote(v)}`), rs.length)}
@@ -459,28 +550,34 @@ function assetRow(a: Asset): Record<string, unknown> {
 
 // ---------------------------------------------------------------------------------- wiring
 
-window.addEventListener("hashchange", () => { shown = PAGE; render(); });
-window.addEventListener("popstate", render);
+window.addEventListener("hashchange", () => render());
+window.addEventListener("popstate", () => render());
 $scrim.addEventListener("click", closeDrawer);
 document.addEventListener("keydown", (e) => {
   const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
-  if (e.key === "/" && !typing) { e.preventDefault(); document.getElementById("q")?.focus(); }
+  if (e.key === "/" && !typing && !$drawer.classList.contains("open")) {
+    e.preventDefault();
+    document.getElementById("q")?.focus();
+  }
   if (e.key === "Escape" && readState().open) closeDrawer();
 });
 
 const THEME_KEY = "repo-catalog-theme";
-function applyTheme(t: string | null): void {
-  if (t) document.documentElement.dataset.theme = t;
-  else delete document.documentElement.dataset.theme;
+const $theme = document.getElementById("theme")!;
+function currentDark(): boolean {
+  const t = document.documentElement.dataset.theme;
+  return t ? t === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
 }
-try { applyTheme(localStorage.getItem(THEME_KEY)); } catch { /* storage unavailable */ }
-document.getElementById("theme")!.addEventListener("click", () => {
-  const dark = document.documentElement.dataset.theme
-    ? document.documentElement.dataset.theme === "dark"
-    : matchMedia("(prefers-color-scheme: dark)").matches;
-  const next = dark ? "light" : "dark";
-  applyTheme(next);
-  try { localStorage.setItem(THEME_KEY, next); } catch { /* ignore */ }
+function syncThemeButton(): void {
+  $theme.setAttribute("aria-pressed", String(currentDark()));
+  $theme.setAttribute("aria-label", currentDark() ? "Switch to light theme" : "Switch to dark theme");
+}
+$theme.addEventListener("click", () => {
+  const next = currentDark() ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem(THEME_KEY, next); } catch { /* storage unavailable */ }
+  syncThemeButton();
 });
+syncThemeButton();
 
 void load();

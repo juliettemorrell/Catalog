@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, cast
@@ -125,9 +127,14 @@ class Enricher:
     # -- internals ------------------------------------------------------------------------
 
     def _map(self, fn: Any, items: list[Any]) -> None:
+        def safe(item: Any) -> None:
+            try:
+                fn(item)
+            except Exception as exc:  # one bad item must never fail the batch
+                log.warning("LLM enrichment failed for %s: %s", getattr(item, "id", item), exc)
+
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            for _ in pool.map(fn, items):
-                pass
+            list(pool.map(safe, items))
 
     def _call(self, schema: type[T], system: str, prompt: str) -> T | None:
         import anthropic
@@ -137,7 +144,10 @@ class Enricher:
         ).hexdigest()
         cached = self.cache_dir / f"{key}.json"
         if cached.exists():
-            return schema.model_validate_json(cached.read_text())
+            try:
+                return schema.model_validate_json(cached.read_text())
+            except (OSError, ValueError):
+                cached.unlink(missing_ok=True)  # corrupt entry: treat as a miss
         try:
             response = self.client.beta.messages.parse(
                 model=self.model,
@@ -158,11 +168,16 @@ class Enricher:
         except anthropic.APIConnectionError as exc:
             log.warning("LLM connection error: %s", exc)
             return None
+        except ValueError as exc:  # truncated/invalid structured output (pydantic)
+            log.warning("LLM output did not match the schema: %s", str(exc)[:200])
+            return None
         if response.stop_reason == "refusal" or response.parsed_output is None:
             log.warning("LLM returned no structured output (stop_reason=%s)", response.stop_reason)
             return None
         result: T = response.parsed_output
-        cached.write_text(result.model_dump_json())
+        tmp = cached.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(result.model_dump_json())
+        os.replace(tmp, cached)  # atomic: concurrent workers never see partial files
         return result
 
 

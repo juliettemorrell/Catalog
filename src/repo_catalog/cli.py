@@ -10,10 +10,13 @@ import re
 import sqlite3
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import httpx
+
 from . import __version__
-from .github import GitHubClient, RepoRef
+from .github import GitHubClient, GitHubError, RepoRef
 from .models import AIAsset, Repo
 from .outputs import exports, store
 from .outputs.sqlite import build_sqlite, dump_meta
@@ -22,6 +25,13 @@ from .scanner import ScanOptions, ScanResult, analyze_checkout, mark_duplicates,
 log = logging.getLogger("repo_catalog")
 
 DB_FILE = "catalog.db"
+
+
+def _positive(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return n
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -73,8 +83,8 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--skip-archived", action="store_true")
     s.add_argument("--match", help="Only repos whose name matches this regex.")
     s.add_argument("--exclude", help="Skip repos whose name matches this regex.")
-    s.add_argument("--limit", type=int, help="Scan at most N repos (for trials).")
-    s.add_argument("--workers", type=int, default=4)
+    s.add_argument("--limit", type=_positive, help="Scan at most N repos (for trials).")
+    s.add_argument("--workers", type=_positive, default=4)
     s.add_argument(
         "--shallow", action="store_true", help="Depth-1 clones: faster, but no history/provenance."
     )
@@ -104,6 +114,7 @@ def _parser() -> argparse.ArgumentParser:
 
     sql = sub.add_parser("sql", help="Run a read-only SQL query against catalog.db.")
     sql.add_argument("query")
+    sql.add_argument("--limit", type=_positive, default=1000)
     sql.add_argument("--out", type=Path, default=Path("data"))
     sql.set_defaults(func=cmd_sql)
 
@@ -123,6 +134,15 @@ def _parser() -> argparse.ArgumentParser:
 def cmd_scan(args: argparse.Namespace) -> int:
     if not (args.org or args.repo or args.local):
         sys.exit("Nothing to scan: pass --org, --repo or --local.")
+    for flag in ("match", "exclude"):
+        if getattr(args, flag):
+            try:
+                re.compile(getattr(args, flag))
+            except re.error as exc:
+                sys.exit(f"--{flag} is not a valid regular expression: {exc}")
+    for path in args.local:
+        if not path.is_dir():
+            sys.exit(f"--local {path}: not a directory")
     args.out.mkdir(parents=True, exist_ok=True)
     opts = ScanOptions(
         workdir=args.workdir,
@@ -139,54 +159,64 @@ def cmd_scan(args: argparse.Namespace) -> int:
     discovered: set[str] = set()
 
     if args.org or args.repo:
-        refs = _discover(args)
+        try:
+            refs = _discover(args)
+        except (GitHubError, httpx.HTTPError) as exc:
+            sys.exit(f"GitHub discovery failed: {exc}")
         discovered.update(r.full_name for r in refs)
         log.info("scanning %d repositories", len(refs))
         report = scan_all(refs, opts, previous)
         results += report.results
         failures.update(report.failures)
-    for path in args.local:
-        for ref, checkout in _local_refs(path):
-            discovered.add(ref.full_name)
-            try:
-                results.append(analyze_checkout(ref, checkout, opts))
-            except Exception as exc:
-                log.error("scan failed for %s: %s", checkout, exc)
-                failures[ref.full_name] = str(exc)
+    local = [pair for path in args.local for pair in _local_refs(path)]
+    if local:
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            futures = {pool.submit(analyze_checkout, ref, root, opts): ref for ref, root in local}
+            for fut, ref in futures.items():
+                discovered.add(ref.full_name)
+                try:
+                    results.append(fut.result())
+                except Exception as exc:
+                    log.error("scan failed for %s: %s", ref.full_name, exc)
+                    failures[ref.full_name] = f"{type(exc).__name__}: {exc}"[:500]
+    fresh = len(results)
 
     for failed in failures:  # keep last good data rather than dropping the repo
         if failed in previous:
             repo, assets = previous[failed]
-            repo = repo.model_copy(
-                update={
-                    "scan_errors": [*repo.scan_errors, f"latest scan failed: {failures[failed]}"]
-                }
-            )
+            note = f"latest scan failed: {failures[failed]}"
+            errors = [e for e in repo.scan_errors if not e.startswith("latest scan failed")]
+            repo = repo.model_copy(update={"scan_errors": [*errors, note]})
             results.append(ScanResult(repo=repo, assets=assets, reused=True))
 
     mark_duplicates([a for r in results for a in r.assets])
-    if args.llm:
-        _enrich(args, results)
-    for r in results:
+    for r in results:  # persist first: enrichment problems must never lose scan results
         store.write_repo(args.out, r.repo, r.assets)
+    if args.llm and _enrich(args, results):
+        for r in results:
+            store.write_repo(args.out, r.repo, r.assets)
     if args.org and not (args.match or args.exclude or args.limit):
-        removed = store.prune(args.out, discovered | set(failures))
+        owners = {
+            o.lower()
+            for o in args.org
+            if any(d.lower().startswith(o.lower() + "/") for d in discovered)
+        }
+        removed = store.prune(args.out, discovered | set(failures), owners)
         if removed:
-            log.info("pruned %d repos no longer in scope", len(removed))
+            log.info("pruned %d repos no longer in %s", len(removed), ", ".join(sorted(owners)))
 
     source = ",".join([f"org:{o}" for o in args.org] + args.repo + [str(p) for p in args.local])
     _build(args.out, source, llm=args.llm)
-    rescanned = sum(not r.reused for r in results)
     log.info(
-        "done: %d repos (%d rescanned, %d reused), %d failed",
+        "done: %d repos (%d scanned, %d reused), %d failed",
         len(results),
-        rescanned,
-        len(results) - rescanned,
+        sum(not r.reused for r in results),
+        sum(r.reused for r in results),
         len(failures),
     )
     for name, err in failures.items():
         log.warning("FAILED %s: %s", name, err)
-    return 1 if failures and not results else 0
+    return 1 if failures and not fresh else 0
 
 
 def _discover(args: argparse.Namespace) -> list[RepoRef]:
@@ -194,6 +224,8 @@ def _discover(args: argparse.Namespace) -> list[RepoRef]:
         refs: list[RepoRef] = []
         for org in args.org:
             owner_refs = gh.list_owner_repos(org)
+            if not owner_refs:
+                log.warning("no repositories visible for %s (check token access)", org)
             props = gh.org_custom_properties(org)
             for ref in owner_refs:
                 ref.custom_properties = props.get(ref.full_name, {})
@@ -220,24 +252,30 @@ def _discover(args: argparse.Namespace) -> list[RepoRef]:
     return out[: args.limit] if args.limit else out
 
 
+_GITHUB_REMOTE = re.compile(r"github\.com[:/]+([^/]+)/([^/]+?)(?:\.git)?/*$")
+
+
 def _local_refs(path: Path) -> list[tuple[RepoRef, Path]]:
     path = path.resolve()
     roots = (
         [path]
         if (path / ".git").exists()
-        else sorted(p for p in path.iterdir() if (p / ".git").exists())
+        else sorted(p for p in path.iterdir() if p.is_dir() and (p / ".git").exists())
     )
+    if not roots:
+        log.warning("no git repositories found in %s", path)
     refs = []
     for root in roots:
         remote = _git(root, "remote", "get-url", "origin")
-        m = re.search(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?$", remote or "")
+        m = _GITHUB_REMOTE.search(remote or "")
         full_name = f"{m.group(1)}/{m.group(2)}" if m else f"local/{root.name}"
         html = f"https://github.com/{full_name}" if m else root.as_uri()
+        branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
         ref = RepoRef(
             full_name=full_name,
             clone_url=remote or "",
             html_url=html,
-            default_branch=_git(root, "rev-parse", "--abbrev-ref", "HEAD"),
+            default_branch=None if branch in (None, "HEAD") else branch,
             head_sha=_git(root, "rev-parse", "HEAD"),
         )
         refs.append((ref, root))
@@ -249,21 +287,31 @@ def _git(cwd: Path, *args: str) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
-def _enrich(args: argparse.Namespace, results: list[ScanResult]) -> None:
-    from .enrich import DEFAULT_MODEL, Enricher
-
+def _enrich(args: argparse.Namespace, results: list[ScanResult]) -> bool:
+    """Best effort: returns True if anything was enriched. Never raises."""
     todo = [r for r in results if not r.reused]
     if not todo:
-        return
-    enricher = Enricher(
-        cache_dir=Path(".cache/llm"), model=args.llm_model or DEFAULT_MODEL, effort=args.llm_effort
-    )
-    log.info("LLM-enriching %d repos with %s", len(todo), enricher.model)
-    enricher.enrich_repos([r.repo for r in todo], {r.repo.id: r.readme for r in todo})
-    enricher.enrich_assets([a for r in todo for a in r.assets])
+        return False
+    try:
+        from .enrich import DEFAULT_MODEL, Enricher
+
+        enricher = Enricher(
+            cache_dir=Path(".cache/llm"),
+            model=args.llm_model or DEFAULT_MODEL,
+            effort=args.llm_effort,
+        )
+        log.info("LLM-enriching %d repos with %s", len(todo), enricher.model)
+        enricher.enrich_repos([r.repo for r in todo], {r.repo.id: r.readme for r in todo})
+        enricher.enrich_assets([a for r in todo for a in r.assets])
+    except Exception as exc:
+        log.error("LLM enrichment skipped: %s", exc)
+        return False
+    return True
 
 
 def cmd_build(args: argparse.Namespace) -> int:
+    if not (args.out / store.REPOS_DIR).is_dir():
+        sys.exit(f"{args.out / store.REPOS_DIR} not found; run `repo-catalog scan` first.")
     _build(args.out, args.source, llm=False)
     return 0
 
@@ -303,9 +351,11 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 def cmd_sql(args: argparse.Namespace) -> int:
     con = _connect(args.out)
+    from .query import read_only_sql
+
     try:
-        rows = [dict(r) for r in con.execute(args.query).fetchall()]
-    except sqlite3.Error as exc:
+        rows = read_only_sql(con, args.query, limit=args.limit)
+    except (sqlite3.Error, ValueError) as exc:
         sys.exit(f"SQL error: {exc}")
     print(json.dumps(rows, indent=2, default=str))
     return 0

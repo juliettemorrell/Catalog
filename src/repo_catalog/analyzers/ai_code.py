@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
 from ..fs import FileEntry, RepoFiles
+from . import ai_python
 from .ai_common import AssetDraft
 
 CODE_EXT = {
@@ -200,6 +201,14 @@ SDKS: dict[str, tuple[str, str, str]] = {
     ),
 }
 
+# One pass per file instead of one per SDK: named groups tell which SDKs matched.
+_SDK_GROUP = {key: "g_" + re.sub(r"\W", "_", key) for key in SDKS}
+SDK_IMPORT_RX = re.compile(
+    "|".join(f"(?P<{_SDK_GROUP[k]}>{imp})" for k, (_, imp, _) in SDKS.items()), re.M
+)
+_SDK_BY_GROUP = {g: k for k, g in _SDK_GROUP.items()}
+
+
 # Model identifiers. Kept deliberately specific to avoid false positives.
 MODEL_PATTERNS = [
     r"(?:(?:us|eu|apac|global)\.)?(?:anthropic\.)?claude-(?:opus|sonnet|haiku|fable|mythos|instant|"
@@ -213,9 +222,9 @@ MODEL_PATTERNS = [
     r"gemini-(?:[0-9][a-z0-9.\-]*|pro|ultra|flash)[a-z0-9.\-]*",
     r"text-bison|chat-bison",
     r"(?:meta-)?llama-?[0-9][a-z0-9.\-]*",
-    r"(?:mistral|mixtral|codestral|ministral|pixtral)-"
-    r"[a-z0-9.\-]+",
-    r"command-r(?:-plus)?[a-z0-9\-]*",
+    r"(?:mistral|mixtral|codestral|ministral|pixtral|magistral|devstral)-(?:(?:large|medium|small|"
+    r"tiny|nemo|embed|saba|ocr|latest)(?:-[a-z0-9.]+)*|[0-9][a-z0-9.\-]*)",
+    r"command-(?:r(?:-plus)?|a)(?:-\d{2}-\d{4}|-[0-9]{2,})?(?![a-z])",
     r"deepseek-[a-z0-9.\-]+",
     r"qwen[0-9.]*-[a-z0-9.\-]+",
 ]
@@ -224,37 +233,38 @@ MODEL_RX = re.compile(r"\b(" + "|".join(MODEL_PATTERNS) + r")\b", re.I)
 _MCP_SERVER_IMPORT = re.compile(
     r"from\s+mcp\.server|from\s+fastmcp|import\s+fastmcp|@modelcontextprotocol/sdk/server|"
     r"mark3labs/mcp-go/server|modelcontextprotocol/go-sdk/mcp|ModelContextProtocol\.Server|"
-    r"io\.modelcontextprotocol\.server|rmcp::"
+    r"io\.modelcontextprotocol\.server|rmcp::|from\s+['\"]fastmcp['\"]"
 )
 _MCP_SERVER_NAME = [
     re.compile(r"\b(?:FastMCP|MCPServer)\(\s*(?:name\s*=\s*)?['\"]([^'\"]+)['\"]"),
-    re.compile(r"new\s+(?:Mcp)?Server\(\s*\{\s*name:\s*['\"`]([^'\"`]+)['\"`]"),
+    re.compile(r"new\s+(?:Mcp|Fast)?(?:Server|MCP)\(\s*\{\s*name:\s*['\"`]([^'\"`]+)['\"`]"),
     re.compile(r"NewMCPServer\(\s*\"([^\"]+)\""),
     re.compile(r"mcp\.Implementation\{\s*Name:\s*\"([^\"]+)\""),
     re.compile(r"(?i)server_?info['\"]?\s*[=:]\s*\{[^}]*?['\"]name['\"]\s*:\s*['\"]([^'\"]+)"),
 ]
 _MCP_SERVER_CTOR = re.compile(
     r"\b(FastMCP|MCPServer)\(|new\s+McpServer\(|new\s+Server\(\s*\{|NewMCPServer\(|mcp\.NewServer\(|"
-    r"AddMcpServer\(|McpServer\.(?:sync|async)\("
+    r"AddMcpServer\(|McpServer\.(?:sync|async)\(|new\s+FastMCP\("
 )
-_PY_TOOL = re.compile(
-    r"@\w+\.tool\s*\((?P<args>[^)]*)\)\s*\n(?:\s*@.*\n)*\s*(?:async\s+)?def\s+(?P<fn>\w+)\s*\("
-    r"[^)]*\)[^:]*:\s*\n\s*(?:[rub]?(?P<q>\"\"\"|''')(?P<doc>.*?)(?P=q))?",
-    re.S,
+_HANDWRITTEN_MCP = re.compile(
+    r"(?:==|===|\bcase)\s*['\"]tools/call['\"]|['\"]tools/call['\"]\s*[:)]\s*(?!\s*['\"])"
 )
-_TS_TOOL = re.compile(
-    r"\.(?:tool|registerTool)\(\s*['\"`]([\w\-.]+)['\"`]\s*,\s*(?:\{[^}]*?description:\s*)?"
-    r"['\"`]([^'\"`]{0,300})",
-    re.S,
-)
-_GO_TOOL = re.compile(
-    r"mcp\.NewTool\(\s*\"([^\"]+)\"(?:.*?mcp\.WithDescription\(\s*\"([^\"]*)\")?", re.S
-)
-_HANDWRITTEN_MCP = re.compile(r"['\"]tools/list['\"]")
+# a server must publish tool schemas; clients and method tables only name the methods
+_SERVES_SCHEMAS = re.compile(r"['\"](?:inputSchema|input_schema)['\"]")
 _JSON_TOOL = re.compile(
     r"['\"]name['\"]\s*:\s*['\"]([\w\-.]+)['\"]\s*,\s*['\"]description['\"]\s*:\s*"
     r"['\"]([^'\"]{0,300})['\"](?=[^{}]{0,200}['\"]inputSchema['\"])"
 )
+
+
+def _handwritten_mcp(code: str) -> bool:
+    return (
+        "tools/list" in code
+        and _HANDWRITTEN_MCP.search(code) is not None
+        and _SERVES_SCHEMAS.search(code) is not None
+    )
+
+
 _PY_RESOURCE = re.compile(r"@\w+\.(resource|prompt)\s*\(")
 
 _PROMPT_VAR = re.compile(r"(prompt|instruction|system|persona|template|guideline|preamble)", re.I)
@@ -298,7 +308,7 @@ def scan_code(files: RepoFiles, claimed: set[str]) -> CodeFindings:
     candidates = [
         f
         for f in files.files
-        if (f.suffix in CODE_EXT or f.suffix in CONFIG_EXT)
+        if (f.suffix in CODE_EXT or f.suffix in CONFIG_EXT or f.name.startswith(".env."))
         and f.size <= MAX_FILE
         and not _is_test_fixture(f.path)
     ][:MAX_FILES]
@@ -315,29 +325,50 @@ def scan_code(files: RepoFiles, claimed: set[str]) -> CodeFindings:
             out.models[m] = out.models.get(m, 0) + 1
         if not is_code:
             continue
-        for key, (label, imp, call) in SDKS.items():
-            if not re.search(imp, text, re.M):
-                continue
-            lines = [i + 1 for i, ln in enumerate(text.splitlines()) if re.search(call, ln)]
+        matched = {
+            _SDK_BY_GROUP[g]
+            for mt in SDK_IMPORT_RX.finditer(text)
+            for g, v in mt.groupdict().items()
+            if v is not None
+        }
+        for key in sorted(matched):
+            label, _, call = SDKS[key]
+            call_rx = re.compile(call)
+            lines = [i + 1 for i, ln in enumerate(text.splitlines()) if call_rx.search(ln)]
             sdk_hits[key].append((entry.path, lines[:20]))
             sdk_models[key].update(file_models)
             out.sdks.add(label)
             if len(sdk_snippets[key]) < 6 and lines:
                 sdk_snippets[key].append(_snippet(entry.path, text, lines[0]))
+
+        tree = ai_python.parse(text) if entry.suffix == ".py" else None
+        if tree is not None:
+            py = ai_python.analyze(tree, text, entry.path, want_prompts=entry.path not in claimed)
+            out.drafts.extend(py.prompts + py.agents)
+            mcp_servers.extend(py.servers)
+            mcp_tools += [(entry.path, t, d) for t, d in py.tools]
+            if not py.servers and _handwritten_mcp(text):
+                server = _mcp_server(entry, text, detector="mcp-server-jsonrpc")
+                server.confidence = "medium"
+                mcp_servers.append(server)
+                mcp_tools += [(entry.path, t, d) for t, d in _JSON_TOOL.findall(text)]
+            continue
+        if entry.suffix == ".ipynb":
+            continue  # notebooks: SDK usage and models only
+        code = strip_comments(text, entry.suffix)
         if entry.path not in claimed:
-            out.drafts.extend(_inline_prompts(entry, text))
-        out.drafts.extend(_code_agents(entry, text))
-        if _MCP_SERVER_IMPORT.search(text):
-            tools = _mcp_tools(entry, text)
-            mcp_tools += [(entry.path, t, d) for t, d in tools]
-            if _MCP_SERVER_CTOR.search(text):
-                mcp_servers.append(_mcp_server(entry, text))
-        elif _HANDWRITTEN_MCP.search(text) and "tools/call" in text:
+            out.drafts.extend(_inline_prompts(entry, code))
+        out.drafts.extend(_code_agents(entry, code))
+        if _MCP_SERVER_IMPORT.search(code):
+            mcp_tools += [(entry.path, t, d) for t, d in _mcp_tools(entry, code)]
+            if _MCP_SERVER_CTOR.search(code):
+                mcp_servers.append(_mcp_server(entry, code))
+        elif _handwritten_mcp(code):
             # MCP spoken directly over JSON-RPC (no SDK): common in quick internal servers
-            server = _mcp_server(entry, text, detector="mcp-server-jsonrpc")
+            server = _mcp_server(entry, code, detector="mcp-server-jsonrpc")
             server.confidence = "medium"
             mcp_servers.append(server)
-            mcp_tools += [(entry.path, t, d) for t, d in _JSON_TOOL.findall(text)]
+            mcp_tools += [(entry.path, t, d) for t, d in _JSON_TOOL.findall(code)]
 
     for key, hits in sdk_hits.items():
         label = SDKS[key][0]
@@ -375,6 +406,63 @@ def scan_code(files: RepoFiles, claimed: set[str]) -> CodeFindings:
     return out
 
 
+def strip_comments(text: str, suffix: str) -> str:
+    """Blank out // and /* */ comments (keeping newlines so line numbers stay right),
+    respecting string, template and Go raw-string literals."""
+    if suffix not in {
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".mts",
+        ".go",
+        ".java",
+        ".kt",
+        ".cs",
+        ".rs",
+        ".php",
+    }:
+        return text
+    out: list[str] = []
+    i, n = 0, len(text)
+    quote: str | None = None
+    while i < n:
+        c = text[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and not (quote == "`" and suffix == ".go"):  # Go raw strings: no escapes
+                if i + 1 < n:
+                    out.append(text[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            elif c == "\n" and quote in "'\"":
+                quote = None  # unterminated single-line string: recover
+            i += 1
+            continue
+        if c in "'\"`":
+            quote = c
+            out.append(c)
+            i += 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j == -1 else j
+            out.append(" " * (j - i))
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            out.append(re.sub(r"[^\n]", " ", text[i:j]))
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def _models(text: str) -> set[str]:
     found = set()
     for m in MODEL_RX.finditer(text):
@@ -388,8 +476,10 @@ def _is_test_fixture(path: str) -> bool:
     """Tests and fixtures often embed fake SDK calls, servers and prompts: not assets."""
     return bool(
         re.search(
-            r"(^|/)(tests?|__tests__|spec|fixtures?|__snapshots__|testdata|mocks?)/|"
-            r"(^|/)test_[^/]+\.py$|_test\.(py|go)$|\.(test|spec)\.[cm]?[jt]sx?$",
+            r"(^|/)(tests?|__tests__|spec|fixtures?|__snapshots__|testdata|mocks?|e2e|"
+            r"integration[-_]tests?|test[-_]utils?|testing)/|"
+            r"(^|/)test_[^/]+\.py$|_test\.(py|go)$|\.(test|spec|eval)\.[cm]?[jt]sx?$|"
+            r"(^|/)conftest\.py$",
             path,
             re.I,
         )
@@ -409,6 +499,7 @@ def _line_of(text: str, pos: int) -> int:
 
 def _inline_prompts(entry: FileEntry, text: str) -> list[AssetDraft]:
     drafts: list[AssetDraft] = []
+    used: dict[str, int] = {}
     seen: set[int] = set()
     patterns = (
         (_PY_ASSIGN, _PY_KWARG)
@@ -429,11 +520,15 @@ def _inline_prompts(entry: FileEntry, text: str) -> list[AssetDraft]:
             seen.add(m.start())
             line = _line_of(text, m.start())
             variables = sorted(set(re.findall(r"\{(\w+)\}|\$\{(\w+)\}|\{\{\s*(\w+)\s*\}\}", body)))
+            label = f"{PurePosixPath(entry.path).name}:{name}"
+            used[label] = used.get(label, 0) + 1
+            if used[label] > 1:
+                label += f" #{used[label]}"
             drafts.append(
                 AssetDraft(
                     kind="prompt",
                     ecosystem="inline",
-                    name=f"{PurePosixPath(entry.path).name}:{name}",
+                    name=label,
                     path=entry.path,
                     line=line,
                     detector="inline-prompt",
@@ -492,7 +587,7 @@ def _code_agents(entry: FileEntry, text: str) -> list[AssetDraft]:
         text,
     ):
         return drafts
-    for m in _AGENT_CTORS.finditer(text):
+    for m in list(_AGENT_CTORS.finditer(text))[:_MAX_CALLS]:
         args = _balanced(text, m.end())
         ctor = m.group("ctor")
         name = _kw(args, "name", "role") or (
@@ -589,28 +684,65 @@ def _agent_eco(text: str, ctor: str) -> str:
     return "generic"
 
 
+_TS_TOOL_CALL = re.compile(r"\.(?:tool|registerTool|addTool)\(")
+_GO_NEWTOOL = re.compile(r"\bNewTool\(")
+_GO_TOOL_STRUCT = re.compile(r"&?mcp\.Tool\{")
+_STR = r"(?:\"((?:[^\"\\]|\\.)*)\"|'((?:[^'\\]|\\.)*)'|`([^`]*)`)"
+_FIRST_STR = re.compile(r"\s*" + _STR)
+_MAX_CALLS = 500
+
+
+def _str_at(text: str) -> str | None:
+    m = _FIRST_STR.match(text)
+    return next((g for g in m.groups() if g is not None), None) if m else None
+
+
 def _mcp_tools(entry: FileEntry, text: str) -> list[tuple[str, str | None]]:
+    """Tools registered in JS/TS or Go source (Python is handled by ``ai_python``)."""
     tools: list[tuple[str, str | None]] = []
-    if entry.suffix == ".py":
-        for m in _PY_TOOL.finditer(text):
-            explicit = re.search(r"name\s*=\s*['\"]([^'\"]+)", m.group("args") or "")
-            desc = re.search(r"description\s*=\s*['\"]([^'\"]+)", m.group("args") or "")
-            doc = (m.group("doc") or "").strip().split("\n\n")[0].strip()
-            tools.append(
-                (
-                    explicit.group(1) if explicit else m.group("fn"),
-                    (desc.group(1) if desc else doc)[:300] or None,
-                )
-            )
-    elif entry.suffix == ".go":
-        tools += [(n, d or None) for n, d in _GO_TOOL.findall(text)]
-    else:
-        tools += [(n, d or None) for n, d in _TS_TOOL.findall(text)]
+    if entry.suffix == ".go":
+        for m in list(_GO_NEWTOOL.finditer(text))[:_MAX_CALLS]:
+            args = _balanced(text, m.end(), 4000)
+            name = _str_at(args)
+            desc = re.search(r"WithDescription\(\s*" + _STR, args)
+            if name:
+                tools.append((name, _group(desc)))
+        for m in list(_GO_TOOL_STRUCT.finditer(text))[:_MAX_CALLS]:
+            body = _balanced(text, m.end(), 4000)
+            name_m = re.search(r"\bName:\s*" + _STR, body)
+            desc = re.search(r"\bDescription:\s*" + _STR, body)
+            if name_m and _group(name_m):
+                tools.append((_group(name_m) or "", _group(desc)))
+        return tools
+    for m in list(_TS_TOOL_CALL.finditer(text))[:_MAX_CALLS]:
+        args = _balanced(text, m.end(), 6000)
+        first = _FIRST_STR.match(args)
+        tool_name = _group(first)
+        rest = args[first.end() :] if first else args
+        if tool_name is None:  # addTool({ name: "x", description: "..." })
+            tool_name = _group(re.search(r"\bname\s*:\s*" + _STR, args))
+        if not tool_name or not re.fullmatch(r"[\w.\-/]{1,100}", tool_name):
+            continue
+        after = rest.lstrip()
+        text_desc = _group(_FIRST_STR.match(after[1:])) if after.startswith(",") else None
+        if text_desc is None:
+            text_desc = _group(re.search(r"\bdescription\s*:\s*" + _STR, rest))
+        tools.append((tool_name, text_desc[:300] if text_desc else None))
     return tools
+
+
+def _group(m: re.Match[str] | None) -> str | None:
+    if not m:
+        return None
+    return next((g for g in m.groups() if g is not None), None)
 
 
 def _mcp_server(entry: FileEntry, text: str, detector: str = "mcp-server-code") -> AssetDraft:
     name = next((m.group(1) for rx in _MCP_SERVER_NAME if (m := rx.search(text))), None)
+    ctor = re.search(r"new\s+(?:Mcp)?Server\(\s*\{", text)
+    if not name and ctor:
+        inner = re.search(r"\bname\s*:\s*['\"`]([^'\"`]+)['\"`]", _balanced(text, ctor.end()))
+        name = inner.group(1) if inner else None
     lang = entry.suffix.lstrip(".")
     resources = len(_PY_RESOURCE.findall(text)) + len(
         re.findall(r"\.(?:resource|registerResource|prompt|registerPrompt)\(", text)
@@ -618,7 +750,7 @@ def _mcp_server(entry: FileEntry, text: str, detector: str = "mcp-server-code") 
     return AssetDraft(
         kind="mcp-server",
         ecosystem="mcp",
-        name=name or PurePosixPath(entry.path).parent.name or entry.path,
+        name=name or ai_python._fallback_name(entry.path),
         path=entry.path,
         detector=detector,
         text=text,

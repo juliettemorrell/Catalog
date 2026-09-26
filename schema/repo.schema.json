@@ -250,7 +250,8 @@
             "dev",
             "optional",
             "peer",
-            "build"
+            "build",
+            "transitive"
           ],
           "title": "Scope",
           "type": "string"
@@ -1010,6 +1011,18 @@
     "scanner_version": {
       "title": "Scanner Version",
       "type": "string"
+    },
+    "scan_fingerprint": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Scan Fingerprint"
     },
     "scan_errors": {
       "items": {

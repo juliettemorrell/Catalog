@@ -201,7 +201,9 @@ def test_ai_asset_library(scanned: ScanResult) -> None:
     assert agent.tools == ["Read", "Grep", "Glob"] and agent.models == ["sonnet"]
 
     cmd = _by(assets, "command")
-    assert "/git:fix-issue" in cmd and cmd["/git:fix-issue"].arguments[0] == "[issue-number]"
+    # Claude Code invokes .claude/commands/git/fix-issue.md as /fix-issue; git is a label
+    assert cmd["/fix-issue"].arguments[0] == "[issue-number]"
+    assert "namespace:git" in cmd["/fix-issue"].tags
     assert _by(assets, "command")["/explain"].ecosystem == "copilot"
 
     instructions = {a.path: a for a in assets if a.kind == "instructions"}
@@ -278,7 +280,7 @@ def test_outputs_and_queries(scanned: ScanResult, tmp_path: Path) -> None:
     assert any(r["matched"] == "Stripe" for r in repos_using(con, "stripe"))
 
     entities = exports.backstage_entities([scanned.repo])
-    assert entities[0]["spec"]["owner"] == "acme/billing-team"  # type: ignore[index]
+    assert entities[0]["spec"]["owner"] == "group:default/billing-team"  # type: ignore[index]
     bom = exports.aibom([scanned.repo], scanned.assets, "test")
     types = {c["type"] for c in bom["components"]}  # type: ignore[attr-defined]
     assert {"machine-learning-model", "library", "application", "data"} <= types

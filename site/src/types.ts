@@ -1,7 +1,7 @@
 // Mirrors the Python models (see ../schema/*.schema.json). Only fields the UI reads.
 
 export interface LanguageStat { name: string; files: number; lines: number; percent: number }
-export interface Dependency { name: string; version: string | null; ecosystem: string; scope: string; manifest: string }
+export interface Dependency { name: string; version: string | null; ecosystem: string; scope: "runtime" | "dev" | "build" | "peer" | "optional" | "transitive"; manifest: string }
 export interface Pkg { name: string; path: string; ecosystem: string; version: string | null; description: string | null }
 export interface PracticeCheck { id: string; category: string; label: string; passed: boolean; weight: number; evidence: string | null }
 
@@ -29,7 +29,7 @@ export interface Repo {
   practices: { score: number; grade: "A" | "B" | "C" | "D" | "F"; checks: PracticeCheck[] };
   ownership: { codeowners: string[]; top_contributors: { name: string; commits: number }[]; contributor_count: number; commit_count: number; first_commit: string | null; last_commit: string | null };
   ai: { has_ai: boolean; asset_count: number; asset_kinds: Record<string, number>; ecosystems: string[]; sdks: string[]; models: string[]; mcp_servers_provided: string[]; mcp_servers_consumed: string[] };
-  scanned_at: string; scan_errors: string[];
+  scanned_at: string; scan_errors: string[]; scan_fingerprint?: string | null;
 }
 
 export interface Asset {

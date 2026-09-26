@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from ..models import AIAsset, AssetFile
+from ..textutil import load_yaml, redact_secrets, sanitize_config
 
 MAX_CONTENT = 100_000
 
@@ -24,40 +25,58 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
         return {}, text
     raw, body = m.group(1), text[m.end() :]
     try:
-        data = yaml.safe_load(raw)
+        data = load_yaml(raw)
         if isinstance(data, dict):
             return _jsonable(data), body
-    except yaml.YAMLError:
+    except (yaml.YAMLError, RecursionError, ValueError):
         pass
-    data = {}
+    fallback: dict[str, Any] = {}
     for line in raw.splitlines():
         key, sep, val = line.partition(":")
         if sep and key.strip() and not key.startswith((" ", "\t", "-")):
-            data[key.strip()] = val.strip().strip("'\"")
-    return data, body
+            v = val.strip().strip("'\"")
+            fallback[key.strip()] = {"true": True, "false": False}.get(v.lower(), v)
+    return fallback, body
 
 
-def _jsonable(v: Any) -> Any:
+def _jsonable(v: Any, depth: int = 0) -> Any:
+    if depth > 30:
+        return "…"
     if isinstance(v, dict):
-        return {str(k): _jsonable(x) for k, x in v.items()}
+        return {str(k): _jsonable(x, depth + 1) for k, x in list(v.items())[:500]}
     if isinstance(v, list | tuple):
-        return [_jsonable(x) for x in v]
+        return [_jsonable(x, depth + 1) for x in v[:500]]
     if isinstance(v, str | int | float | bool) or v is None:
         return v
     return str(v)
 
 
 def as_list(value: Any) -> list[str]:
-    """Normalise tool/glob lists given as YAML lists, comma strings or space strings."""
+    """Normalise tool/glob lists given as YAML lists, comma strings or space strings.
+    Parenthesised groups stay together: ``Bash(git add:*) Read`` -> 2 items."""
     if value is None or value == "":
         return []
     if isinstance(value, list):
-        return [str(v).strip() for v in value if str(v).strip()]
+        return [str(v).strip() for v in value[:200] if str(v).strip()]
     if isinstance(value, dict):
-        return [str(k) for k in value]
-    s = str(value)
-    parts = re.split(r",\s*|\s+(?![^()]*\))", s) if "," in s or " " in s else [s]
-    return [p.strip() for p in parts if p.strip()]
+        return [str(k) for k in list(value)[:200]]
+    s = str(value)[:20_000]
+    sep_comma = "," in s
+    items: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if depth == 0 and (ch == "," or (not sep_comma and ch.isspace())):
+            items.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    items.append("".join(buf))
+    return [i.strip() for i in items if i.strip()][:200]
 
 
 def headings(body: str, limit: int = 25) -> list[str]:
@@ -68,11 +87,17 @@ def headings(body: str, limit: int = 25) -> list[str]:
 def excerpt(body: str, limit: int = 280) -> str | None:
     text = re.sub(r"```.*?```", " ", body, flags=re.S)
     text = re.sub(r"^#+\s.*$", " ", text, flags=re.M)
-    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"<[^<>\n]{1,200}>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return None
     return text if len(text) <= limit else text[: limit - 1].rsplit(" ", 1)[0] + "…"
+
+
+EXAMPLE_PATH = re.compile(
+    r"(^|/)(examples?|samples?|demos?|templates?|cookbooks?|tutorials?|starters?|snippets|docs_src)/",
+    re.I,
+)
 
 
 def asset_id(repo: str, path: str, kind: str, name: str) -> str:
@@ -119,8 +144,10 @@ class AssetDraft:
     line: int | None = None
 
     def build(self, ctx: RepoContext) -> AIAsset:
-        text = self.text or ""
-        body = self.body if self.body is not None else text
+        text = redact_secrets(self.text or "")
+        body = redact_secrets(self.body) if self.body is not None else text
+        if EXAMPLE_PATH.search(self.path) and "example" not in self.tags:
+            self.tags.append("example")
         truncated = len(text) > MAX_CONTENT
         content = text[:MAX_CONTENT] if text else None
         words = len(re.findall(r"\S+", body))
@@ -130,14 +157,14 @@ class AssetDraft:
             ecosystem=self.ecosystem,
             name=self.name,
             title=self.title,
-            description=(self.description or "").strip() or None,
+            description=redact_secrets(self.description or "").strip() or None,
             repo=ctx.repo,
             path=self.path,
             url=ctx.url(self.path, self.line),
             scope=self.scope,  # type: ignore[arg-type]
             confidence=self.confidence,  # type: ignore[arg-type]
             detector=self.detector,
-            frontmatter=self.frontmatter,
+            frontmatter=sanitize_config(self.frontmatter),
             tools=_uniq(self.tools),
             models=_uniq(self.models),
             providers=_uniq(self.providers),

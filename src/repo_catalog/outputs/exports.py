@@ -35,18 +35,41 @@ _BACKSTAGE_LIFECYCLE = {
 
 
 def _bs_name(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-._")[:63] or "unnamed"
+    """Backstage name: ``^([A-Za-z0-9][-_.]?)*[A-Za-z0-9]$``, max 63 chars."""
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", s)
+    name = re.sub(r"[-_.]{2,}", "-", name)  # separators may not repeat
+    name = name[:63].strip("-_.")
+    return name or "unnamed"
 
 
 def _bs_tag(s: str) -> str:
-    return re.sub(r"[^a-z0-9+#-]+", "-", s.lower()).strip("-")[:63]
+    """Backstage tag: ``^[a-z0-9:+#]+(-[a-z0-9:+#]+)*$``, max 63 chars."""
+    tag = re.sub(r"[^a-z0-9:+#]+", "-", s.lower())
+    return re.sub(r"-{2,}", "-", tag)[:63].strip("-")
+
+
+def _bs_owner(raw: str) -> str:
+    """CODEOWNERS / declared owner -> Backstage entity ref."""
+    raw = raw.strip()
+    if ":" in raw and "/" in raw.split(":", 1)[1]:
+        return raw  # already a full ref like group:default/payments
+    if raw.startswith("@") and "/" in raw:
+        return f"group:default/{_bs_name(raw.split('/', 1)[1])}"
+    if raw.startswith("@"):
+        return f"user:default/{_bs_name(raw[1:])}"
+    if "@" in raw:  # e-mail address
+        return f"user:default/{_bs_name(raw.split('@', 1)[0])}"
+    return _bs_name(raw)
 
 
 def backstage_entities(repos: list[Repo]) -> list[dict[str, object]]:
     """One Component per repo. Values a team declared themselves always win."""
     out = []
-    for r in repos:
+    base_names = [_bs_name(r.declared.name or r.name) for r in repos]
+    clashes = {n for n in base_names if base_names.count(n) > 1}
+    for r, base in zip(repos, base_names, strict=True):
         d = r.declared
+        name = _bs_name(f"{r.owner}-{base}") if base in clashes else base
         branch = r.default_branch or "main"
         tags = sorted(
             {
@@ -63,7 +86,7 @@ def backstage_entities(repos: list[Repo]) -> list[dict[str, object]]:
             "apiVersion": "backstage.io/v1alpha1",
             "kind": "Component",
             "metadata": {
-                "name": _bs_name(d.name or r.name),
+                "name": name,
                 "title": r.summary.readme_title or r.name,
                 "description": r.summary.purpose or r.summary.one_liner or "",
                 "tags": tags,
@@ -80,8 +103,9 @@ def backstage_entities(repos: list[Repo]) -> list[dict[str, object]]:
             "spec": {
                 "type": d.type or _BACKSTAGE_TYPE.get(r.structure.repo_type, "other"),
                 "lifecycle": d.lifecycle or _BACKSTAGE_LIFECYCLE[r.lifecycle],
-                "owner": d.owner
-                or (r.ownership.codeowners[0].lstrip("@") if r.ownership.codeowners else "unknown"),
+                "owner": _bs_owner(
+                    d.owner or (r.ownership.codeowners[0] if r.ownership.codeowners else "unknown")
+                ),
                 **({"system": d.system} if d.system else {}),
                 **({"providesApis": d.provides_apis} if d.provides_apis else {}),
                 **({"consumesApis": d.consumes_apis} if d.consumes_apis else {}),

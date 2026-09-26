@@ -7,10 +7,11 @@ from a single paginated REST call. Everything else is read from a local clone.
 
 from __future__ import annotations
 
+import email.utils
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -71,7 +72,26 @@ class RepoRef:
 
 
 class GitHubError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Retry-After is either delta-seconds or an HTTP date."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return float(min(max((when - datetime.now(UTC)).total_seconds(), 1), 3600))
 
 
 class GitHubClient:
@@ -113,27 +133,36 @@ class GitHubClient:
 
     def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         for attempt in range(self._max_retries + 1):
-            resp = self._http.request(method, url, **kwargs)
-            wait = self._retry_delay(resp, attempt)
-            if wait is None:
+            try:
+                resp = self._http.request(method, url, **kwargs)
+            except httpx.TransportError as exc:  # timeouts, resets, DNS hiccups
+                if attempt >= self._max_retries:
+                    raise GitHubError(f"network error calling GitHub: {exc}") from None
+                wait = float(2**attempt)
+                log.warning("GitHub %s %s failed (%s), retrying in %.0fs", method, url, exc, wait)
+                time.sleep(wait)
+                continue
+            delay = self._retry_delay(resp, attempt)
+            if delay is None:
                 return resp
             log.warning(
-                "GitHub %s %s -> %s, retrying in %.0fs", method, url, resp.status_code, wait
+                "GitHub %s %s -> %s, retrying in %.0fs", method, url, resp.status_code, delay
             )
-            time.sleep(wait)
-        return resp
+            time.sleep(delay)
+        raise AssertionError("unreachable")
 
     def _retry_delay(self, resp: httpx.Response, attempt: int) -> float | None:
         if attempt >= self._max_retries:
             return None
         if resp.status_code in (403, 429):
-            if "retry-after" in resp.headers:
-                return float(resp.headers["retry-after"])
+            retry_after = _parse_retry_after(resp.headers.get("retry-after"))
+            if retry_after is not None:
+                return retry_after
             if resp.headers.get("x-ratelimit-remaining") == "0":
-                reset = int(resp.headers.get("x-ratelimit-reset", "0"))
+                reset = int(resp.headers.get("x-ratelimit-reset", "0") or 0)
                 return float(min(max(reset - time.time(), 1), 3600))
-            if "secondary rate limit" in resp.text.lower():
-                return 60.0 * (attempt + 1)
+            if resp.status_code == 429 or "rate limit" in resp.text.lower():
+                return 60.0 * (attempt + 1)  # GitHub: wait at least a minute
             return None
         if resp.status_code in (500, 502, 503, 504):
             return float(2**attempt)
@@ -142,7 +171,9 @@ class GitHubClient:
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         resp = self._request("POST", "/graphql", json={"query": query, "variables": variables})
         if resp.status_code != 200:
-            raise GitHubError(f"GraphQL HTTP {resp.status_code}: {resp.text[:300]}")
+            raise GitHubError(
+                f"GraphQL HTTP {resp.status_code}: {resp.text[:300]}", status=resp.status_code
+            )
         body = resp.json()
         if body.get("errors") and not body.get("data"):
             raise GitHubError(f"GraphQL errors: {body['errors']}")
@@ -159,7 +190,10 @@ class GitHubClient:
             # the `next` link already carries its query string; passing params would drop it
             resp = self._request("GET", next_url, params=query)
             if resp.status_code != 200:
-                raise GitHubError(f"GET {next_url} -> {resp.status_code}: {resp.text[:300]}")
+                raise GitHubError(
+                    f"GET {next_url} -> {resp.status_code}: {resp.text[:300]}",
+                    status=resp.status_code,
+                )
             items.extend(resp.json())
             next_url = resp.links.get("next", {}).get("url")
             query = None
@@ -174,10 +208,13 @@ class GitHubClient:
             try:
                 return fn(*args)
             except GitHubError as exc:
-                if "GraphQL HTTP" not in str(exc):
-                    raise
-                log.info("GraphQL unavailable (%s); falling back to REST", str(exc)[:120])
-                self._graphql_ok = False
+                if exc.status is None:
+                    raise  # GraphQL answered with errors: a real problem, not an outage
+                if exc.status in (401, 403, 404, 410, 501):
+                    log.info("GraphQL unavailable (%s); using REST", str(exc)[:120])
+                    self._graphql_ok = False  # blocked/disabled: stop trying for this run
+                else:
+                    log.warning("GraphQL failed (%s); using REST for this call", str(exc)[:120])
         return None
 
     def list_owner_repos(self, login: str) -> list[RepoRef]:
@@ -192,7 +229,9 @@ class GitHubClient:
     def _list_owner_rest(self, login: str) -> list[RepoRef]:
         try:
             rows = self.paginate(f"/orgs/{login}/repos", {"type": "all"})
-        except GitHubError:
+        except GitHubError as exc:
+            if exc.status != 404:  # e.g. 403 SAML enforcement: report it, don't mask it
+                raise
             rows = self.paginate(f"/users/{login}/repos", {"type": "owner"})
         return [
             self._ref_from_rest(r) for r in rows if r["owner"]["login"].lower() == login.lower()

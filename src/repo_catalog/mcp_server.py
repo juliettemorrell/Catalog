@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from . import query
+from . import __version__, query
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
@@ -28,15 +29,20 @@ ai_assets, asset_tools, asset_models, asset_tags; views: tech_usage, dependency_
 
 
 def build_server(db_path: Path) -> MCPServer:
-    if not db_path.exists():
-        raise FileNotFoundError(f"{db_path} not found; run `repo-catalog scan` first.")
+    """The server starts even before a catalog exists (so MCP clients connect cleanly);
+    tools then explain how to create it instead of failing opaquely."""
 
     def con() -> sqlite3.Connection:
+        if not db_path.exists():
+            raise ToolError(
+                f"No catalog at {db_path}. Run `repo-catalog scan --org <org>` (or "
+                "`--local <folder>`) to create it, then retry."
+            )
         c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
         c.row_factory = sqlite3.Row
         return c
 
-    server = MCPServer("repo-catalog", instructions=INSTRUCTIONS)
+    server = MCPServer("repo-catalog", instructions=INSTRUCTIONS, version=__version__)
 
     @server.tool(annotations=READ_ONLY)
     def search_repos(
@@ -116,7 +122,10 @@ def build_server(db_path: Path) -> MCPServer:
     def sql(statement: str, limit: int = 200) -> list[dict[str, Any]]:
         """Run one read-only SELECT against the catalog database (see server instructions
         for tables). Full records are in the `json` columns."""
-        return query.read_only_sql(con(), statement, limit=min(limit, 1000))
+        try:
+            return query.read_only_sql(con(), statement, limit=max(1, min(limit, 1000)))
+        except (ValueError, sqlite3.Error) as exc:
+            raise ToolError(f"SQL error: {exc}") from None
 
     return server
 

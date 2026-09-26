@@ -48,13 +48,17 @@ def write_repo(out_dir: Path, repo: Repo, assets: list[AIAsset]) -> None:
     (folder / f"{_slug(repo.id)}.json").write_text(json.dumps(payload, indent=1) + "\n")
 
 
-def prune(out_dir: Path, keep: set[str]) -> list[str]:
-    """Remove per-repo files for repos that no longer exist or were filtered out."""
-    removed = []
+def prune(out_dir: Path, keep: set[str], owners: set[str]) -> list[str]:
+    """Remove records of repos under ``owners`` that were not seen in this run (deleted,
+    renamed or filtered out). Records of other owners and of local scans are left alone."""
+    removed: list[str] = []
     folder = out_dir / REPOS_DIR
+    if not owners or not folder.is_dir():
+        return removed
     wanted = {_slug(k) for k in keep}
-    for path in folder.glob("*.json") if folder.is_dir() else []:
-        if path.stem not in wanted:
+    for path in folder.glob("*.json"):
+        owner = path.stem.split("__", 1)[0].lower()
+        if owner in owners and path.stem not in wanted:
             path.unlink()
             removed.append(path.stem)
     return removed

@@ -26,7 +26,7 @@ from .models import AIAsset, AIUsageSummary, Contributor, Ownership, Repo
 
 log = logging.getLogger(__name__)
 
-MAX_PROVENANCE_LOOKUPS = 300
+MAX_PROVENANCE_LOOKUPS = 2000
 
 
 @dataclass
@@ -38,6 +38,10 @@ class ScanOptions:
     max_files: int = 100_000
     force: bool = False
     provenance: bool = True
+
+    def fingerprint(self) -> str:
+        """Options that change the output; a stored record is reused only if they match."""
+        return f"{__version__}|shallow={self.shallow}|prov={self.provenance}|max={self.max_files}"
 
 
 @dataclass
@@ -63,7 +67,7 @@ def scan_all(
         prev = previous.get(ref.full_name)
         if prev and not ref.head_sha:
             ref.head_sha = git.remote_head(ref.clone_url, opts.token, ref.default_branch)
-        if prev and not opts.force and _unchanged(ref, prev[0]):
+        if prev and not opts.force and _unchanged(ref, prev[0], opts):
             log.info("unchanged, reusing: %s", ref.full_name)
             return ScanResult(repo=_refresh_meta(prev[0], ref), assets=prev[1], reused=True)
         checkout = opts.workdir / ref.owner / ref.name
@@ -92,9 +96,13 @@ def scan_all(
     return report
 
 
-def _unchanged(ref: RepoRef, prev: Repo) -> bool:
+def _unchanged(ref: RepoRef, prev: Repo, opts: ScanOptions) -> bool:
     return (
-        bool(ref.head_sha) and ref.head_sha == prev.head_sha and prev.scanner_version == __version__
+        bool(ref.head_sha)
+        and ref.head_sha == prev.head_sha
+        and prev.scan_fingerprint == opts.fingerprint()
+        # declared metadata from org custom properties is part of the record
+        and ref.custom_properties == prev.declared.custom_properties
     )
 
 
@@ -116,7 +124,11 @@ def _refresh_meta(repo: Repo, ref: RepoRef) -> Repo:
         )
         if k in m
     }
-    return repo.model_copy(update=update)
+    repo = repo.model_copy(update=update)
+    repo.lifecycle = _lifecycle(
+        repo.archived, repo.ownership.last_commit or repo.pushed_at, repo.declared.lifecycle
+    )
+    return repo
 
 
 def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanResult:
@@ -130,18 +142,20 @@ def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanRes
     stack_res = analyze_stack(files, manifests)
     stack, structure = stack_res.stack, stack_res.structure
     summary, readme = summarize_readme(files)
-    declared = parse_declared(files, ref.custom_properties)
+    declared = parse_declared(files, ref.custom_properties, errors)
 
     # ---- AI assets ----
     ctx = RepoContext(
         repo=ref.full_name, html_url=ref.html_url, ref=ref.head_sha or ref.default_branch or "HEAD"
     )
-    detector = FileDetector(files)
+    detector = FileDetector(files, repo_name=ref.name)
     drafts = detector.run()
+    errors += detector.errors[:50]
     code = scan_code(files, detector.claimed)
     assets = [d.build(ctx) for d in drafts + code.drafts]
     assets = _dedupe_assets(assets)
-    if opts.provenance and not opts.shallow:
+    full_history = not opts.shallow and not git.is_shallow(checkout)
+    if opts.provenance and full_history:
         _add_provenance(checkout, assets)
 
     for label in sorted(code.sdks):
@@ -164,7 +178,7 @@ def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanRes
         structure.repo_type = "mcp-server"
 
     # ---- ownership / history ----
-    history = git.repo_history(checkout) if not opts.shallow else None
+    history = git.repo_history(checkout) if full_history else None
     ownership = Ownership(codeowners=parse_codeowners(files))
     if history:
         ownership.commit_count = history.commit_count
@@ -191,6 +205,7 @@ def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanRes
         structure,
         manifests.lockfiles,
         stack_res.workflow_texts,
+        len([d for d in manifests.dependencies if d.scope != "build"]),
         description=meta.get("description"),
         topics=meta.get("topics") or [],
         has_descriptor=bool(declared.source_files),
@@ -231,6 +246,7 @@ def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanRes
         ownership=ownership,
         ai=ai_summary,
         scanned_at=datetime.now(UTC),
+        scan_fingerprint=opts.fingerprint(),
         scanner_version=__version__,
         scan_errors=errors,
     )
@@ -248,15 +264,10 @@ def _dedupe_assets(assets: list[AIAsset]) -> list[AIAsset]:
 
 
 def _add_provenance(checkout: Path, assets: list[AIAsset]) -> None:
-    cache: dict[str, git.FileHistory | None] = {}
+    paths = sorted({a.path for a in assets if a.kind != "sdk-usage"})[:MAX_PROVENANCE_LOOKUPS]
+    history = git.files_history(checkout, paths)
     for a in assets:
-        if a.kind == "sdk-usage":
-            continue
-        if a.path not in cache:
-            if len(cache) >= MAX_PROVENANCE_LOOKUPS:
-                break
-            cache[a.path] = git.file_history(checkout, a.path)
-        hist = cache[a.path]
+        hist = history.get(a.path)
         if hist:
             a.last_modified, a.last_author, a.commit_count = (
                 hist.last_modified,
@@ -314,14 +325,26 @@ _LICENSE_HINTS = (
 
 
 def _license_from_files(files: RepoFiles) -> str | None:
-    hit = files.first("LICENSE", "LICENSE.*", "LICENCE", "COPYING")
-    text = files.read(hit.path, 4000) if hit else None
-    if not text:
-        return None
-    for needle, spdx in _LICENSE_HINTS:
-        if needle.lower() in text.lower():
-            return spdx
-    return "Other"
+    hits = files.glob(
+        "LICENSE",
+        "LICENSE.*",
+        "LICENSE-*",
+        "LICENCE",
+        "LICENCE.*",
+        "COPYING",
+        "COPYING.*",
+        "UNLICENSE",
+    )
+    found: list[str] = []
+    for hit in hits[:4]:
+        text = (files.read(hit.path, 4000) or "").lower()
+        spdx = next((sp for needle, sp in _LICENSE_HINTS if needle.lower() in text), None)
+        spdx = spdx or ("Unlicense" if "unlicense" in hit.name.lower() else None)
+        if spdx and spdx not in found:
+            found.append(spdx)
+    if found:
+        return " OR ".join(sorted(found))  # e.g. Rust's dual MIT / Apache-2.0
+    return "Other" if hits else None
 
 
 def mark_duplicates(assets: list[AIAsset]) -> None:

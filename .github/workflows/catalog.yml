@@ -2,7 +2,7 @@
 #
 # Setup (see README "Running it on a schedule"):
 #   Auth, pick one:
-#     - GitHub App (recommended): vars.CATALOG_APP_ID + secrets.CATALOG_APP_PRIVATE_KEY,
+#     - GitHub App (recommended): vars.CATALOG_APP_CLIENT_ID + secrets.CATALOG_APP_PRIVATE_KEY,
 #       installed on the org with read-only Contents + Metadata (+ Custom properties).
 #     - Fine-grained PAT: secrets.CATALOG_TOKEN with read-only Contents + Metadata.
 #   vars.CATALOG_ORG            org (or user) to scan; defaults to this repo's owner
@@ -26,7 +26,7 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: read # checkout only; the org is read with the App token / PAT
 
 concurrency:
   group: catalog-scan
@@ -40,15 +40,22 @@ jobs:
       ORG: ${{ inputs.org || vars.CATALOG_ORG || github.repository_owner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: GitHub App token
         id: app-token
-        if: vars.CATALOG_APP_ID != ''
+        if: vars.CATALOG_APP_CLIENT_ID != ''
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.CATALOG_APP_ID }}
+          client-id: ${{ vars.CATALOG_APP_CLIENT_ID }}
           private-key: ${{ secrets.CATALOG_APP_PRIVATE_KEY }}
-          owner: ${{ env.ORG }}
+          # The scanner must read every repository in the org, so the token is org-wide,
+          # but it is limited to read-only permissions.
+          owner: ${{ env.ORG }} # zizmor: ignore[github-app]
+          permission-contents: read
+          permission-metadata: read
+          permission-organization-custom-properties: read
 
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
@@ -68,9 +75,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.CATALOG_TOKEN || github.token }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          LLM: ${{ vars.CATALOG_LLM == 'true' && secrets.ANTHROPIC_API_KEY != '' && '--llm' || '' }}
-          FORCE: ${{ inputs.force && '--force' || '' }}
-        run: uv run repo-catalog scan --org "$ORG" --out data --workers 6 $LLM $FORCE
+          LLM: ${{ vars.CATALOG_LLM == 'true' && secrets.ANTHROPIC_API_KEY != '' }}
+          FORCE: ${{ inputs.force == true }}
+        run: |
+          args=(--org "$ORG" --out data --workers 6)
+          if [ "$LLM" = "true" ]; then args+=(--llm); fi
+          if [ "$FORCE" = "true" ]; then args+=(--force); fi
+          uv run repo-catalog scan "${args[@]}"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

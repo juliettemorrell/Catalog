@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <title>Repo Catalog</title>
+    <script>
+      // apply the saved theme before first paint (no light flash for dark-mode users)
+      try { var t = localStorage.getItem("repo-catalog-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+    </script>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%232a78d6'/><path d='M9 10h14M9 16h14M9 22h9' stroke='white' stroke-width='3' stroke-linecap='round'/></svg>" />
   </head>
   <body>
@@ -19,10 +23,10 @@
         <a href="#/assets" data-tab="assets">AI Asset Library</a>
         <a href="#/insights" data-tab="insights">Insights</a>
       </nav>
-      <button class="icon-btn" id="theme" type="button" aria-label="Toggle color theme"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"/></svg></button>
+      <button class="icon-btn" id="theme" type="button" aria-label="Toggle color theme" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"/></svg></button>
     </header>
-    <main id="main"><p class="loading">Loading catalog…</p></main>
-    <aside id="drawer" class="drawer" aria-hidden="true" tabindex="-1"></aside>
+    <main id="main" tabindex="-1"><p class="loading">Loading catalog…</p></main>
+    <div id="drawer" class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" tabindex="-1" inert></div>
     <div id="scrim" class="scrim" hidden></div>
     <script type="module" src="/src/main.ts"></script>
   </body>

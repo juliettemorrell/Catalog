@@ -120,9 +120,11 @@ FILENAMES: dict[str, tuple[str, bool]] = {
 }
 
 _GENERATED = re.compile(
-    r"(\.min\.(js|css)$|\.bundle\.js$|\.map$|(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|"
-    r"poetry\.lock|uv\.lock|Cargo\.lock|go\.sum|composer\.lock|Gemfile\.lock|Pipfile\.lock)$|"
-    r"_pb2\.py$|\.pb\.go$|\.generated\.)",
+    r"(\.min\.(js|css)$|\.bundle\.js$|\.map$|(^|/)(package-lock\.json|yarn\.lock|"
+    r"pnpm-lock\.yaml|poetry\.lock|uv\.lock|Cargo\.lock|go\.sum|composer\.lock|Gemfile\.lock|"
+    r"Pipfile\.lock|bun\.lock)$|_pb2(_grpc)?\.pyi?$|\.pb(\.gw)?\.go$|_grpc\.pb\.go$|"
+    r"\.generated\.|\.g\.dart$|\.freezed\.dart$|\.gr\.dart$|(^|/)zz_generated[^/]*\.go$|"
+    r"(^|/)mock_[^/]*\.go$|_mock\.go$|\.designer\.cs$|(^|/)generated/)",
     re.IGNORECASE,
 )
 
@@ -158,6 +160,14 @@ def analyze_languages(files: RepoFiles) -> tuple[list[LanguageStat], str | None,
         total += lines
         if lang[1]:
             programming.add(lang[0])
+    # .h is shared by C, C++ and Objective-C: attribute headers to the sibling language
+    if "C" in counts and ("C++" in counts or "Objective-C" in counts):
+        c_sources = sum(1 for e in files.files if e.suffix == ".c")
+        if not c_sources:
+            target = "C++" if "C++" in counts else "Objective-C"
+            f, ln = counts.pop("C")
+            counts[target][0] += f
+            counts[target][1] += ln
     stats = [
         LanguageStat(
             name=name, files=f, lines=ln, percent=round(100 * ln / total, 1) if total else 0.0

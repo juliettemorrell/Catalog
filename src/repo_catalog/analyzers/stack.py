@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from ..fs import RepoFiles
 from ..models import Package, Stack, Structure
 from .languages import analyze_languages
-from .manifests import ManifestResult
+from .manifests import NON_PRODUCT_DIR, ManifestResult
 from .rules import FILE_RULES, Rule, match_dependency
 
 _STACK_FIELDS = {
@@ -123,21 +123,23 @@ def analyze_stack(files: RepoFiles, manifests: ManifestResult) -> StackResult:
     col = _Collector()
 
     runtime_deps = [d for d in manifests.dependencies if d.scope in ("runtime", "peer", "optional")]
+    core: set[str] = set()  # labels backed by runtime deps or product files: drive repo_type
+    product_stack = {"frameworks", "databases", "messaging", "auth"}
     for dep in manifests.dependencies:
         for rule in match_dependency(dep.name):
-            # dev-only frameworks/databases are usually tooling, not the product stack
-            if dep.scope in ("dev", "build") and rule.category in {
-                "frameworks",
-                "databases",
-                "messaging",
-                "auth",
-            }:
+            # dev/build-only frameworks are tooling, and indirect deps are not the repo's choice
+            if dep.scope == "transitive" or (
+                dep.scope in ("dev", "build") and rule.category in product_stack
+            ):
                 continue
             col.add_rule(rule)
+            if dep.scope == "runtime":
+                core.add(rule.label)
 
     for rule, patterns in FILE_RULES:
-        if files.glob(*patterns):
+        if any(not NON_PRODUCT_DIR.search(f.path) for f in files.glob(*patterns)):
             col.add_rule(rule)
+            core.add(rule.label)
 
     pyproject = files.read("pyproject.toml") or ""
     for tool, (cat, label) in _PYPROJECT_TOOLS.items():
@@ -174,7 +176,7 @@ def analyze_stack(files: RepoFiles, manifests: ManifestResult) -> StackResult:
         package_managers=sorted(manifests.package_managers),
         **{f: col.values[f] for f in _STACK_FIELDS},
     )
-    structure = _structure(files, manifests, stack, total_lines)
+    structure = _structure(files, manifests, stack, total_lines, core)
     caps = col.capabilities
     if structure.api_specs and "api-spec" not in caps:
         caps.append("api-spec")
@@ -206,7 +208,9 @@ def _grep_any(files: RepoFiles, globs: tuple[str, ...], pattern: str) -> bool:
     return any(rx.search(text) for _, text in files.iter_text(candidates[:2000]))
 
 
-def _structure(files: RepoFiles, man: ManifestResult, stack: Stack, total_lines: int) -> Structure:
+def _structure(
+    files: RepoFiles, man: ManifestResult, stack: Stack, total_lines: int, core: set[str]
+) -> Structure:
     packages = _dedupe_packages(man.packages)
     is_monorepo = (
         man.workspaces
@@ -255,7 +259,7 @@ def _structure(files: RepoFiles, man: ManifestResult, stack: Stack, total_lines:
         file_count=len(files.files),
         total_lines=total_lines,
     )
-    structure.repo_type = classify_repo(stack, structure, man)
+    structure.repo_type = classify_repo(stack, structure, man, core)
     return structure
 
 
@@ -325,8 +329,11 @@ _DATA_APPS = {"Streamlit", "Gradio", "Dash", "Panel"}
 _CLI = {"Typer", "Click", "Cobra", "Clap"}
 
 
-def classify_repo(stack: Stack, structure: Structure, man: ManifestResult) -> str:
-    fw = set(stack.frameworks)
+def classify_repo(
+    stack: Stack, structure: Structure, man: ManifestResult, core: set[str] | None = None
+) -> str:
+    # only frameworks the repo itself runs on (not peer/optional/indirect deps) decide the type
+    fw = set(stack.frameworks) & core if core is not None else set(stack.frameworks)
     langs = {s.name: s.percent for s in stack.languages}
     code_pct = sum(
         p
@@ -360,6 +367,6 @@ def classify_repo(stack: Stack, structure: Structure, man: ManifestResult) -> st
         return "docs"
     if structure.packages:
         return "library"
-    if "Docker" in stack.infrastructure:
+    if "Docker" in (core if core is not None else set(stack.infrastructure)):
         return "service"
     return "scripts" if code_pct else "other"

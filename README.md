@@ -83,7 +83,12 @@ Field-by-field reference: [docs/catalog-data.md](docs/catalog-data.md). JSON Sch
 payments lang:python -type:library     fastapi missing:tests grade:D
 kind:skill eco:claude-code             kind:mcp-server tool:jira
 cap:pdf                                uses:anthropic ai:yes
+fw:fastapi data:postgresql minscore:70  kind:skill minq:60 dup:no
 ```
+
+Filters: `lang` (primary language), `anylang`, `fw`, `data`, `infra`, `tech` (any stack item, partial), `type`, `grade`, `cap`, `topic`, `owner`, `lifecycle`, `ai`, `uses`, `missing`, `has`, `is`, `minscore`; for assets `kind`, `eco`, `repo`, `tool`, `model`, `tag`, `conf`, `scope`, `dup`, `minq`. Prefix with `-` to exclude. Unknown keys are searched as text.
+
+```KEEP```
 
 **CLI**
 
@@ -97,7 +102,7 @@ repo-catalog sql "SELECT repo_id FROM practice_checks WHERE check_id='tests' AND
 **MCP server** for SDLC and coding agents. `.mcp.json` in this repo already registers it for Claude Code:
 
 ```json
-{ "mcpServers": { "repo-catalog": { "command": "uv", "args": ["run", "repo-catalog", "mcp", "--out", "data"] } } }
+{ "mcpServers": { "repo-catalog": { "command": "uv", "args": ["run", "--extra", "mcp", "repo-catalog", "mcp", "--out", "data"] } } }
 ```
 
 Tools: `search_repos`, `get_repo`, `search_ai_assets`, `get_ai_asset`, `repos_using`, `technology_usage`, `sql` (read-only). The skill in [`.claude/skills/repo-catalog`](.claude/skills/repo-catalog/SKILL.md) teaches an agent how to use them for prior-art searches.
@@ -106,7 +111,7 @@ Tools: `search_repos`, `get_repo`, `search_ai_assets`, `get_ai_asset`, `repos_us
 
 [`.github/workflows/catalog.yml`](.github/workflows/catalog.yml) scans nightly and on demand. It uploads the data and the built site as workflow artifacts, and can deploy to GitHub Pages.
 
-1. **Auth.** Create a GitHub App with read-only *Contents* and *Metadata* permissions, plus *Custom properties* read on the org, and install it on the org. Set `vars.CATALOG_APP_ID` and `secrets.CATALOG_APP_PRIVATE_KEY`. A fine-grained PAT in `secrets.CATALOG_TOKEN` also works. An App is preferred because its rate limits scale with the org and the token is short-lived.
+1. **Auth.** Create a GitHub App with read-only *Contents* and *Metadata* permissions, plus *Custom properties* read on the org, and install it on the org. Set `vars.CATALOG_APP_CLIENT_ID` (the App's Client ID) and `secrets.CATALOG_APP_PRIVATE_KEY`. A fine-grained PAT in `secrets.CATALOG_TOKEN` also works. An App is preferred because its rate limits scale with the org and the token is short-lived.
 2. Set `vars.CATALOG_ORG` if the org differs from this repo's owner.
 3. *Optional:* add `secrets.ANTHROPIC_API_KEY` and set `vars.CATALOG_LLM=true` to turn on summaries. Responses are cached, so only changed repos are re-summarized. The default model is `claude-opus-5`; override it with `--llm-model`.
 4. *Optional:* set `vars.CATALOG_PUBLISH_PAGES=true` to deploy the site.

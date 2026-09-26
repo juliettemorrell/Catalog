@@ -8,20 +8,25 @@ from typing import Literal
 
 from ..fs import RepoFiles
 from ..models import PracticeCheck, Practices, Stack, Structure
+from .docs import find_readme
 
 _TEST_PATH = re.compile(
-    r"(^|/)(tests?|__tests__|spec|specs|e2e|integration[-_]tests?)/|"
-    r"(_test\.(go|py)|\.test\.[jt]sx?|\.spec\.[jt]sx?|(^|/)test_[^/]+\.py|Tests?\.(cs|java|kt))$",
+    r"(^|/)(tests?|__tests__|spec|e2e|integration[-_]tests?|src/test)/[^/]+\.[a-z0-9]+$|"
+    r"(^|/)[^/]*\.(Unit|Integration|Functional)?Tests?/[^/]+\.(cs|fs|vb)$|"  # .NET test projects
+    r"(^|/)[^/]*Tests/[^/]+\.swift$|"  # Xcode/SwiftPM test targets
+    r"(_test\.(go|py|exs?)|\.(test|spec)\.[cm]?[jt]sx?|_spec\.rb|(^|/)test_[^/]+\.py|"
+    r"Tests?\.(cs|java|kt|swift|php))$",
     re.IGNORECASE,
 )
+_NOT_TEST = re.compile(r"\.(md|mdx|rst|txt|ya?ml|json|lock|svg|png|jpe?g)$", re.I)
 _TEST_CMD = re.compile(
     r"\b(pytest|tox|nox|jest|vitest|mocha|go test|cargo test|mvn\b.*\btest|gradle\w*\s+.*test|"
     r"npm (run )?test|pnpm (run )?test|yarn test|bun test|rspec|phpunit|dotnet test|make test|"
     r"playwright test|cypress run)\b",
     re.IGNORECASE,
 )
-_PINNED_SHA = re.compile(r"uses:\s*[\w.-]+/[\w./-]+@[0-9a-f]{40}\b")
-_UNPINNED = re.compile(r"uses:\s*[\w.-]+/[\w./-]+@(?![0-9a-f]{40}\b)[\w.-]+")
+_USES = re.compile(r"uses:\s*['\"]?([\w.-]+/[\w./-]+)@([\w.-]+)")
+_WRITE_ALL = re.compile(r"^\s*permissions:\s*['\"]?write-all", re.M)
 
 
 def assess_practices(
@@ -30,6 +35,7 @@ def assess_practices(
     structure: Structure,
     lockfiles: list[str],
     workflows: dict[str, str],
+    dependencies: int = 1,
     *,
     description: str | None,
     topics: list[str],
@@ -60,7 +66,7 @@ def assess_practices(
         hit = files.first(*patterns)
         return hit.path if hit else None
 
-    readme = first("README", "README.*", "readme.*")
+    readme = find_readme(files)
     readme_len = len(files.read(readme) or "") if readme else 0
     check("readme", "docs", "Has a README", bool(readme), 3, readme)
     check(
@@ -71,7 +77,16 @@ def assess_practices(
         1,
         f"{readme_len} chars" if readme else None,
     )
-    lic = first("LICENSE", "LICENSE.*", "LICENCE", "LICENCE.*", "COPYING")
+    lic = first(
+        "LICENSE",
+        "LICENSE.*",
+        "LICENCE",
+        "LICENCE.*",
+        "COPYING",
+        "COPYING.*",
+        "LICENSE-*",
+        "UNLICENSE",
+    )
     check("license", "governance", "Has a LICENSE file", bool(lic), 2, lic)
     contributing = first("CONTRIBUTING.*", ".github/CONTRIBUTING.*", "docs/CONTRIBUTING.*")
     check(
@@ -132,7 +147,8 @@ def assess_practices(
         dep_updates,
         2,
     )
-    has_manifest = bool(structure.packages) or bool(stack.package_managers)
+    # repos whose manifests declare no external dependencies have nothing to lock
+    has_manifest = bool(dependencies) and bool(structure.packages or stack.package_managers)
     check(
         "lockfile",
         "security",
@@ -144,7 +160,13 @@ def assess_practices(
     env_files = [
         f.path
         for f in files.files
-        if re.search(r"(^|/)\.env(\.(?!example|sample|template|dist)[\w-]+)?$", f.path)
+        if re.search(r"(^|/)\.env(\.[\w.-]+)?$", f.path)
+        and not re.search(
+            r"\.(example|sample|template|dist|vault|schema|defaults|tpl)$|"
+            r"\.(example|sample|template)\.",
+            f.name,
+            re.I,
+        )
     ]
     check(
         "no-env-files",
@@ -156,8 +178,9 @@ def assess_practices(
     )
     all_wf = "\n".join(workflows.values())
     if workflows:
-        pinned = len(_PINNED_SHA.findall(all_wf))
-        unpinned = len(_UNPINNED.findall(all_wf))
+        refs = [ref for _, ref in _USES.findall(all_wf)]
+        pinned = sum(bool(re.fullmatch(r"[0-9a-f]{40}", r)) for r in refs)
+        unpinned = len(refs) - pinned
         check(
             "actions-pinned",
             "security",
@@ -170,11 +193,16 @@ def assess_practices(
             "workflow-permissions",
             "security",
             "Workflows declare least-privilege permissions",
-            all(re.search(r"^\s*permissions:", t, re.M) for t in workflows.values()),
+            all(
+                re.search(r"^\s*permissions:", t, re.M) and not _WRITE_ALL.search(t)
+                for t in workflows.values()
+            ),
             1,
         )
 
-    test_files = [f.path for f in files.files if _TEST_PATH.search(f.path)]
+    test_files = [
+        f.path for f in files.files if _TEST_PATH.search(f.path) and not _NOT_TEST.search(f.path)
+    ]
     check(
         "tests",
         "quality",
@@ -210,14 +238,15 @@ def assess_practices(
         1,
     )
 
+    has_ci = bool(
+        stack.ci_cd
+        and set(stack.ci_cd) - {"Dependabot", "Renovate", "release-please", "GoReleaser"}
+    )
     check(
         "ci",
         "delivery",
         "Has CI pipelines",
-        bool(
-            stack.ci_cd
-            and set(stack.ci_cd) - {"Dependabot", "Renovate", "release-please", "GoReleaser"}
-        ),
+        has_ci,
         3,
         ", ".join(stack.ci_cd[:3]) or None,
     )
@@ -228,13 +257,15 @@ def assess_practices(
             "Jenkinsfile",
             ".circleci/config.yml",
             "azure-pipelines.yml",
-            "Makefile",
+            "bitbucket-pipelines.yml",
+            ".buildkite/pipeline.yml",
         )
-        if files.exists(p)
     )
-    check(
-        "ci-runs-tests", "delivery", "CI runs the test suite", bool(_TEST_CMD.search(ci_texts)), 2
-    )
+    if has_ci and re.search(r"\bmake\s+\w*|\bjust\s+\w+|\btask\s+\w+", ci_texts):
+        # CI delegating to a task runner: the runner's recipes count too
+        ci_texts += "".join(files.read(p) or "" for p in ("Makefile", "justfile", "Taskfile.yml"))
+    ran = has_ci and bool(_TEST_CMD.search(ci_texts))
+    check("ci-runs-tests", "delivery", "CI runs the test suite", ran, 2)
     release = any(t in stack.ci_cd for t in ("release-please", "GoReleaser")) or any(
         t in stack.build_tools for t in ("Changesets", "semantic-release")
     )

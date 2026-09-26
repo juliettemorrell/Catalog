@@ -27,7 +27,7 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 | `summary.readme_title/excerpt/key_features` | First heading, first paragraphs and the "Features" bullets of the README | README |
 | `summary.purpose/domains/reuse_notes` | Plain-language purpose, domain tags and what others could borrow | Claude (`--llm`), `summary.source = "llm"` |
 | `stack.*` | `primary_language`, `languages` (files/lines/%), `frameworks`, `libraries`, `databases`, `messaging`, `auth`, `ai`, `cloud`, `infrastructure`, `ci_cd`, `testing`, `linting`, `build_tools`, `observability`, `package_managers`, `runtimes` | manifests, config files, workflow `uses:` |
-| `dependencies[]` | `name`, `version` (as declared), `ecosystem`, `scope` (runtime/dev/peer/optional/build), `manifest` path | manifests |
+| `dependencies[]` | `name`, `version` (as declared), `ecosystem`, `scope` (runtime/dev/peer/optional/build, or transitive for Go `// indirect`; transitive deps never count toward the stack), `manifest` path | manifests |
 | `structure.repo_type` | `service`, `web-app`, `full-stack-app`, `library`, `cli`, `mcp-server`, `monorepo`, `data-app`, `mobile-app`, `desktop-app`, `infrastructure`, `data-science`, `docs`, `scripts` | heuristics over the above |
 | `structure.*` | `packages`, `entrypoints`, `api_specs`, `dockerfiles`, `docs`, `top_level`, `file_count`, `total_lines` | file tree |
 | `practices` | `score` 0–100, `grade` A–F (≥85/70/55/40), `checks[]` with `id`, `category`, `label`, `passed`, `weight`, `evidence` | see below |
@@ -66,8 +66,8 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 |---|---|
 | `id` | Stable hash of repo + path + kind + name |
 | `kind` | `skill`, `agent`, `command`, `prompt`, `instructions`, `mcp-server`, `mcp-config`, `hook`, `plugin`, `eval`, `workflow`, `sdk-usage` |
-| `ecosystem` | `claude-code`, `agent-skills`, `agents-md`, `copilot`, `cursor`, `windsurf`, `cline`, `roo`, `kiro`, `gemini`, `codex`, `opencode`, `continue`, `a2a`, `mcp`, `crewai`, `langgraph`, `promptfoo`, `prompty`, `github-models`, `inline`, `generic`, or an SDK key for `sdk-usage` (`anthropic`, `openai`, `bedrock`, `snowflake-cortex`…) |
-| `name`, `title`, `description` | From frontmatter/manifest; commands are named `/namespace:command` |
+| `ecosystem` | `claude-code`, `agent-skills`, `agents-md`, `agent-plugins`, `copilot`, `gh-aw` (agentic workflows), `cursor`, `windsurf`, `cline`, `roo`, `kiro`, `amazon-q`, `junie`, `gemini`, `codex`, `opencode`, `continue`, `trae`, `augment`, `firebase-studio`, `antigravity`, `factory`, `a2a`, `mcp`, `crewai`, `langgraph`, `promptfoo`, `prompty`, `github-models`, `inline`, `generic`, or an SDK key for `sdk-usage` (`anthropic`, `openai`, `bedrock`, `snowflake-cortex`…) |
+| `name`, `title`, `description` | From frontmatter/manifest; commands are named `/command` (Claude Code subfolders add a `namespace:<folder>` tag) or `/namespace:command` for other tools |
 | `repo`, `path`, `url` | Location; `url` is a permalink at the scanned commit (with `#L<line>` for code) |
 | `scope` | `repo` or `plugin` (shipped inside a plugin) |
 | `confidence`, `detector` | `high` for file conventions, `medium` for heuristics over source code; which rule fired |
@@ -88,7 +88,7 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 
 ## SQLite (`catalog.db`)
 
-Tables: `repos` (flat columns + `json`), `repo_tech(repo_id, category, name)`, `repo_capabilities`, `repo_topics`, `repo_languages`, `dependencies`, `packages`, `practice_checks`, `ai_assets` (flat columns + `content` + `json`), `asset_tools`, `asset_models`, `asset_tags`, and `meta`. Full-text search: `repos_fts`, `assets_fts` (porter stemming). Views: `tech_usage`, `dependency_usage`.
+Tables: `repos` (flat columns + `json`), `repo_tech(repo_id, category, name)`, `repo_capabilities`, `repo_topics`, `repo_languages`, `dependencies`, `packages`, `practice_checks`, `ai_assets` (flat columns + `content` + `json`), `asset_tools`, `asset_models`, `asset_tags`, and `meta`. Full-text search: `repos_fts`, `assets_fts` (unicode61, prefix matching). Views: `tech_usage`, `dependency_usage`.
 
 ```sql
 -- Which repos already integrate Stripe, newest first?

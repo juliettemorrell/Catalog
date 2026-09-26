@@ -44,10 +44,10 @@ CREATE TABLE asset_models (asset_id TEXT, model TEXT);
 CREATE TABLE asset_tags (asset_id TEXT, tag TEXT);
 CREATE VIRTUAL TABLE repos_fts USING fts5(
   id UNINDEXED, name, description, summary, readme, tech, capabilities, topics,
-  tokenize = 'porter unicode61');
+  tokenize = 'unicode61 remove_diacritics 2');
 CREATE VIRTUAL TABLE assets_fts USING fts5(
   id UNINDEXED, name, description, summary, content, tags,
-  tokenize = 'porter unicode61');
+  tokenize = 'unicode61 remove_diacritics 2');
 CREATE INDEX idx_tech ON repo_tech(name COLLATE NOCASE);
 CREATE INDEX idx_tech_repo ON repo_tech(repo_id);
 CREATE INDEX idx_cap ON repo_capabilities(capability);

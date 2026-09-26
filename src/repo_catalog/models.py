@@ -28,7 +28,8 @@ class Dependency(_Model):
     name: str
     version: str | None = None
     ecosystem: str  # npm, pypi, go, cargo, maven, gem, composer, nuget
-    scope: Literal["runtime", "dev", "optional", "peer", "build"] = "runtime"
+    # transitive: indirect deps pinned by the manifest (e.g. Go "// indirect")
+    scope: Literal["runtime", "dev", "optional", "peer", "build", "transitive"] = "runtime"
     manifest: str  # path of the manifest the dependency came from
 
 
@@ -188,6 +189,7 @@ class Repo(_Model):
     ai: AIUsageSummary = Field(default_factory=AIUsageSummary)
     scanned_at: datetime
     scanner_version: str
+    scan_fingerprint: str | None = None  # scanner version + options that shape the output
     scan_errors: list[str] = Field(default_factory=list)
 
 

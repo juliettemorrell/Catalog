@@ -23,7 +23,7 @@ The `repo-catalog` MCP server exposes a catalog of every repository in the org a
 
 ## Tips
 
-- Free-text search is stemmed and prefix-matched. If it returns nothing, it falls back to OR, so keep queries short and specific.
+- Free-text search is prefix-matched. If it returns nothing, it falls back to OR, so keep queries short and specific.
 - For anything the tools don't cover, use `sql` (read-only). The tables and views are listed in the server instructions; for example:
   `SELECT name, repo_count FROM dependency_usage WHERE ecosystem='npm' LIMIT 20`.
 - Scan data can be up to a day old. Confirm details in the linked source before depending on them.

@@ -55,10 +55,22 @@ function stackValues(r: Repo): string[] {
   ];
 }
 
+export interface FilterDef<T> {
+  get: Getter<T>;
+  exact?: boolean;
+  /** numeric threshold filters: `minq:60` keeps items whose value is >= 60 */
+  min?: (item: T) => number;
+  help: string;
+}
+
 /** Filter keys for repos. `exact` keys compare whole values; others use substring match. */
-export const REPO_FILTERS: Record<string, { get: Getter<Repo>; exact?: boolean; help: string }> = {
-  lang: { get: (r) => [r.stack.primary_language, ...r.stack.languages.map((l) => l.name)], exact: true, help: "language" },
-  tech: { get: stackValues, help: "framework, library, tool or dependency" },
+export const REPO_FILTERS: Record<string, FilterDef<Repo>> = {
+  lang: { get: (r) => r.stack.primary_language, exact: true, help: "primary language" },
+  anylang: { get: (r) => r.stack.languages.map((l) => l.name), exact: true, help: "any language used" },
+  fw: { get: (r) => r.stack.frameworks, exact: true, help: "framework" },
+  data: { get: (r) => [...r.stack.databases, ...r.stack.messaging], exact: true, help: "data store or messaging" },
+  infra: { get: (r) => [...r.stack.cloud, ...r.stack.infrastructure], exact: true, help: "cloud or infrastructure" },
+  tech: { get: stackValues, help: "any framework, library, tool or dependency (partial match)" },
   type: { get: (r) => r.structure.repo_type, exact: true, help: "repo type" },
   grade: { get: (r) => r.practices.grade, exact: true, help: "best-practice grade A-F" },
   cap: { get: (r) => [...r.capabilities, ...r.summary.domains], help: "capability or domain" },
@@ -73,9 +85,10 @@ export const REPO_FILTERS: Record<string, { get: Getter<Repo>; exact?: boolean; 
     get: (r) => [r.archived ? "archived" : null, r.fork ? "fork" : null, r.structure.is_monorepo ? "monorepo" : null, r.visibility],
     exact: true, help: "archived, fork, monorepo, private, public",
   },
+  minscore: { get: () => null, min: (r) => r.practices.score, help: "minimum practices score (0-100)" },
 };
 
-export const ASSET_FILTERS: Record<string, { get: Getter<Asset>; exact?: boolean; help: string }> = {
+export const ASSET_FILTERS: Record<string, FilterDef<Asset>> = {
   kind: { get: (a) => a.kind, exact: true, help: "skill, agent, command, prompt, instructions, mcp-server…" },
   eco: { get: (a) => a.ecosystem, exact: true, help: "ecosystem, e.g. claude-code, cursor, copilot" },
   repo: { get: (a) => [a.repo, a.repo.split("/")[1]], exact: true, help: "repository" },
@@ -85,23 +98,29 @@ export const ASSET_FILTERS: Record<string, { get: Getter<Asset>; exact?: boolean
   conf: { get: (a) => a.confidence, exact: true, help: "detection confidence" },
   scope: { get: (a) => a.scope, exact: true, help: "repo, plugin" },
   dup: { get: (a) => (a.duplicates.length ? "yes" : "no"), exact: true, help: "has copies elsewhere (yes/no)" },
+  minq: { get: () => null, min: (a) => a.quality_score, help: "minimum quality score (0-100)" },
 };
 
-function matches<T>(item: T, f: Filter, defs: Record<string, { get: Getter<T>; exact?: boolean }>): boolean {
-  if (f.key === "minq") return (item as unknown as Asset).quality_score >= Number(f.value);
-  if (f.key === "minscore") return (item as unknown as Repo).practices.score >= Number(f.value);
+function matches<T>(item: T, f: Filter, defs: Record<string, FilterDef<T>>): boolean {
   const def = defs[f.key];
-  if (!def) return true; // unknown keys are ignored rather than hiding everything
+  if (!def) return true;
+  if (def.min) {
+    const threshold = Number(f.value);
+    return !Number.isFinite(threshold) || def.min(item) >= threshold; // ignore "minq:abc"
+  }
   const raw = def.get(item);
   const values = (Array.isArray(raw) ? raw : [raw]).map(lc).filter(Boolean);
   const want = f.value.toLowerCase();
   return values.some((v) => (def.exact ? v === want : v.includes(want)));
 }
 
-export function applyFilters<T>(items: T[], filters: Filter[], defs: Record<string, { get: Getter<T>; exact?: boolean }>): T[] {
+export function applyFilters<T>(items: T[], filters: Filter[], defs: Record<string, FilterDef<T>>): T[] {
   // Same key twice = OR (lang:go lang:rust); different keys = AND; `-key:v` excludes.
   const byKey = new Map<string, Filter[]>();
-  for (const f of filters) byKey.set(`${f.negate ? "-" : ""}${f.key}`, [...(byKey.get(`${f.negate ? "-" : ""}${f.key}`) ?? []), f]);
+  for (const f of filters) {
+    const k = `${f.negate ? "-" : ""}${f.key}`;
+    byKey.set(k, [...(byKey.get(k) ?? []), f]);
+  }
   return items.filter((item) =>
     [...byKey.values()].every((group) =>
       group[0]!.negate ? group.every((f) => !matches(item, f, defs)) : group.some((f) => matches(item, f, defs)),
@@ -109,7 +128,15 @@ export function applyFilters<T>(items: T[], filters: Filter[], defs: Record<stri
   );
 }
 
-export function repoIndex(repos: Repo[]): MiniSearch<Repo> {
+/** Split a parsed query into known filters and free text (unknown `a:b` tokens are text). */
+export function resolveQuery(q: ParsedQuery, defs: Record<string, unknown>): ParsedQuery & { unknown: string[] } {
+  const known = q.filters.filter((f) => f.key in defs);
+  const unknown = q.filters.filter((f) => !(f.key in defs));
+  const extra = unknown.map((f) => `${f.key}:${f.value}`);
+  return { text: [q.text, ...extra].filter(Boolean).join(" "), filters: known, unknown: unknown.map((f) => f.key) };
+}
+
+export function repoIndex(): MiniSearch<Repo> {
   const ms = new MiniSearch<Repo>({
     idField: "id",
     fields: ["name", "description", "purpose", "readme", "features", "tech", "caps", "topics", "packages"],
@@ -133,11 +160,10 @@ export function repoIndex(repos: Repo[]): MiniSearch<Repo> {
       prefix: true, fuzzy: 0.15, combineWith: "AND",
     },
   });
-  ms.addAll(repos);
   return ms;
 }
 
-export function assetIndex(assets: Asset[]): MiniSearch<Asset> {
+export function assetIndex(): MiniSearch<Asset> {
   const ms = new MiniSearch<Asset>({
     idField: "id",
     fields: ["name", "description", "summary", "tags", "tools", "content", "repo"],
@@ -149,7 +175,7 @@ export function assetIndex(assets: Asset[]): MiniSearch<Asset> {
         case "summary": return [a.summary, ...a.use_cases, a.category].filter(Boolean).join(" ");
         case "tags": return [...a.tags, a.kind, a.ecosystem].join(" ");
         case "tools": return [...a.tools, ...a.models, ...a.mcp_servers].join(" ");
-        case "content": return (a.content ?? "").slice(0, 20_000);
+        case "content": return [a.headings.join(" "), (a.content ?? "").slice(0, 2_000)].join(" ");
         case "repo": return a.repo;
         default: return "";
       }
@@ -159,23 +185,60 @@ export function assetIndex(assets: Asset[]): MiniSearch<Asset> {
       prefix: true, fuzzy: 0.15, combineWith: "AND",
     },
   });
-  ms.addAll(assets);
   return ms;
 }
 
 /** Rank by text relevance (falling back to OR when AND finds nothing), then filter. */
+/** A search index filled in the background, in chunks, so large catalogs never freeze the UI. */
+export class LazyIndex<T> {
+  ready = false;
+  progress = 0;
+  private started: Promise<void> | null = null;
+
+  constructor(readonly index: MiniSearch<T>, private readonly docs: T[], private readonly onReady: () => void) {}
+
+  start(): Promise<void> {
+    this.started ??= (async () => {
+      const chunk = 400;
+      for (let i = 0; i < this.docs.length; i += chunk) {
+        this.index.addAll(this.docs.slice(i, i + chunk));
+        this.progress = Math.min(1, (i + chunk) / Math.max(1, this.docs.length));
+        await new Promise((r) => setTimeout(r, 0)); // yield to input and rendering
+      }
+      this.ready = true;
+      this.progress = 1;
+      this.onReady();
+    })();
+    return this.started;
+  }
+}
+
 export function runSearch<T extends { id: string }>(
-  items: T[], index: MiniSearch<T>, q: ParsedQuery,
-  defs: Record<string, { get: Getter<T>; exact?: boolean }>, fallbackSort: (a: T, b: T) => number,
+  items: T[], index: LazyIndex<T>, q: ParsedQuery,
+  defs: Record<string, FilterDef<T>>, fallbackSort: (a: T, b: T) => number,
 ): T[] {
   let ranked: T[];
   if (q.text.trim()) {
     const byId = new Map(items.map((i) => [i.id, i]));
-    let hits = index.search(q.text);
-    if (!hits.length) hits = index.search(q.text, { combineWith: "OR" });
+    if (!index.ready) {
+      void index.start();
+      return applyFilters(textFallback(items, q.text), q.filters, defs); // exact-substring until ready
+    }
+    const idx = index.index;
+    let hits = idx.search(q.text);
+    if (!hits.length) hits = idx.search(q.text, { combineWith: "OR" });
     ranked = hits.map((h) => byId.get(h.id as string)).filter((x): x is T => !!x);
   } else {
     ranked = [...items].sort(fallbackSort);
   }
   return applyFilters(ranked, q.filters, defs);
+}
+
+/** Plain substring search used while the full-text index is still being built. */
+function textFallback<T>(items: T[], text: string): T[] {
+  const words = text.toLowerCase().split(/\s+/).filter(Boolean);
+  return items.filter((item) => {
+    const hay = JSON.stringify(item).slice(0, 20_000).toLowerCase();
+    return words.every((w) => hay.includes(w));
+  });
 }
