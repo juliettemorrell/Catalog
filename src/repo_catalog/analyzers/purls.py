@@ -41,6 +41,9 @@ PACKAGE_ECOSYSTEMS = frozenset(
     }
 )
 _EXACT = re.compile(r"^(?:==|=|v)?(\d+(?:\.\d+)*(?:[-+.][0-9A-Za-z.\-+]*)?)$")
+_WILDCARD = re.compile(r"(?:^|[.\-])[xX*](?:[.\-]|$)")
+# ecosystems where a version with fewer than three parts is a range
+_SHORT_IS_RANGE = {"npm", "jsr", "deno"}
 # a bare "1.2.3" means ^1.2.3 in Cargo and ~> in Terraform/Helm; only locks make it exact
 _BARE_IS_RANGE = {"cargo", "terraform", "helm", "conda"}
 _PURL_TYPE = {
@@ -80,8 +83,10 @@ def exact_version(ecosystem: str, version: str | None) -> str | None:
     if ecosystem == "nuget" and re.fullmatch(r"\[[^,\]]+\]", version):
         version = version[1:-1]  # [13.0.3] is NuGet's exact-version syntax
     m = _EXACT.match(version)
-    if not m:
-        return None
+    if not m or _WILDCARD.search(m.group(1)):
+        return None  # 1.x, 1.2.*: ranges, not versions
+    if ecosystem in _SHORT_IS_RANGE and not re.match(r"\d+\.\d+\.\d+", m.group(1)):
+        return None  # npm: "1.2" means 1.2.x
     if ecosystem == "docker" and version in ("latest", "stable"):
         return None
     return m.group(1)

@@ -23,6 +23,7 @@ from typing import Any
 import httpx
 
 from .analyzers.purls import summarize
+from .analyzers.versions import version_sort_key
 from .models import Dependency, Flag, Repo, Severity
 
 log = logging.getLogger(__name__)
@@ -70,6 +71,8 @@ def _key(dep: Dependency) -> Key | None:
     # that could carry an internal host name or credential
     if not re.fullmatch(r"v?\d[\w.+\-]*", version) or re.search(r"://|[?#\s]", dep.name):
         return None
+    if re.search(r"(?:^|[.\-])[xX*](?:[.\-]|$)", version):
+        return None  # 1.x is a range, not a version OSV can match
     if "@" in dep.name.lstrip("@") or (":" in dep.name and dep.ecosystem != "maven"):
         return None
     if dep.ecosystem == "github-actions" and not re.match(r"v?\d+\.\d+", version):
@@ -232,23 +235,33 @@ def _fixed(advisory: dict[str, Any], ecosystem: str, name: str) -> list[str]:
         ):
             continue
         for rng in affected.get("ranges") or []:
-            fixed += [e["fixed"] for e in rng.get("events") or [] if e.get("fixed")]
+            if str(rng.get("type") or "ECOSYSTEM").upper() not in ("ECOSYSTEM", "SEMVER"):
+                continue  # GIT ranges list commit SHAs, not versions anyone can upgrade to
+            fixed += [str(e["fixed"]) for e in rng.get("events") or [] if e.get("fixed")]
     return list(dict.fromkeys(fixed))
 
 
 def _distinct(ids: list[str], advisories: dict[str, dict[str, Any]]) -> list[list[str]]:
     """Group ids that describe the same issue (GHSA-x and PYSEC-y aliasing one CVE), so it
     is counted once. The first id of each group (GHSA preferred) is the one shown."""
-    groups: list[tuple[set[str], list[str]]] = []
-    for vid in sorted(ids, key=lambda i: (not i.startswith("GHSA-"), i)):
-        names = {vid, *advisories.get(vid, {}).get("aliases", [])}
-        match = next((g for g in groups if g[0] & names), None)
-        if match is not None:
-            match[0].update(names)
-            match[1].append(vid)
-        else:
-            groups.append((names, [vid]))
-    return [members for _, members in groups]
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    ordered = sorted(dict.fromkeys(ids), key=lambda i: (not i.startswith("GHSA-"), i))
+    for vid in ordered:  # union-find: A~B and B~C put A, B and C in one group
+        aliases = advisories.get(vid, {}).get("aliases") or []
+        for alias in [vid, *(str(a) for a in aliases if a)]:
+            parent[find(alias)] = find(vid)
+    groups: dict[str, list[str]] = {}
+    for vid in ordered:
+        groups.setdefault(find(vid), []).append(vid)
+    return list(groups.values())
 
 
 def apply_vulnerabilities(
@@ -296,7 +309,10 @@ def apply_vulnerabilities(
         hits += 1
         # sources can disagree on severity (GHSA label vs a PYSEC CVSS vector): take the worst
         worst = min((_severity(advisories[i]) for i in members), key=lambda s: _RANK[s])
-        fixed = sorted({f for i in members for f in _fixed(advisories[i], key[0], key[1])})
+        fixed = sorted(
+            {f for i in members for f in _fixed(advisories[i], key[0], key[1])},
+            key=lambda f: version_sort_key(f, dep.ecosystem),
+        )
         shown = ", ".join(vuln_ids[:3]) + ("..." if len(vuln_ids) > 3 else "")
         message = (
             f"{dep.name}@{key[2]}{' (transitive)' if dep.scope == 'transitive' else ''}: "

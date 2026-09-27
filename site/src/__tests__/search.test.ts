@@ -1,6 +1,8 @@
+// @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { applyFilters, hasFilter, parseQuery, resolveQuery, REPO_FILTERS, ASSET_FILTERS, BLOCK_FILTERS, toggleFilter } from "../search";
+import { applyFilters, facetValue, hasFilter, parseQuery, resolveQuery, REPO_FILTERS, ASSET_FILTERS, BLOCK_FILTERS, toggleFilter } from "../search";
 import type { Asset, Block, Flag, Repo } from "../types";
+import { countBy } from "../util";
 
 const repo = (over: Partial<Repo> & { lang?: string; fw?: string[]; langs?: string[] }): Repo =>
   ({
@@ -117,5 +119,35 @@ describe("dependency filters", () => {
     expect(ids("dep:Postgres depeco:docker")).toEqual(["acme/web"]);
     expect(ids("vuln:yes")).toEqual(["acme/web"]);
     expect(ids("vuln:no")).toEqual(["acme/tool"]);
+  });
+});
+
+describe("facets agree with their filters", () => {
+  const mk = (id: string, tools: string[], tags: string[], category: string) =>
+    ({ id, tools, tags, category, repo: "acme/x", models: [], flags: [], duplicates: [] }) as unknown as Asset;
+  const assets = [mk("a", ["mcp__github__*"], [], "testing"), mk("b", ["mcp__github__create_issue"], ["testing"], "docs"), mk("c", ["Read"], [], "docs")];
+  const run = <T,>(items: T[], defs: Parameters<typeof applyFilters<T>>[2], q: string) =>
+    applyFilters(items, parseQuery(q).filters, defs).map((x) => (x as { id: string }).id);
+
+  it("a facet click on a value ending in * matches exactly, typed tool:x* stays a prefix", () => {
+    const facets = countBy(assets, ASSET_FILTERS.tool!.get);
+    expect(facets.find(([v]) => v === "mcp__github__*")?.[1]).toBe(1);
+    const q = toggleFilter("", "tool", facetValue("mcp__github__*"));
+    expect(run(assets, ASSET_FILTERS, q)).toEqual(["a"]);
+    expect(hasFilter(q, "tool", facetValue("mcp__github__*"))).toBe(true);
+    expect(run(assets, ASSET_FILTERS, "tool:mcp__github__*")).toEqual(["a", "b"]);
+    expect(facetValue("Read")).toBe("Read");
+  });
+
+  it("tag and capability facets count what their filters return", () => {
+    const tag = countBy(assets, ASSET_FILTERS.tag!.get).find(([v]) => v === "testing")?.[1];
+    expect(tag).toBe(run(assets, ASSET_FILTERS, "tag:testing").length);
+    const rs = [
+      { id: "r1", capabilities: ["payments"], summary: { domains: [] } },
+      { id: "r2", capabilities: [], summary: { domains: ["payments"] } },
+    ] as unknown as Repo[];
+    const cap = countBy(rs, REPO_FILTERS.cap!.get).find(([v]) => v === "payments")?.[1];
+    expect(cap).toBe(2);
+    expect(run(rs, REPO_FILTERS, "cap:payments")).toEqual(["r1", "r2"]);
   });
 });

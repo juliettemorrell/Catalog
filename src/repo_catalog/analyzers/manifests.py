@@ -268,7 +268,10 @@ def _split_req(req: Any) -> tuple[str, str | None]:
     if not isinstance(req, str):
         return "", None
     req = req.split(";", 1)[0].split(" #", 1)[0].split("--hash", 1)[0].strip()
-    if req.startswith(("#", "-", "git+", "http", ".", "/")) or "@" in req.split("[")[0]:
+    if (
+        req.startswith(("#", "-", "git+", "http:", "https:", "file:", ".", "/"))
+        or "@" in req.split("[")[0]
+    ):
         # URL / path / VCS installs: keep the name of "pkg @ url" forms
         if " @ " in req:
             req = req.split(" @ ", 1)[0]

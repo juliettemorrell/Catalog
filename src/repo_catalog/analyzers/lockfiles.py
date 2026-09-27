@@ -19,7 +19,7 @@ from typing import Any
 from ..fs import RepoFiles
 from ..models import Dependency
 from ..textutil import clean_ref, load_json, load_yaml
-from .versions import best_match
+from .versions import best_match, satisfies
 
 MAX_TRANSITIVE_PER_LOCKFILE = 5000
 MAX_LOCKFILE_BYTES = 30_000_000
@@ -37,6 +37,9 @@ class LockData:
     direct: dict[tuple[str, str], str] = field(default_factory=dict)
     # "name@range" as written in a manifest -> version (yarn)
     specs: dict[str, str] = field(default_factory=dict)
+    # npm workspace member dirs: their deps are hoisted to the root, so a member missing
+    # from ``direct`` may fall back to the root's record; nothing else may (pnpm never)
+    workspaces: set[str] = field(default_factory=set)
 
 
 def _d(v: Any) -> dict[str, Any]:
@@ -75,6 +78,8 @@ def _package_lock(text: str) -> LockData:
     if packages:  # lockfileVersion 2 and 3: keys are install paths
         for key, meta in packages.items():
             meta = _d(meta)
+            if key and "node_modules/" not in key:
+                out.workspaces.add(key.strip("/"))
             if "node_modules/" not in key or meta.get("link") or not meta.get("version"):
                 continue  # root, workspace members and links are the repo's own code
             installed = key.rsplit("node_modules/", 1)[1]
@@ -128,11 +133,20 @@ def _yarn_lock(text: str) -> LockData:
                 specs.append((name, rng))
             continue
         if specs and (m := _YARN_VERSION.match(line)):
+            real_names: list[str] = []
             for name, rng in specs:
                 out.specs[f"{name}@{rng}"] = m.group(1)
+                real = name
                 if rng.startswith("npm:"):
-                    out.specs[f"{name}@{rng[4:]}"] = m.group(1)
-            for name in dict.fromkeys(n for n, _ in specs):
+                    target, target_rng = split_at(rng[4:])
+                    if target_rng and not re.match(r"^[\d^~<>=*xX]", target):
+                        # alias: "myalias@npm:left-pad@^1.3.0" installs left-pad
+                        real = target
+                        out.specs[f"{target}@{target_rng}"] = m.group(1)
+                    else:
+                        out.specs[f"{name}@{rng[4:]}"] = m.group(1)
+                real_names.append(real)
+            for name in dict.fromkeys(real_names):
                 out.entries.append((name, m.group(1)))
             specs = []
     return out
@@ -504,9 +518,14 @@ def _resolve(dep: Dependency, data: LockData, importer: str) -> str | None:
     """The locked version of a direct dependency: the lockfile's own record for this
     project first, then the version satisfying the declared range. Never a guess."""
     key = norm(dep.ecosystem, dep.name)
-    for where in (importer, ""):
-        if (where, key) in data.direct:
-            return data.direct[(where, key)]
+    # the root's record only stands in for a declared npm workspace member (hoisted deps)
+    places = [importer, ""] if importer == "" or importer in data.workspaces else [importer]
+    for where in dict.fromkeys(places):
+        found = data.direct.get((where, key))
+        if found is not None:
+            if dep.version and satisfies(found, dep.version, dep.ecosystem) is False:
+                break  # the lockfile records something else than this manifest asks for
+            return found
     if dep.version and f"{dep.name}@{dep.version}" in data.specs:
         return data.specs[f"{dep.name}@{dep.version}"]
     candidates = list(dict.fromkeys(v for n, v in data.entries if norm(dep.ecosystem, n) == key))

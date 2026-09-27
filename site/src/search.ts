@@ -37,6 +37,14 @@ export function toggleFilter(q: string, key: string, value: string): string {
   return [parsed.text, ...tokens].filter(Boolean).join(" ");
 }
 
+/**
+ * The filter value a facet click writes. A leading `=` asks for an exact match, so a facet
+ * for a value that itself ends in `*` (tool `mcp__github__*`) is not read as a prefix.
+ */
+export function facetValue(value: string): string {
+  return value.endsWith("*") || value.startsWith("=") ? `=${value}` : value;
+}
+
 export function hasFilter(q: string, key: string, value: string): boolean {
   return parseQuery(q).filters.some((f) => !f.negate && f.key === key && f.value.toLowerCase() === value.toLowerCase());
 }
@@ -129,6 +137,9 @@ function matches<T>(item: T, f: Filter, defs: Record<string, FilterDef<T>>): boo
   const raw = def.get(item);
   const values = (Array.isArray(raw) ? raw : [raw]).map(lc).filter(Boolean);
   const want = f.value.toLowerCase();
+  if (want.length > 1 && want.startsWith("=")) { // exact marker written by facet clicks
+    return values.some((v) => v === want.slice(1));
+  }
   if (want.length > 1 && want.endsWith("*")) { // explicit prefix match: tool:Bash*, uses:claude*
     const prefix = want.slice(0, -1);
     return values.some((v) => v.startsWith(prefix));

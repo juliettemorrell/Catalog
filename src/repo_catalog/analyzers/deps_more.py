@@ -11,6 +11,7 @@ from __future__ import annotations
 import configparser
 import re
 from collections.abc import Callable
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from ..fs import RepoFiles
@@ -140,17 +141,43 @@ def pip_requirement(line: str) -> tuple[str | None, str | None]:
     return m.group(1), (None if rest.startswith("@") else rest or None)
 
 
-def sbt(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
+_SBT_VAL = re.compile(r'\b(?:lazy\s+)?val\s+(\w+)\s*(?::\s*String\s*)?=\s*"([^"\s]+)"')
+
+
+def _sbt_values(path: str, text: str, files: RepoFiles) -> dict[str, str]:
+    """Simple ``val circeV = "0.14.1"`` definitions in build.sbt and project/*.scala."""
+    values: dict[str, str] = {}
+    parent = str(PurePosixPath(path).parent)
+    project = "project" if parent == "." else f"{parent}/project"
+    texts = []
+    for entry in files.under(project)[:50]:
+        if entry.path.endswith(".scala") and entry.path.count("/") == project.count("/") + 1:
+            texts.append(files.read(entry.path) or "")
+    for source in [*texts, text]:  # the build file's own definitions win
+        for name, value in _SBT_VAL.findall(source):
+            values[name] = value
+    return values
+
+
+def sbt(path: str, text: str, res: ManifestResult, files: RepoFiles) -> None:
     scala = re.search(r'scalaVersion\s*:?=\s*"(\d+)\.(\d+)', text)
     suffix = (
         ("_3" if scala.group(1) == "3" else f"_{scala.group(1)}.{scala.group(2)}") if scala else ""
     )
+    values: dict[str, str] | None = None
     for m in re.finditer(
-        r'"([\w.\-]+)"\s*(%%%|%%|%)\s*"([\w.\-]+)"\s*%\s*(?:"([^"]+)"|(\w+))'
+        r'"([\w.\-]+)"\s*(%%%|%%|%)\s*"([\w.\-]+)"\s*%\s*(?:"([^"]+)"|([A-Za-z_][\w.]*))'
         r'(?:\s*%\s*"?(\w+)"?)?',
         text,
     ):
-        group, op, artifact, version, _variable, config = m.groups()
+        group, op, artifact, version, variable, config = m.groups()
+        if variable and version is None:
+            if values is None:
+                try:
+                    values = _sbt_values(path, text, files)
+                except Exception:  # an unreadable project/ file just leaves it unresolved
+                    values = {}
+            version = values.get(variable) or values.get(variable.rsplit(".", 1)[-1])
         # %% appends the Scala binary version to the artifact id
         artifact = artifact + suffix if op != "%" and suffix else artifact
         scope = "dev" if config and config.lower() in ("test", "it") else "runtime"
@@ -312,17 +339,22 @@ def dockerfile(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
 
     stages: dict[str, str] = {}  # alias -> the external image it builds on
     froms = [(expand(m.group(1)), (m.group(2) or "").lower()) for m in _FROM.finditer(text)]
-    # the final stage (and everything it builds FROM, through aliases) is the runtime
-    runtime_images: set[str] = set()
+    # a FROM names an earlier stage only when that alias was defined above it:
+    # "FROM nginx AS nginx" still pulls the nginx image
+    external: list[str] = []
+    base = ""
     for image, alias in froms:
-        base = stages.get(image.lower(), image)
+        if image.lower() in stages:
+            base = stages[image.lower()]
+        else:
+            base = image
+            external.append(image)
         if alias:
             stages[alias] = base
-    if froms:
-        last = froms[-1][0]
-        runtime_images.add(stages.get(last.lower(), last))
-    for image, _alias in froms:
-        if image.lower() in stages or image == "scratch" or "$" in image:
+    # the final stage (and everything it builds FROM, through aliases) is the runtime
+    runtime_images = {base} if froms else set()
+    for image in external:
+        if image == "scratch" or "$" in image:
             continue
         name, ref = split_image(image)
         scope = "runtime" if image in runtime_images else "build"

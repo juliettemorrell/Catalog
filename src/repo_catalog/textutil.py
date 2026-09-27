@@ -173,18 +173,74 @@ def _secretish_segment(seg: str) -> bool:
     return len(seg) >= 24 and bool(re.search(r"\d", seg)) and bool(re.search(r"[A-Za-z]", seg))
 
 
-_USERINFO = re.compile(r"(?<![^\s/])[^\s/:@]+:[^\s/@]+@")
+_COMMIT = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# query parameters that carry signatures or credentials (S3/GCS/Azure SAS, CloudFront)
+_SECRET_PARAM = re.compile(
+    r"(?i)^(?:sig|signature|x-amz-.*|x-goog-.*|se|sp|sv|sr|st|skoid|sktid|skt|ske|sks|skv|"
+    r"policy|key-pair-id|expires|access_token|private_token|client_secret)$"
+)
+# scp-like or bare "user:pass@host/path": userinfo runs to the LAST @ before the host
+_BARE_USERINFO = re.compile(
+    r"^(?P<ui>[^\s/]+)@(?P<host>[A-Za-z0-9-]*[A-Za-z][A-Za-z0-9.-]*)(?P<rest>[:/]\S*)$"
+)
+_REF_FRAGMENT = re.compile(r"[\w.\-/+:^~<>=*]{1,200}")
+_URL = re.compile(r"((?:[A-Za-z][\w+.\-]*:)*//)(\S*)")
+
+
+def _secret_value(value: str) -> bool:
+    if not value or _COMMIT.fullmatch(value):
+        return False  # commit SHAs pin code, they are not credentials
+    return _secretish_segment(value) or bool(SECRET_PATTERNS.search(value))
+
+
+def _clean_query(query: str) -> str:
+    kept = []
+    for pair in query.split("&"):
+        name, _, value = pair.partition("=")
+        if not name or SECRET_NAME.search(name) or _SECRET_PARAM.match(name):
+            continue
+        if _secret_value(value):
+            continue
+        kept.append(pair)
+    return "&".join(kept)
+
+
+def _clean_url(prefix: str, rest: str) -> str:
+    """``prefix`` ends with ``://``; ``rest`` is authority + path + query + fragment."""
+    rest, hash_, fragment = rest.partition("#")
+    rest, qmark, query = rest.partition("?")
+    authority, slash, path = rest.partition("/")
+    host = authority.rpartition("@")[2]  # userinfo ends at the last @ of the authority
+    path = "/".join("[REDACTED]" if _secret_value(seg) else seg for seg in path.split("/"))
+    out = f"{prefix}{host}{slash}{path}"
+    query = _clean_query(query) if qmark else ""
+    if query:
+        out += f"?{query}"
+    if (
+        hash_
+        and _REF_FRAGMENT.fullmatch(fragment)
+        and not _secret_value(fragment)
+        and not SECRET_NAME.search(fragment.partition("=")[0] if "=" in fragment else "")
+    ):
+        out += f"#{fragment}"  # git refs (#v1.2.3, #semver:^1.0), egg names, tarball hashes
+    return out
 
 
 def clean_ref(text: str) -> str:
-    """A dependency name/version as stored: URLs lose credentials, query strings and
-    secret-looking path segments; bare ``user:pass@host`` userinfo is dropped; any
-    credential-shaped string is masked. Plain names and versions pass through unchanged."""
+    """A dependency name/version as stored: URLs lose credentials, secret-looking query
+    parameters and path segments but keep refs (``#v1.2.3``, ``?ref=v1.2.0``); bare
+    ``user:pass@host/path`` userinfo is dropped; any credential-shaped string is masked.
+    Plain names and versions (``com.foo:bar:1.0@aar``, ``npm:lodash@^4``) pass through."""
     if "://" in text:
-        text = redact_url(text)
-    elif re.search(r"\?[^?\s]*=", text):
-        text = text.split("?", 1)[0]  # registry-style sources: mod/aws?token=...
-    text = _USERINFO.sub("", text)
+        text = _URL.sub(lambda m: _clean_url(m.group(1), m.group(2)), text)
+    else:
+        m = _BARE_USERINFO.match(text)
+        if m and (":" in m.group("ui") or _secret_value(m.group("ui"))):
+            text = m.group("host") + m.group("rest")
+        if re.search(r"\?[^?\s]*=", text):  # registry-style sources: mod/aws?token=...
+            head, _, query = text.partition("?")
+            query = _clean_query(query)
+            text = f"{head}?{query}" if query else head
     return redact_secrets(text)
 
 

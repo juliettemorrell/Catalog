@@ -1,8 +1,9 @@
 import "./styles.css";
 import {
-  ASSET_FILTERS, BLOCK_FILTERS, LazyIndex, REPO_FILTERS, assetIndex, blockIndex, hasFilter, parseQuery,
+  ASSET_FILTERS, BLOCK_FILTERS, LazyIndex, REPO_FILTERS, assetIndex, blockIndex, facetValue, hasFilter, parseQuery,
   repoIndex, resolveQuery, runSearch, toggleFilter,
 } from "./search";
+import type { FilterDef } from "./search";
 import type { Asset, Block, Catalog, Flag, Repo } from "./types";
 import { chips, copyText, countBy, downloadCsv, esc, fmtNum, markdown, num, relTime, safeUrl } from "./util";
 
@@ -282,8 +283,8 @@ function renderSearch(state: State): void {
 function facetGroup(title: string, key: string, entries: [string, number][], q: string, limit = 8, label = (v: string) => v): string {
   if (!entries.length) return "";
   const items = entries.slice(0, 40).map(([value, n], i) => {
-    const on = hasFilter(q, key, value);
-    const target = href({ q: toggleFilter(q, key, value), open: null });
+    const on = hasFilter(q, key, facetValue(value));
+    const target = href({ q: toggleFilter(q, key, facetValue(value)), open: null });
     return `<li${i >= limit && !on ? ' class="extra"' : ""}><a class="facet${on ? " on" : ""}" data-focus="facet:${esc(key)}:${esc(value)}"
       href="${esc(target)}"><span>${esc(label(value))}${on ? '<span class="sr-only"> (selected, click to remove)</span>' : ""}</span><span class="n">${num(n)}</span></a></li>`;
   }).join("");
@@ -292,48 +293,56 @@ function facetGroup(title: string, key: string, entries: [string, number][], q: 
   return `<div class="facet-group${entries.length <= limit ? " few" : ""}"><h2>${esc(title)}</h2><ul>${items}</ul>${more}</div>`;
 }
 
+/** Facet counts use the filter's own getter, so a facet's number is what its click returns. */
+function counts<T>(items: T[], defs: Record<string, FilterDef<T>>, key: string): [string, number][] {
+  return countBy(items, defs[key]!.get);
+}
+
 function repoFacets(rs: Repo[], q: string): string {
+  const c = (key: string) => counts(rs, REPO_FILTERS, key);
   return [
-    facetGroup("Type", "type", countBy(rs, (r) => r.structure.repo_type), q),
-    facetGroup("Language", "lang", countBy(rs, (r) => r.stack.primary_language), q),
-    facetGroup("Framework", "fw", countBy(rs, (r) => r.stack.frameworks), q),
-    facetGroup("Capability", "cap", countBy(rs, (r) => r.capabilities), q),
-    facetGroup("Data & messaging", "data", countBy(rs, (r) => [...r.stack.databases, ...r.stack.messaging]), q),
-    facetGroup("Cloud & infra", "infra", countBy(rs, (r) => [...r.stack.cloud, ...r.stack.infrastructure]), q),
-    facetGroup("Uses AI", "ai", countBy(rs, (r) => (r.ai.has_ai ? "yes" : "no")), q, 8, (v) => (v === "yes" ? "Yes" : "No")),
-    facetGroup("Practices grade", "grade", countBy(rs, (r) => r.practices.grade).sort((a, b) => a[0].localeCompare(b[0])), q),
-    facetGroup("Missing practice", "missing", countBy(rs, (r) => r.practices.checks.filter((c) => !c.passed).map((c) => c.id)), q),
-    facetGroup("Lifecycle", "lifecycle", countBy(rs, (r) => r.lifecycle), q),
-    facetGroup("Findings", "flag", countBy(rs, (r) => r.flags.map((f) => f.id)), q, 8, flagLabel),
-    facetGroup("Severity", "sev", countBy(rs, (r) => r.flags.map((f) => f.severity)).sort((a, b) => num(SEV_ORDER[a[0]]) - num(SEV_ORDER[b[0]])), q),
-    facetGroup("Ships building blocks", "reuse", countBy(rs, (r) => r.reusables.map((x) => x.kind)), q, 8, (v) => BLOCK_LABEL[v] ?? v),
-    facetGroup("Used by other repos", "usedby", countBy(rs, (r) => (r.used_by.length ? "yes" : "no")), q, 8, (v) => (v === "yes" ? "Yes" : "No")),
-    facetGroup("Topic", "topic", countBy(rs, (r) => r.topics), q),
+    facetGroup("Type", "type", c("type"), q),
+    facetGroup("Language", "lang", c("lang"), q),
+    facetGroup("Framework", "fw", c("fw"), q),
+    facetGroup("Capability or domain", "cap", c("cap"), q),
+    facetGroup("Data & messaging", "data", c("data"), q),
+    facetGroup("Cloud & infra", "infra", c("infra"), q),
+    facetGroup("Uses AI", "ai", c("ai"), q, 8, (v) => (v === "yes" ? "Yes" : "No")),
+    facetGroup("Practices grade", "grade", c("grade").sort((a, b) => a[0].localeCompare(b[0])), q),
+    facetGroup("Missing practice", "missing", c("missing"), q),
+    facetGroup("Lifecycle", "lifecycle", c("lifecycle"), q),
+    facetGroup("Findings", "flag", c("flag"), q, 8, flagLabel),
+    facetGroup("Severity", "sev", c("sev").sort((a, b) => num(SEV_ORDER[a[0]]) - num(SEV_ORDER[b[0]])), q),
+    facetGroup("Ships building blocks", "reuse", c("reuse"), q, 8, (v) => BLOCK_LABEL[v] ?? v),
+    facetGroup("Used by other repos", "usedby", c("usedby"), q, 8, (v) => (v === "yes" ? "Yes" : "No")),
+    facetGroup("Topic", "topic", c("topic"), q),
   ].join("");
 }
 
 function assetFacets(as: Asset[], q: string): string {
+  const c = (key: string) => counts(as, ASSET_FILTERS, key);
   return [
-    facetGroup("Kind", "kind", countBy(as, (a) => a.kind), q, 12, (v) => KIND_LABEL[v] ?? v),
-    facetGroup("Ecosystem", "eco", countBy(as, (a) => a.ecosystem), q),
+    facetGroup("Kind", "kind", c("kind"), q, 12, (v) => KIND_LABEL[v] ?? v),
+    facetGroup("Ecosystem", "eco", c("eco"), q),
     facetGroup("Repository", "repo", countBy(as, (a) => a.repo), q, 8, (v) => v.split("/")[1] ?? v),
-    facetGroup("Category", "tag", countBy(as, (a) => a.category), q),
-    facetGroup("Tools", "tool", countBy(as, (a) => a.tools), q),
-    facetGroup("Models", "model", countBy(as, (a) => a.models), q),
-    facetGroup("Confidence", "conf", countBy(as, (a) => a.confidence), q),
-    facetGroup("Copied elsewhere", "dup", countBy(as, (a) => (a.duplicates.length ? "yes" : "no")), q, 8, (v) => (v === "yes" ? "Yes" : "No")),
-    facetGroup("Findings", "flag", countBy(as, (a) => a.flags.map((f) => f.id)), q, 8, flagLabel),
+    facetGroup("Tag or category", "tag", c("tag"), q),
+    facetGroup("Tools", "tool", c("tool"), q),
+    facetGroup("Models", "model", c("model"), q),
+    facetGroup("Confidence", "conf", c("conf"), q),
+    facetGroup("Copied elsewhere", "dup", c("dup"), q, 8, (v) => (v === "yes" ? "Yes" : "No")),
+    facetGroup("Findings", "flag", c("flag"), q, 8, flagLabel),
   ].join("");
 }
 
 function blockFacets(bs: Block[], q: string): string {
+  const c = (key: string) => counts(bs, BLOCK_FILTERS, key);
   return [
-    facetGroup("Kind", "kind", countBy(bs, (b) => b.kind), q, 8, (v) => BLOCK_LABEL[v] ?? v),
-    facetGroup("Format", "format", countBy(bs, (b) => String(b.details.format ?? b.details.engine ?? b.details.using ?? "").split(" ")[0]), q),
+    facetGroup("Kind", "kind", c("kind"), q, 8, (v) => BLOCK_LABEL[v] ?? v),
+    facetGroup("Format", "format", c("format"), q),
     facetGroup("Repository", "repo", countBy(bs, (b) => b.repo), q, 8, (v) => v.split("/")[1] ?? v),
-    facetGroup("Repo language", "lang", countBy(bs, (b) => b.repoRef.stack.primary_language), q),
-    facetGroup("Repo grade", "grade", countBy(bs, (b) => b.repoRef.practices.grade).sort((a, b) => a[0].localeCompare(b[0])), q),
-    facetGroup("Repo lifecycle", "lifecycle", countBy(bs, (b) => b.repoRef.lifecycle), q),
+    facetGroup("Repo language", "lang", c("lang"), q),
+    facetGroup("Repo grade", "grade", c("grade").sort((a, b) => a[0].localeCompare(b[0])), q),
+    facetGroup("Repo lifecycle", "lifecycle", c("lifecycle"), q),
   ].join("");
 }
 

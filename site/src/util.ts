@@ -65,7 +65,9 @@ export function chips(values: string[], cls = "chip", max = 99): string {
 
 /** Items per value. Case-insensitive like the filters ("Read" and "read" are one facet,
  * shown with the first spelling seen), and each item counts once per value. */
-export function countBy<T>(items: T[], key: (t: T) => string | string[] | null | undefined): [string, number][] {
+export function countBy<T>(
+  items: T[], key: (t: T) => string | (string | null | undefined)[] | null | undefined,
+): [string, number][] {
   const counts = new Map<string, [string, number]>();
   for (const item of items) {
     const k = key(item);
