@@ -31,6 +31,13 @@
       "default": false,
       "title": "Llm Enriched",
       "type": "boolean"
+    },
+    "failures": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Failures",
+      "type": "object"
     }
   },
   "required": [

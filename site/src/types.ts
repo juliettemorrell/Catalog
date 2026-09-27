@@ -66,6 +66,6 @@ export interface Asset {
   flags: Flag[];
 }
 
-export interface Meta { generated_at: string; source: string; repo_count: number; asset_count: number; llm_enriched: boolean; scanner_version: string }
+export interface Meta { generated_at: string; source: string; repo_count: number; asset_count: number; llm_enriched: boolean; scanner_version: string; failures?: Record<string, string> }
 
 export interface Catalog { meta: Meta; repos: Repo[]; assets: Asset[] }

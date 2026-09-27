@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -22,6 +24,19 @@ def _slug(repo_id: str) -> str:
     return repo_id.replace("/", "__")
 
 
+def write_atomic(path: Path, text: str) -> None:
+    """Write via a temp file and rename, so a killed run never leaves a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def load_previous(out_dir: Path) -> dict[str, tuple[Repo, list[AIAsset]]]:
     prev: dict[str, tuple[Repo, list[AIAsset]]] = {}
     folder = out_dir / REPOS_DIR
@@ -34,7 +49,7 @@ def load_previous(out_dir: Path) -> dict[str, tuple[Repo, list[AIAsset]]]:
             assets = [AIAsset.model_validate(a) for a in data.get("assets", [])]
             prev[repo.id] = (repo, assets)
         except Exception as exc:  # schema drift: just rescan that repo
-            log.info("ignoring stale %s: %s", path.name, exc)
+            log.warning("ignoring unreadable %s (it will be rescanned): %s", path.name, exc)
     return prev
 
 
@@ -45,7 +60,7 @@ def write_repo(out_dir: Path, repo: Repo, assets: list[AIAsset]) -> None:
         "repo": repo.model_dump(mode="json"),
         "assets": [a.model_dump(mode="json") for a in assets],
     }
-    (folder / f"{_slug(repo.id)}.json").write_text(json.dumps(payload, indent=1) + "\n")
+    write_atomic(folder / f"{_slug(repo.id)}.json", json.dumps(payload, indent=1) + "\n")
 
 
 def prune(out_dir: Path, keep: set[str], owners: set[str]) -> list[str]:
@@ -65,7 +80,12 @@ def prune(out_dir: Path, keep: set[str], owners: set[str]) -> list[str]:
 
 
 def write_aggregates(
-    out_dir: Path, repos: list[Repo], assets: list[AIAsset], source: str, llm: bool
+    out_dir: Path,
+    repos: list[Repo],
+    assets: list[AIAsset],
+    source: str,
+    llm: bool,
+    failures: dict[str, str] | None = None,
 ) -> CatalogMeta:
     meta = CatalogMeta(
         generated_at=datetime.now(UTC),
@@ -74,15 +94,18 @@ def write_aggregates(
         repo_count=len(repos),
         asset_count=len(assets),
         llm_enriched=llm,
+        failures=failures or {},
     )
     meta_json = meta.model_dump(mode="json")
-    (out_dir / CATALOG_FILE).write_text(
-        json.dumps({"meta": meta_json, "repos": [_site_repo(r) for r in repos]}, indent=1)
+    write_atomic(
+        out_dir / CATALOG_FILE,
+        json.dumps({"meta": meta_json, "repos": [_site_repo(r) for r in repos]}, indent=1),
     )
-    (out_dir / ASSETS_FILE).write_text(
+    write_atomic(
+        out_dir / ASSETS_FILE,
         json.dumps(
             {"meta": meta_json, "assets": [a.model_dump(mode="json") for a in assets]}, indent=1
-        )
+        ),
     )
     return meta
 

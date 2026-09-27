@@ -23,6 +23,7 @@ def _rest_repo(name: str, owner: str = "acme") -> dict[str, object]:
         "visibility": "private",
         "pushed_at": "2026-01-01T00:00:00Z",
         "stargazers_count": 3,
+        "language": "Python",
     }
 
 
@@ -48,7 +49,8 @@ def test_rest_fallback_and_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
     gh = GitHubClient("t", transport=httpx.MockTransport(handler))
     refs = gh.list_owner_repos("acme")
     assert [r.full_name for r in refs] == ["acme/a", "acme/b"]  # other owner dropped
-    assert refs[0].meta["license"] == "MIT" and refs[0].meta["languages"] == {"Python": 1000}
+    assert refs[0].meta["license"] == "MIT" and refs[0].meta["languages"] == {"Python": 1}
+    assert not any(c.endswith("/languages") for c in calls)  # no per-repo call
     assert refs[0].head_sha is None and refs[0].default_branch == "main"
     gh.list_owner_repos("acme")  # GraphQL is not retried once known to be unavailable
     assert calls.count("POST /graphql") == 1

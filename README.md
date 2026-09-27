@@ -42,7 +42,7 @@ repo-catalog scan --org my-org --llm                    # add Claude summaries (
 repo-catalog scan --org my-org --match '^svc-' --limit 20 --skip-archived
 ```
 
-Re-runs are incremental: a repo whose default-branch HEAD hasn't changed is reused without cloning or analysis. Use `--force` to rescan everything.
+Re-runs are incremental: a repo whose default-branch HEAD hasn't changed is reused without cloning or analysis. Use `--force` to rescan everything. Each repo's record is saved as soon as it finishes, so an interrupted run keeps its progress. Exit codes: `0` success, `2` the catalog was written but some repos failed (listed in `meta.failures` of `catalog.json`), `1` nothing usable. Records are pruned only when GitHub returns a complete repo list.
 
 ## What gets cataloged
 

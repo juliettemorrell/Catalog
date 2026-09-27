@@ -61,6 +61,7 @@ class RepoRef:
     head_sha: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
     custom_properties: dict[str, Any] = field(default_factory=dict)
+    properties_known: bool = True  # False when the custom-properties call failed
 
     @property
     def owner(self) -> str:
@@ -119,6 +120,8 @@ class GitHubClient:
         self._max_retries = max_retries
         self.has_token = bool(token)
         self._graphql_ok = bool(token)  # GraphQL requires authentication
+        # owners whose listing came back incomplete: never prune their records
+        self.incomplete: set[str] = set()
 
     def close(self) -> None:
         self._http.close()
@@ -168,19 +171,33 @@ class GitHubClient:
             return float(2**attempt)
         return None
 
-    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
-        resp = self._request("POST", "/graphql", json={"query": query, "variables": variables})
-        if resp.status_code != 200:
-            raise GitHubError(
-                f"GraphQL HTTP {resp.status_code}: {resp.text[:300]}", status=resp.status_code
-            )
-        body = resp.json()
-        if body.get("errors") and not body.get("data"):
-            raise GitHubError(f"GraphQL errors: {body['errors']}")
-        for err in body.get("errors") or []:
-            log.warning("GraphQL partial error: %s", err.get("message"))
-        data: dict[str, Any] = body["data"]
-        return data
+    def graphql(self, query: str, variables: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Returns (data, complete). ``complete`` is False when GitHub answered with partial
+        errors (e.g. SAML on one repo), so callers never treat the result as exhaustive."""
+        for attempt in range(self._max_retries + 1):
+            resp = self._request("POST", "/graphql", json={"query": query, "variables": variables})
+            if resp.status_code != 200:
+                raise GitHubError(
+                    f"GraphQL HTTP {resp.status_code}: {resp.text[:300]}", status=resp.status_code
+                )
+            body = resp.json()
+            errors = body.get("errors") or []
+            # GraphQL reports rate limiting as HTTP 200 with a RATE_LIMITED error
+            if any(e.get("type") == "RATE_LIMITED" for e in errors if isinstance(e, dict)):
+                if attempt >= self._max_retries:
+                    raise GitHubError("GraphQL rate limit exceeded", status=429)
+                reset = int(resp.headers.get("x-ratelimit-reset", "0") or 0)
+                wait = float(min(max(reset - time.time(), 60 * (attempt + 1)), 3600))
+                log.warning("GraphQL rate limited, retrying in %.0fs", wait)
+                time.sleep(wait)
+                continue
+            if errors and not body.get("data"):
+                raise GitHubError(f"GraphQL errors: {errors}")
+            for err in errors:
+                log.warning("GraphQL partial error: %s", err.get("message"))
+            data: dict[str, Any] = body["data"]
+            return data, not errors
+        raise AssertionError("unreachable")
 
     def paginate(self, url: str, params: dict[str, Any] | None = None) -> list[Any]:
         items: list[Any] = []
@@ -243,8 +260,9 @@ class GitHubClient:
             raise GitHubError(f"Repository {full_name}: HTTP {resp.status_code}")
         return self._ref_from_rest(resp.json())
 
-    def _ref_from_rest(self, r: dict[str, Any]) -> RepoRef:
-        langs = self._request("GET", f"/repos/{r['full_name']}/languages")
+    @staticmethod
+    def _ref_from_rest(r: dict[str, Any]) -> RepoRef:
+        # the primary language only: a /languages call per repo would cost one request each
         meta = {
             "description": r.get("description"),
             "homepage": r.get("homepage") or None,
@@ -258,7 +276,8 @@ class GitHubClient:
             "open_issues": r.get("open_issues_count"),
             "license": (r.get("license") or {}).get("spdx_id"),
             "topics": r.get("topics") or [],
-            "languages": langs.json() if langs.status_code == 200 else {},
+            "languages": {r["language"]: 1} if r.get("language") else {},
+            "languages_partial": True,
         }
         return RepoRef(
             full_name=r["full_name"],
@@ -273,13 +292,17 @@ class GitHubClient:
         refs: list[RepoRef] = []
         cursor: str | None = None
         while True:
-            data = self.graphql(_OWNER_QUERY, {"login": login, "cursor": cursor})
+            data, complete = self.graphql(_OWNER_QUERY, {"login": login, "cursor": cursor})
+            if not complete:
+                self.incomplete.add(login.lower())
             owner = data.get("repositoryOwner")
             if owner is None:
                 raise GitHubError(f"No GitHub user or organization named {login!r}")
             conn = owner["repositories"]
             for node in conn["nodes"]:
-                if node and node["owner"]["login"].lower() == login.lower():
+                if not node:  # a repo GitHub could not return: the listing is incomplete
+                    self.incomplete.add(login.lower())
+                elif node["owner"]["login"].lower() == login.lower():
                     refs.append(_ref_from_node(node))
             if not conn["pageInfo"]["hasNextPage"]:
                 break
@@ -288,24 +311,31 @@ class GitHubClient:
 
     def _get_repo_graphql(self, full_name: str) -> RepoRef:
         owner, name = full_name.split("/", 1)
-        data = self.graphql(_REPO_QUERY, {"owner": owner, "name": name})
+        data, _ = self.graphql(_REPO_QUERY, {"owner": owner, "name": name})
         if not data.get("repository"):
             raise GitHubError(f"Repository {full_name} not found or not accessible")
         return _ref_from_node(data["repository"])
 
-    def org_custom_properties(self, org: str) -> dict[str, dict[str, Any]]:
-        """Map of full_name -> {property: value}. Empty for users or without permission."""
+    def org_custom_properties(self, org: str) -> dict[str, dict[str, Any]] | None:
+        """Map of full_name -> {property: value}; empty for users. None when the call failed,
+        so callers keep the values they already have instead of wiping them."""
         try:
             rows = self.paginate(f"/orgs/{org}/properties/values")
         except GitHubError as exc:
-            log.info("Custom properties unavailable for %s (%s)", org, exc)
-            return {}
-        return {
-            row["repository_full_name"]: {
-                p["property_name"]: p["value"] for p in row.get("properties", [])
+            if exc.status == 404:  # a user account, or properties not enabled
+                return {}
+            log.warning("Custom properties unavailable for %s (%s)", org, exc)
+            return None
+        try:
+            return {
+                row["repository_full_name"]: {
+                    p["property_name"]: p["value"] for p in row.get("properties") or []
+                }
+                for row in rows
             }
-            for row in rows
-        }
+        except (TypeError, KeyError, AttributeError):
+            log.warning("Custom properties for %s had an unexpected shape; ignoring", org)
+            return None
 
     def dependency_sbom(self, full_name: str) -> dict[str, Any] | None:
         """GitHub's dependency graph as SPDX JSON (needs the dependency graph enabled and

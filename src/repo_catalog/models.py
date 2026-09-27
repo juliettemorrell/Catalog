@@ -356,3 +356,5 @@ class CatalogMeta(_Model):
     repo_count: int
     asset_count: int
     llm_enriched: bool = False
+    # repos whose latest scan failed in the run that wrote this catalog: id -> error
+    failures: dict[str, str] = Field(default_factory=dict)

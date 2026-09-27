@@ -12,6 +12,7 @@ import yaml
 
 from .. import __version__
 from ..models import AIAsset, Repo
+from .store import write_atomic
 
 _BACKSTAGE_TYPE = {
     "service": "service",
@@ -128,8 +129,8 @@ def backstage_entities(repos: list[Repo]) -> list[dict[str, object]]:
 
 
 def write_backstage(path: Path, repos: list[Repo]) -> None:
-    path.write_text(
-        yaml.safe_dump_all(backstage_entities(repos), sort_keys=False, allow_unicode=True)
+    write_atomic(
+        path, yaml.safe_dump_all(backstage_entities(repos), sort_keys=False, allow_unicode=True)
     )
 
 
@@ -207,7 +208,7 @@ def aibom(repos: list[Repo], assets: list[AIAsset], source: str) -> dict[str, ob
 
 
 def write_aibom(path: Path, repos: list[Repo], assets: list[AIAsset], source: str) -> None:
-    path.write_text(json.dumps(aibom(repos, assets, source), indent=1))
+    write_atomic(path, json.dumps(aibom(repos, assets, source), indent=1))
 
 
 _CDX_SCOPE = {"dev": "optional", "build": "excluded", "optional": "optional"}
@@ -317,7 +318,7 @@ def write_sboms(folder: Path, repos: list[Repo]) -> None:
     for r in repos:
         name = re.sub(r"[^A-Za-z0-9._-]+", "__", r.id) + ".cdx.json"
         wanted.add(name)
-        (folder / name).write_text(json.dumps(repo_sbom(r), indent=1))
+        write_atomic(folder / name, json.dumps(repo_sbom(r), indent=1))
     for old in folder.glob("*.cdx.json"):
         if old.name not in wanted:
             old.unlink()

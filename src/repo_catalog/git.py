@@ -106,33 +106,56 @@ def sync(
         log.warning("discarding unusable clone at %s", dest)
         shutil.rmtree(dest)
     if dest.exists():
-        if (
-            not shallow
-            and _run(["rev-parse", "--is-shallow-repository"], cwd=dest).strip() == "true"
-        ):
-            depth = ["--unshallow", "--filter=blob:none"]
-        ref = f"refs/heads/{branch}" if branch else "HEAD"
-        _run(["fetch", "--no-tags", "--force", *depth, "origin", ref], cwd=dest, env=env)
-        _run(["reset", "--hard", "--quiet", "FETCH_HEAD"], cwd=dest)
-        _run(["clean", "-fdxq"], cwd=dest)
-    else:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        branch_args = ["--branch", branch] if branch else []
-        _run(
-            [
-                "clone",
-                "--quiet",
-                "--no-tags",
-                "--single-branch",
-                *depth,
-                *branch_args,
-                "--",
-                url,
-                str(dest),
-            ],
-            env=env,
-        )
+        try:
+            _update(dest, branch, depth, shallow, env)
+            return head_sha(dest)
+        except GitError as exc:
+            # a run killed mid-command leaves lock files behind; clear them and retry once
+            if _remove_stale_locks(dest):
+                try:
+                    _update(dest, branch, depth, shallow, env)
+                    return head_sha(dest)
+                except GitError:
+                    pass
+            log.warning("re-cloning %s after a failed update: %s", dest.name, exc)
+            shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    branch_args = ["--branch", branch] if branch else []
+    _run(
+        [
+            "clone",
+            "--quiet",
+            "--no-tags",
+            "--single-branch",
+            *depth,
+            *branch_args,
+            "--",
+            url,
+            str(dest),
+        ],
+        env=env,
+    )
     return head_sha(dest)
+
+
+def _update(
+    dest: Path, branch: str | None, depth: list[str], shallow: bool, env: dict[str, str]
+) -> None:
+    if not shallow and _run(["rev-parse", "--is-shallow-repository"], cwd=dest).strip() == "true":
+        depth = ["--unshallow", "--filter=blob:none"]
+    ref = f"refs/heads/{branch}" if branch else "HEAD"
+    _run(["fetch", "--no-tags", "--force", *depth, "origin", ref], cwd=dest, env=env)
+    _run(["reset", "--hard", "--quiet", "FETCH_HEAD"], cwd=dest)
+    _run(["clean", "-fdxq"], cwd=dest)
+
+
+def _remove_stale_locks(dest: Path) -> bool:
+    """Scans of one clone never overlap, so any lock file left in .git is stale."""
+    git_dir = dest / ".git"
+    locks = [p for p in git_dir.rglob("*.lock") if p.is_file() and not p.is_symlink()]
+    for lock in locks:
+        lock.unlink(missing_ok=True)
+    return bool(locks)
 
 
 def head_sha(repo: Path) -> str:

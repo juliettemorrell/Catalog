@@ -6,6 +6,7 @@ import hashlib
 import logging
 import re
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -68,13 +69,20 @@ class ScanReport:
 
 
 def scan_all(
-    refs: list[RepoRef], opts: ScanOptions, previous: dict[str, tuple[Repo, list[AIAsset]]]
+    refs: list[RepoRef],
+    opts: ScanOptions,
+    previous: dict[str, tuple[Repo, list[AIAsset]]],
+    on_result: Callable[[ScanResult], None] | None = None,
 ) -> ScanReport:
+    """``on_result`` runs as each repo finishes, so a killed run keeps finished work."""
     report = ScanReport()
     gh = GitHubClient(opts.token) if opts.github_sbom and opts.token else None
 
     def one(ref: RepoRef) -> ScanResult:
         prev = previous.get(ref.full_name)
+        if prev and not ref.properties_known:  # the lookup failed: keep what we had
+            ref.custom_properties = prev[0].declared.custom_properties
+            ref.properties_known = True
         if prev and not ref.head_sha:
             ref.head_sha = git.remote_head(ref.clone_url, opts.token, ref.default_branch)
         if prev and not opts.force and _unchanged(ref, prev[0], opts):
@@ -102,22 +110,44 @@ def scan_all(
         for fut in as_completed(futures):
             ref = futures[fut]
             try:
-                report.results.append(fut.result())
+                result = fut.result()
             except Exception as exc:
                 log.error("scan failed for %s: %s", ref.full_name, exc)
-                report.failures[ref.full_name] = f"{type(exc).__name__}: {exc}"[:500]
+                report.failures[ref.full_name] = _relative_error(exc, opts.workdir)
+                continue
+            report.results.append(result)
+            if on_result is not None:
+                try:
+                    on_result(result)
+                except OSError as exc:
+                    log.error("could not save %s: %s", ref.full_name, exc)
     report.results.sort(key=lambda r: r.repo.id.lower())
     mark_duplicates([a for r in report.results for a in r.assets])
     return report
 
 
+def _relative_error(exc: Exception, workdir: Path) -> str:
+    """Error text without the scanner host's absolute clone path."""
+    text = f"{type(exc).__name__}: {exc}"
+    for root in {str(workdir.resolve()), str(workdir)}:
+        text = text.replace(root + "/", "").replace(root, ".")
+    return text[:500]
+
+
 def _unchanged(ref: RepoRef, prev: Repo, opts: ScanOptions) -> bool:
+    m = ref.meta
     return (
         bool(ref.head_sha)
         and ref.head_sha == prev.head_sha
         and prev.scan_fingerprint == opts.fingerprint()
+        and ref.default_branch == prev.default_branch
         # declared metadata from org custom properties is part of the record
         and ref.custom_properties == prev.declared.custom_properties
+        # GitHub-side fields that feed flags, building blocks, the summary and practices
+        and bool(m.get("archived")) == prev.archived
+        and bool(m.get("is_template")) == prev.is_template
+        and (m.get("description") or None) == (prev.description or None)
+        and list(m.get("topics") or []) == list(prev.topics)
     )
 
 
@@ -131,6 +161,8 @@ def _refresh_meta(repo: Repo, ref: RepoRef) -> Repo:
             "homepage",
             "visibility",
             "archived",
+            "fork",
+            "is_template",
             "stars",
             "open_issues",
             "topics",
@@ -139,6 +171,8 @@ def _refresh_meta(repo: Repo, ref: RepoRef) -> Repo:
         )
         if k in m
     }
+    if m.get("languages") and not m.get("languages_partial"):
+        update["github_languages"] = m["languages"]
     repo = repo.model_copy(update=update)
     repo.lifecycle = _lifecycle(
         repo.archived, repo.ownership.last_commit or repo.pushed_at, repo.declared.lifecycle

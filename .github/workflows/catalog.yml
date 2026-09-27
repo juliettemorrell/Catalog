@@ -81,7 +81,14 @@ jobs:
           args=(--org "$ORG" --out data --workers 6 --osv --github-sbom)
           if [ "$LLM" = "true" ]; then args+=(--llm); fi
           if [ "$FORCE" = "true" ]; then args+=(--force); fi
-          uv run repo-catalog scan "${args[@]}"
+          # exit 2: the catalog was written but some repos failed; publish it and warn
+          rc=0
+          uv run repo-catalog scan "${args[@]}" || rc=$?
+          if [ "$rc" -eq 2 ]; then
+            echo "::warning::Some repositories failed to scan; see the log and meta.failures in catalog.json"
+          elif [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

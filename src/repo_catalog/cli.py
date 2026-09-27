@@ -207,28 +207,38 @@ def cmd_scan(args: argparse.Namespace) -> int:
     results: list[ScanResult] = []
     failures: dict[str, str] = {}
     discovered: set[str] = set()
+    incomplete: set[str] = set()
+
+    def save(result: ScanResult) -> None:  # as each repo finishes: a killed run keeps work
+        store.write_repo(args.out, result.repo, result.assets)
 
     if args.org or args.repo:
         try:
-            refs = _discover(args)
+            refs, incomplete = _discover(args)
         except (GitHubError, httpx.HTTPError) as exc:
             sys.exit(f"GitHub discovery failed: {exc}")
         discovered.update(r.full_name for r in refs)
         log.info("scanning %d repositories", len(refs))
-        report = scan_all(refs, opts, previous)
+        report = scan_all(refs, opts, previous, on_result=save)
         results += report.results
         failures.update(report.failures)
-    local = [pair for path in args.local for pair in _local_refs(path)]
+    local = _local_refs(args.local)
+    if args.local and not local and not (args.org or args.repo):
+        log.error("no git repositories found under %s", ", ".join(map(str, args.local)))
+        return 1
     if local:
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
             futures = {pool.submit(analyze_checkout, ref, root, opts): ref for ref, root in local}
             for fut, ref in futures.items():
                 discovered.add(ref.full_name)
                 try:
-                    results.append(fut.result())
+                    result = fut.result()
                 except Exception as exc:
                     log.error("scan failed for %s: %s", ref.full_name, exc)
                     failures[ref.full_name] = f"{type(exc).__name__}: {exc}"[:500]
+                    continue
+                results.append(result)
+                save(result)
     fresh = len(results)
 
     for failed in failures:  # keep last good data rather than dropping the repo
@@ -251,12 +261,16 @@ def cmd_scan(args: argparse.Namespace) -> int:
             for o in args.org
             if any(d.lower().startswith(o.lower() + "/") for d in discovered)
         }
+        for owner in sorted(owners & incomplete):
+            log.warning("GitHub returned an incomplete repo list for %s; not pruning", owner)
+        owners -= incomplete
         removed = store.prune(args.out, discovered | set(failures), owners)
         if removed:
             log.info("pruned %d repos no longer in %s", len(removed), ", ".join(sorted(owners)))
+            _prune_clones(args.workdir, removed)
 
     source = ",".join([f"org:{o}" for o in args.org] + args.repo + [str(p) for p in args.local])
-    _build(args.out, source, llm=args.llm, osv=args.osv)
+    _build(args.out, source, llm=args.llm, osv=args.osv, failures=failures)
     log.info(
         "done: %d repos (%d scanned, %d reused), %d failed",
         len(results),
@@ -266,21 +280,50 @@ def cmd_scan(args: argparse.Namespace) -> int:
     )
     for name, err in failures.items():
         log.warning("FAILED %s: %s", name, err)
-    return 1 if failures and not fresh else 0
+    # 1: nothing usable; 2: the catalog was written but some repos failed (see meta)
+    if failures:
+        return 1 if not fresh else 2
+    return 0
 
 
-def _discover(args: argparse.Namespace) -> list[RepoRef]:
+def _prune_clones(workdir: Path, slugs: list[str]) -> None:
+    """Drop the clones of repos that were deleted or renamed, so the workdir stays bounded."""
+    import shutil
+
+    root = workdir.resolve()
+    for slug in slugs:
+        owner, _, name = slug.partition("__")
+        clone = (root / owner / name).resolve()
+        if name and clone.parent.parent == root and clone.is_dir():
+            shutil.rmtree(clone, ignore_errors=True)
+
+
+def _discover(args: argparse.Namespace) -> tuple[list[RepoRef], set[str]]:
+    """Refs to scan, plus the owners whose listing GitHub returned incomplete."""
     with GitHubClient(args.token) as gh:
         refs: list[RepoRef] = []
+        props_cache: dict[str, dict[str, dict[str, object]] | None] = {}
+
+        def props_for(owner: str) -> dict[str, dict[str, object]] | None:
+            if owner.lower() not in props_cache:
+                props_cache[owner.lower()] = gh.org_custom_properties(owner)
+            return props_cache[owner.lower()]
+
+        def attach(ref: RepoRef) -> RepoRef:
+            props = props_for(ref.owner)
+            if props is None:
+                ref.properties_known = False
+            else:
+                ref.custom_properties = props.get(ref.full_name, {})
+            return ref
+
         for org in args.org:
             owner_refs = gh.list_owner_repos(org)
             if not owner_refs:
                 log.warning("no repositories visible for %s (check token access)", org)
-            props = gh.org_custom_properties(org)
-            for ref in owner_refs:
-                ref.custom_properties = props.get(ref.full_name, {})
-            refs += owner_refs
-        refs += [gh.get_repo(name) for name in args.repo]
+            refs += [attach(ref) for ref in owner_refs]
+        refs += [attach(gh.get_repo(name)) for name in args.repo]
+        incomplete = set(gh.incomplete)
     seen: set[str] = set()
     out = []
     for ref in refs:
@@ -299,26 +342,55 @@ def _discover(args: argparse.Namespace) -> list[RepoRef]:
             continue
         seen.add(ref.full_name)
         out.append(ref)
-    return out[: args.limit] if args.limit else out
+    return (out[: args.limit] if args.limit else out), incomplete
 
 
 _GITHUB_REMOTE = re.compile(r"github\.com[:/]+([^/]+)/([^/]+?)(?:\.git)?/*$")
 
 
-def _local_refs(path: Path) -> list[tuple[RepoRef, Path]]:
-    path = path.resolve()
-    roots = (
-        [path]
-        if (path / ".git").exists()
-        else sorted(p for p in path.iterdir() if p.is_dir() and (p / ".git").exists())
-    )
-    if not roots:
-        log.warning("no git repositories found in %s", path)
+_SKIP_DIRS = {"node_modules", "vendor", "__pycache__"}
+
+
+def _find_git_roots(path: Path, depth: int = 3) -> list[Path]:
+    """Git work trees at or below ``path`` (e.g. a folder of clones, or the scanner's own
+    ``workdir/<owner>/<repo>`` layout). Nested repos inside a found repo are not listed."""
+    if (path / ".git").exists():
+        return [path]
+    if depth == 0:
+        return []
+    try:
+        children = sorted(p for p in path.iterdir() if p.is_dir() and not p.is_symlink())
+    except OSError:
+        return []
+    return [
+        root
+        for child in children
+        if not child.name.startswith(".") and child.name not in _SKIP_DIRS
+        for root in _find_git_roots(child, depth - 1)
+    ]
+
+
+def _local_refs(paths: list[Path]) -> list[tuple[RepoRef, Path]]:
+    found: list[tuple[Path, Path]] = []  # (--local folder, repo root)
+    for path in (p.resolve() for p in paths):
+        roots = _find_git_roots(path)
+        if not roots:
+            log.warning("no git repositories found in %s", path)
+        found += [(path, root) for root in roots]
+    names = [root.name for _, root in found]
     refs = []
-    for root in roots:
+    seen: set[str] = set()
+    for base, root in found:
         remote = _git(root, "remote", "get-url", "origin")
         m = _GITHUB_REMOTE.search(remote or "")
-        full_name = f"{m.group(1)}/{m.group(2)}" if m else f"local/{root.name}"
+        local_name = root.name
+        if names.count(root.name) > 1:  # same folder name twice: qualify by its path
+            local_name = "-".join((base.name, *root.relative_to(base).parts))
+        full_name = f"{m.group(1)}/{m.group(2)}" if m else f"local/{local_name}"
+        if full_name.lower() in seen:
+            log.warning("skipping %s: another checkout of %s was already found", root, full_name)
+            continue
+        seen.add(full_name.lower())
         html = f"https://github.com/{full_name}" if m else root.as_uri()
         branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
         ref = RepoRef(
@@ -366,7 +438,9 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
-def _build(out: Path, source: str, llm: bool, osv: bool = False) -> None:
+def _build(
+    out: Path, source: str, llm: bool, osv: bool = False, failures: dict[str, str] | None = None
+) -> None:
     prev = store.load_previous(out)
     repos: list[Repo] = sorted((r for r, _ in prev.values()), key=lambda r: r.id.lower())
     assets: list[AIAsset] = [
@@ -378,7 +452,7 @@ def _build(out: Path, source: str, llm: bool, osv: bool = False) -> None:
         hits = apply_vulnerabilities(repos, Path(".cache/osv"))
         log.info("OSV: %d vulnerable dependency versions", hits)
     llm = llm or any(r.summary.source == "llm" for r in repos)
-    meta = store.write_aggregates(out, repos, assets, source, llm)
+    meta = store.write_aggregates(out, repos, assets, source, llm, failures or {})
     build_sqlite(out / DB_FILE, repos, assets, dump_meta(meta.model_dump(mode="json")))
     exports.write_backstage(out / "backstage-entities.yaml", repos)
     exports.write_aibom(out / "ai-bom.cdx.json", repos, assets, source)
