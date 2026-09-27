@@ -20,6 +20,7 @@ from ..models import CrossRef, Package, Reusable
 from ..textutil import load_json, load_yaml
 from .docs import first_sentence
 from .manifests import NON_PRODUCT_DIR
+from .stack import VENDORED
 
 MAX_REUSABLES = 300
 MAX_REFS = 500
@@ -229,6 +230,11 @@ def _templates(files: RepoFiles, is_template: bool, repo_name: str, out: list[Re
 _PROTO_SERVICE = re.compile(r"^[ \t]*service\s+(\w+)\s*\{", re.M)
 _PROTO_RPC = re.compile(r"^[ \t]*rpc\s+(\w+)\s*\(", re.M)
 _PROTO_PKG = re.compile(r"^[ \t]*package\s+([\w.]+)\s*;", re.M)
+# protobuf packages of well-known third-party APIs: a copy of them is not the org's API
+_THIRD_PARTY_PROTO = re.compile(
+    r"^(opentelemetry|google|grpc|envoy|xds|udpa|validate|gogoproto|k8s\.io|istio|"
+    r"prometheus|jaeger|zipkin|io\.prometheus|grpc_gateway)(\.|$)"
+)
 _GQL_ROOT = re.compile(r"\btype\s+(Query|Mutation|Subscription)\b[^{}]{0,200}\{")
 
 
@@ -247,15 +253,17 @@ def _graphql_roots(text: str) -> list[tuple[str, str]]:
 def _apis(files: RepoFiles, api_specs: list[str], out: list[Reusable]) -> None:
     protos: dict[str, dict[str, Any]] = {}
     for path in api_specs:
-        if NON_PRODUCT_DIR.search(path):
+        if NON_PRODUCT_DIR.search(path) or VENDORED.search(path):
             continue
         text = files.read(path) or ""
         if not text:
             continue
         if path.endswith(".proto"):
             services = _PROTO_SERVICE.findall(text)
+            pkg = _PROTO_PKG.search(text)
+            if pkg and _THIRD_PARTY_PROTO.match(pkg.group(1)):
+                continue  # a vendored OpenTelemetry/Google/gRPC proto, not the org's API
             if services:  # message-only protos are types, not APIs
-                pkg = _PROTO_PKG.search(text)
                 protos[path] = {
                     "format": "grpc",
                     "package": pkg.group(1) if pkg else None,

@@ -16,7 +16,7 @@ _BADGE = re.compile(
     r"\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)|!\[[^\]]*\]\([^)]*\)|"  # inline badges / images
     r"\[!\[[^\]]*\]\[[^\]]*\]\]\[[^\]]*\]|!\[[^\]]*\]\[[^\]]*\]"  # reference-style badges
 )
-_HTML = re.compile(r"<[^<>\n]{1,400}>")
+_HTML = re.compile(r"<[A-Za-z/!][^<>]{0,400}>")  # tags may span lines
 _LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)|\[([^\]]+)\]\[[^\]]*\]")
 _REF_DEF = re.compile(r"^[ \t]*\[[^\]]+\]:\s*\S+.*$", re.M)
 _FENCE = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.S | re.M)
@@ -50,7 +50,9 @@ def summarize_readme(files: RepoFiles) -> tuple[Summary, str]:
         return Summary(), ""
     body = _strip_noise(text)
     title = _title(body)
-    excerpt = _first_paragraphs(body, title)
+    # the lead (text before the first "##" section) describes the repo; later sections are
+    # setup steps and notes, used only when there is no lead at all
+    excerpt = _first_paragraphs(body, title, lead_only=True) or _first_paragraphs(body, title)
     features = _features(body)
     return Summary(
         readme_title=title,
@@ -110,17 +112,58 @@ def _is_nav(block: str) -> bool:
     return len(re.sub(r"[\W_]+", "", _HTML.sub("", without))) < 20
 
 
-def _first_paragraphs(body: str, title: str | None, limit: int = 700) -> str | None:
+# Calls to action, admonitions and pointers elsewhere: never a description of the repo.
+_BOILERPLATE = re.compile(
+    r"^(click|see |note\b|warning\b|important\b|caution\b|tip\b|\[!|for more|learn more|"
+    r"read more|check out|visit |join |please |if you |star |copyright|\(c\)|built with |"
+    r"made with |maintained by|install|to get started|table of contents|contents\b|"
+    r"this (?:repository|project) (?:is|has been) (?:archived|deprecated|no longer))",
+    re.I,
+)
+
+
+_INTRO_HEADING = re.compile(
+    r"^(introduction|intro|overview|about\b.*|description|summary|what is\b.*|what'?s this)\W*$",
+    re.I,
+)
+
+
+def _is_heading(b: str) -> int:
+    """Heading level of a block (0 when it is not a heading)."""
+    m = re.match(r"^(#{1,6})\s", b)
+    if m:
+        return len(m.group(1))
+    m = re.match(r"^[^\n]+\n([=-])+\s*$", b)
+    if m:
+        return 1 if m.group(1) == "=" else 2
+    m = re.fullmatch(r"<h([1-6])\b[^>]*>.*?</h\1>", b, re.I | re.S)
+    return int(m.group(1)) if m else 0
+
+
+def _first_paragraphs(
+    body: str, title: str | None, limit: int = 700, *, lead_only: bool = False
+) -> str | None:
     paras: list[str] = []
+    # an ATX heading directly followed by text ("## Intro\nWelcome...") is its own block
+    body = re.sub(r"^(#{1,6}[ \t].*)$", "\n\\1\n", body, flags=re.M)
+    body = re.sub(r"^([^\n]*\w[^\n]*\n(?:={3,}|-{3,})[ \t]*)$", "\n\\1\n", body, flags=re.M)
+    first_heading = True
     for block in re.split(r"\n\s*\n", body):
         b = block.strip()
         if not b or b.startswith(("|", "---", "===", "***")) or re.match(r"^[-*+]\s", b):
             continue
-        if b.startswith("#") or re.match(r"^[^\n]+\n[=-]+\s*$", b):
+        level = _is_heading(b)
+        if level:
             if paras:
                 break
+            # the first heading is the title whatever its level; the lead may also sit
+            # under an "Introduction"/"Overview"/"About" section
+            intro = first_heading or _INTRO_HEADING.search(_clean(b))
+            first_heading = False
+            if lead_only and level >= 2 and not intro:
+                break
             continue
-        if _is_nav(b):
+        if _is_nav(b) or b.startswith(">"):  # blockquotes are notes and callouts
             continue
         cleaned = _clean(b)
         if title and re.match(re.escape(title) + r"\s*(?:[:\-\u2013\u2014|]|$)", cleaned):
@@ -128,7 +171,9 @@ def _first_paragraphs(body: str, title: str | None, limit: int = 700) -> str | N
         if (
             len(cleaned) < 12
             or " " not in cleaned
-            or cleaned.lower().startswith(("table of contents", "contents"))
+            or _BOILERPLATE.match(cleaned)
+            # "See the slides here:" only introduces a link or list
+            or (cleaned.endswith(":") and len(cleaned) < 120)
         ):
             continue
         paras.append(cleaned)
@@ -149,6 +194,29 @@ def _features(body: str, max_items: int = 10) -> list[str]:
     section = section[: nxt.start()] if nxt else section
     items = [_clean(x) for x in re.findall(r"^[ \t]*[-*+]\s+(.+)$", section, re.M)]
     return [i for i in items if 3 < len(i) < 200][:max_items]
+
+
+def readme_lead(text: str | None) -> str | None:
+    """First sentence of the README's lead (before the first "##" section), or None."""
+    if not text:
+        return None
+    body = _strip_noise(text)
+    return first_sentence(_first_paragraphs(body, _title(body), lead_only=True))
+
+
+_PLACEHOLDER_DESC = re.compile(
+    r"^\s*(add (a|your) (short )?description( here)?|(a )?short description|description|todo|"
+    r"tbd|n/?a|none|your (package|project) description|a new (flutter|dart|rust|python) "
+    r"(project|package|module)|an? (sample|example|simple) (python )?project|"
+    r"my (awesome |new |first )?(project|app|package)|default template for .*|"
+    r"generated (by|with) .*)[.!]?\s*$",
+    re.I,
+)
+
+
+def is_placeholder_description(text: str | None) -> bool:
+    """Scaffolding defaults ("Add your description here" from uv init, ...)."""
+    return not text or bool(_PLACEHOLDER_DESC.match(text)) or len(text.strip()) < 4
 
 
 def first_sentence(text: str | None) -> str | None:
@@ -241,6 +309,33 @@ def parse_declared(
             value = ",".join(map(str, val)) if isinstance(val, list) else _s(val)
             setattr(declared, attr, value)
     return declared
+
+
+def declared_description(files: RepoFiles) -> str | None:
+    """The description a team wrote in its catalog descriptor (Backstage Component
+    ``metadata.description``, Cortex ``info.description``, OpsLevel/Compass ``description``)."""
+    for path in _DESCRIPTORS:
+        text = files.read(path, 500_000)
+        if not text:
+            continue
+        try:
+            docs = [d for d in load_yaml_all(text) if isinstance(d, dict)]
+        except Exception:  # parse_declared records the error
+            continue
+        docs.sort(key=lambda d: _KIND_RANK.get(d.get("kind"), 5))
+        for doc in docs:
+            if "backstage.io" in str(doc.get("apiVersion", "")):
+                if doc.get("kind") not in ("Component", None):
+                    continue
+                desc = _s(_dict(doc.get("metadata")).get("description"))
+            elif isinstance(doc.get("info"), dict):
+                desc = _s(doc["info"].get("description"))
+            else:
+                svc = doc.get("service") or doc.get("component") or doc
+                desc = _s(svc.get("description")) if isinstance(svc, dict) else None
+            if desc and not is_placeholder_description(desc):
+                return " ".join(desc.split())[:500]
+    return None
 
 
 def _backstage(doc: dict[str, Any], d: Declared) -> None:

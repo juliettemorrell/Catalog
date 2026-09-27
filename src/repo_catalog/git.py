@@ -198,7 +198,9 @@ def is_shallow(repo: Path) -> bool:
         return True
 
 
-def repo_history(repo: Path, top: int = 10) -> RepoHistory | None:
+def repo_history(repo: Path, top: int | None = None) -> RepoHistory | None:
+    """Commit count, first/last commit and every author (most commits first, or the
+    ``top`` most active), so callers can report a true contributor count."""
     try:
         out = _run(["log", "--no-merges", "--format=%aN%x09%aI", "HEAD"], cwd=repo, timeout=300)
     except GitError as exc:

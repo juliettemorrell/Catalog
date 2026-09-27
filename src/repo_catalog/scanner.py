@@ -18,13 +18,20 @@ from .analyzers.ai_code import scan_code
 from .analyzers.ai_common import RepoContext
 from .analyzers.ai_files import FileDetector
 from .analyzers.ai_risk import asset_flags
-from .analyzers.docs import first_sentence, parse_codeowners, parse_declared, summarize_readme
+from .analyzers.docs import (
+    declared_description,
+    is_placeholder_description,
+    parse_codeowners,
+    parse_declared,
+    readme_lead,
+    summarize_readme,
+)
 from .analyzers.flags import repo_flags, runtime_versions
 from .analyzers.manifests import parse_manifests
 from .analyzers.practices import assess_practices
 from .analyzers.purls import PACKAGE_ECOSYSTEMS, merge_github_sbom, summarize
 from .analyzers.reusables import find_references, find_reusables
-from .analyzers.stack import analyze_stack
+from .analyzers.stack import AUX_DIR, analyze_stack
 from .fs import RepoFiles
 from .github import GitHubClient, RepoRef
 from .models import AIAsset, AIUsageSummary, Contributor, Ownership, Repo
@@ -33,6 +40,7 @@ log = logging.getLogger(__name__)
 
 MAX_PROVENANCE_LOOKUPS = 2000
 MAX_DEPENDENCIES = 15_000
+_TESTISH = re.compile(r"(^|/)(tests?|testing|testdata|fixtures?|__tests__|e2e)(/|$)", re.I)
 
 
 @dataclass
@@ -217,9 +225,14 @@ def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanRes
         detector.mcp_provided | code.mcp_provided,
         stack.ai,
     )
-    if ai_summary.mcp_servers_provided and structure.repo_type in {
+    # an MCP server is the product only when it lives outside examples, docs and tests
+    product_server = any(
+        a.kind == "mcp-server" and not AUX_DIR.search(a.path) and not _TESTISH.search(a.path)
+        for a in assets
+    )
+    # a CLI that also offers an MCP mode (``tool mcp``) stays a CLI
+    if product_server and structure.repo_type in {
         "library",
-        "cli",
         "service",
         "scripts",
         "other",
@@ -233,8 +246,9 @@ def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanRes
         ownership.commit_count = history.commit_count
         ownership.first_commit = history.first_commit
         ownership.last_commit = history.last_commit
+        # history lists every author (most commits first): count them all, keep the top 10
         ownership.top_contributors = [
-            Contributor(name=n, commits=c) for n, c in history.contributors
+            Contributor(name=n, commits=c) for n, c in history.contributors[:10]
         ]
         ownership.contributor_count = len(history.contributors)
 
@@ -260,13 +274,30 @@ def analyze_checkout(ref: RepoRef, checkout: Path, opts: ScanOptions) -> ScanRes
     references = find_references(files, workflows)
 
     # ---- summary ----
-    manifest_desc = min(manifests.descriptions, default=(0, None))[1]
+    # GitHub description, then what the team declared (catalog-info), then the ROOT
+    # manifest (a nested package describes itself, not the repo), then the README lead
+    descriptor_desc = declared_description(files)
+    manifest_desc = next(
+        (
+            p.description
+            for p in manifests.packages
+            if p.path == "" and not is_placeholder_description(p.description)
+        ),
+        None,
+    )
     if meta.get("description"):
         summary.one_liner, summary.source = meta["description"], "github"
+    elif descriptor_desc:
+        summary.one_liner, summary.source = descriptor_desc, "manifest"
     elif manifest_desc:
-        summary.one_liner, summary.source = manifest_desc, "manifest"
+        summary.one_liner, summary.source = " ".join(manifest_desc.split()), "manifest"
     else:
-        summary.one_liner = first_sentence(summary.readme_excerpt)
+        lead = readme_lead(readme)
+        title = summary.readme_title
+        if not lead and title and len(title.split()) >= 2:
+            lead = title  # "Spring PetClinic Sample Application" beats a setup step
+        summary.one_liner = lead
+        summary.source = "readme" if lead else "none"
 
     practices = assess_practices(
         files,
@@ -432,7 +463,7 @@ def mark_duplicates(assets: list[AIAsset]) -> None:
     for a in assets:
         if (
             a.content_sha
-            and a.kind not in ("sdk-usage", "mcp-config", "hook")
+            and a.kind not in ("sdk-usage", "mcp-config", "settings", "hook")
             and a.word_count >= 10
         ):
             groups[a.content_sha].append(a)

@@ -19,10 +19,20 @@ _TEST_PATH = re.compile(
     re.IGNORECASE,
 )
 _NOT_TEST = re.compile(r"\.(md|mdx|rst|txt|ya?ml|json|lock|svg|png|jpe?g)$", re.I)
+# a test is source code: fixtures and data files (test/fixture.bin, test/data.csv) are not
+_TEST_SOURCE = re.compile(
+    r"\.(py|pyi|[cm]?[jt]sx?|go|rs|java|kt|kts|scala|groovy|rb|php|cs|fs|vb|swift|dart|exs?|"
+    r"erl|clj[sc]?|hs|ml|c|cc|cpp|cxx|h|hpp|m|mm|lua|r|jl|sh|bats|ps1|pl|t|zig|nim|vue|"
+    r"svelte|feature|robot|sql)$",
+    re.I,
+)
 _TEST_CMD = re.compile(
-    r"\b(pytest|tox|nox|jest|vitest|mocha|go test|cargo test|mvn\b.*\btest|gradle\w*\s+.*test|"
-    r"npm (run )?test|pnpm (run )?test|yarn test|bun test|rspec|phpunit|dotnet test|make test|"
-    r"playwright test|cypress run)\b",
+    r"\b(pytest|tox|nox|jest|vitest|mocha|go test|cargo test|cargo nextest|"
+    r"mvnw?(?:\.cmd)?\s[^\n]*\b(?:test|verify|install|package)|"
+    r"gradlew?(?:\.bat)?\s[^\n]*\b(?:test|check|build)|"
+    r"npm (run )?test|pnpm (run )?test|yarn test|bun test|rspec|phpunit|pest|artisan test|"
+    r"dotnet test|make test|playwright test|cypress run|ctest|swift test|mix test|flutter test)\b|"
+    r"\}\}\s+(?:test|nextest)\b",  # ${{ env.CARGO }} test
     re.IGNORECASE,
 )
 _USES = re.compile(r"uses:\s*['\"]?([\w.-]+/[\w./-]+)@([\w.-]+)")
@@ -201,7 +211,11 @@ def assess_practices(
         )
 
     test_files = [
-        f.path for f in files.files if _TEST_PATH.search(f.path) and not _NOT_TEST.search(f.path)
+        f.path
+        for f in files.files
+        if _TEST_PATH.search(f.path)
+        and not _NOT_TEST.search(f.path)
+        and _TEST_SOURCE.search(f.path)
     ]
     check(
         "tests",

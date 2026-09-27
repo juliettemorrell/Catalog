@@ -37,6 +37,12 @@ _SECRETS: dict[str, str] = {
     "Hugging Face token": r"\bhf_[A-Za-z0-9]{34}\b",
     "SendGrid key": r"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b",
     "Azure storage key": r"AccountKey=[A-Za-z0-9+/]{80,}={0,2}",
+    "Twilio API key": r"\bSK[0-9a-f]{32}\b",
+    "npm auth token": r"(?:_authToken|npmAuthToken)[ \t]*[=:][ \t]*['\"]?(?!\$)[A-Za-z0-9_\-.+/=]{20,}",
+    # a connection string with an inline password (checked further in _dsn_ok)
+    "Database URL with password": r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|"
+    r"amqps?|mssql|sqlserver|oracle)(?:\+\w+)?://([^:@/\s'\"]{1,64}):([^@\s'\"]{8,128})@"
+    r"([A-Za-z0-9.-]{3,253})",
     # header plus a real base64 body (code that only parses PEM headers is not a leak)
     "Private key": r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----(?:\\[nr]|\s)+(?:[A-Za-z0-9+/=]{40,}(?:\\[nr]|\s)+){2,}",
 }
@@ -57,6 +63,9 @@ _HINTS: dict[str, tuple[str, ...]] = {
     "Hugging Face token": ("hf_",),
     "SendGrid key": ("SG.",),
     "Azure storage key": ("AccountKey=",),
+    "Twilio API key": ("SK",),
+    "npm auth token": ("uthToken",),
+    "Database URL with password": ("://",),
     "Private key": ("PRIVATE KEY",),
 }
 _SECRET_RXS = [(label, _HINTS[label], re.compile(rx)) for label, rx in _SECRETS.items()]
@@ -116,6 +125,44 @@ _TESTISH = re.compile(
 )
 
 
+_WEAK_PASSWORDS = frozenset(
+    {
+        "password",
+        "passwd",
+        "pass",
+        "secret",
+        "changeme",
+        "change_me",
+        "admin",
+        "root",
+        "postgres",
+        "mysql",
+        "redis",
+        "guest",
+        "user",
+        "test",
+        "example",
+        "default",
+        "letmein",
+        "12345678",
+        "password123",
+    }
+)
+
+
+def _dsn_ok(m: re.Match[str]) -> bool:
+    """A real-looking inline password on a real host, not a local/dev or templated one."""
+    user, password, host = m.group(1), m.group(2), m.group(3).lower()
+    if re.search(r"[${}<>%*]", password) or password.lower() in _WEAK_PASSWORDS:
+        return False
+    if password.lower() == user.lower() or "." not in host or host.startswith("127."):
+        return False  # docker-compose service names (db, postgres) and localhost
+    if host in ("localhost", "0.0.0.0", "host.docker.internal"):
+        return False
+    # letters and digits both: dictionary words are almost always documentation
+    return bool(re.search(r"\d", password) and re.search(r"[A-Za-z]", password))
+
+
 def find_secrets(text: str) -> Iterable[tuple[str, int]]:
     """(kind, offset) for each credential-shaped string that is not a placeholder."""
     for label, hints, rx in _SECRET_RXS:
@@ -123,8 +170,15 @@ def find_secrets(text: str) -> Iterable[tuple[str, int]]:
             continue
         for m in rx.finditer(text):
             value = m.group(0)
-            if not _PLACEHOLDER.search(value) and len(set(value)) >= 10:
-                yield label, m.start()
+            if _PLACEHOLDER.search(value) or len(set(value)) < 10:
+                continue
+            if label == "Database URL with password" and not _dsn_ok(m):
+                continue
+            if label == "Twilio API key" and not (
+                re.search(r"\d", value[2:]) and re.search(r"[a-f]", value[2:])
+            ):
+                continue
+            yield label, m.start()
 
 
 def _secret_flags(files: RepoFiles) -> list[Flag]:
@@ -243,6 +297,11 @@ def runtime_versions(
                 _add(out, hit[0], hit[1], entry.path)
     for path, text in workflow_texts.items():
         for runtime, version in _WORKFLOW_VERSION.findall(text):
+            # a CI matrix may test versions the project no longer supports (engines >=22
+            # while the matrix still has 20): only versions inside the declared range count
+            spec = manifest_runtimes.get(runtime)
+            if spec and not _exactish(spec) and _satisfies(version, spec) is False:
+                continue
             _add(out, runtime, version, path)
     # go.mod's `go` line and ranges like engines/requires-python state compatibility,
     # not what the service runs on, so only pins that choose a runtime count
@@ -259,6 +318,54 @@ def runtime_versions(
             found = files.first(pattern)
             _add(out, runtime, spec, found.path if found else pattern)
     return out[:50]
+
+
+def _vtuple(text: str) -> tuple[int, ...] | None:
+    m = re.match(r"v?(\d+)(?:\.(\d+|x|\*))?(?:\.(\d+|x|\*))?", text.strip())
+    if not m:
+        return None
+    return tuple(int(g) for g in m.groups() if g is not None and g.isdigit())
+
+
+def _satisfies(version: str, spec: str) -> bool | None:
+    """Whether ``version`` falls inside a range such as ">=22.22.0", ">=3.10,<4",
+    "^20 || ^22" or "~3.11". A partial version ("22") stands for its whole line. None when
+    the range cannot be read (then nothing is dropped)."""
+    v = _vtuple(version)
+    if v is None:
+        return None
+    alternatives = []
+    for alt in spec.split("||"):
+        ok: bool | None = True
+        for part in re.split(r"[,\s]+(?=[<>=!^~])|,", alt.strip()):
+            part = part.strip()
+            if not part or part in ("*", "x"):
+                continue
+            m = re.match(r"(>=|<=|>|<|==|=|!=|\^|~=|~)?\s*(.+)", part)
+            want = _vtuple(m.group(2)) if m else None
+            if not m or want is None:
+                return None
+            op, n = m.group(1) or "=", len(want)
+            head = v[:n] + (0,) * (n - len(v[:n]))
+            if op == ">=":
+                ok = ok and v >= want[: len(v)]
+            elif op == ">":
+                ok = ok and head > want
+            elif op == "<=":
+                ok = ok and head <= want
+            elif op == "<":
+                ok = ok and v + (0,) * 3 < want + (0,) * 3
+            elif op == "!=":
+                ok = ok and head != want
+            elif op == "^":
+                ok = ok and v[:1] == want[:1] and v >= want[: len(v)]
+            elif op in ("~", "~="):
+                keep = max(1, n - 1) if op == "~=" else min(2, n)
+                ok = ok and head[:keep] == want[:keep] and v >= want[: len(v)]
+            else:
+                ok = ok and head == want
+        alternatives.append(bool(ok))
+    return any(alternatives) if alternatives else None
 
 
 def _exactish(spec: str) -> bool:
@@ -363,7 +470,138 @@ _UNTRUSTED = re.compile(
     r"(?:email|name))|head_commit\.(?:message|author\.(?:email|name))|workflow_run\."
     r"(?:head_branch|head_commit\.message|display_title))|github\.head_ref)\b"
 )
-_HEAD_CHECKOUT = re.compile(r"github\.event\.pull_request\.head\.(?:sha|ref)|github\.head_ref")
+# refs that resolve to code from the pull request (or the run that built it)
+_HEAD_CHECKOUT = re.compile(
+    r"github\.event\.pull_request\.(?:head\.(?:sha|ref)|merge_commit_sha)|github\.head_ref|"
+    r"refs/pull/|github\.event\.(?:pull_request\.)?number|github\.event\.workflow_run\."
+    r"(?:head_sha|head_branch|pull_requests)|github\.event\.issue\.number"
+)
+_ENV_REF = re.compile(r"\$\{\{\s*env\.(\w+)\s*\}\}")
+# shell commands that fetch the PR's code into the workspace
+_PR_FETCH = re.compile(
+    r"\bgh\s+pr\s+checkout\b|\bgit\s+(?:checkout|switch|merge|pull|reset\s+--hard)\b[^\n]*"
+    r"(?:pull/|FETCH_HEAD|pull_request\.head|head_ref|pr-head)"
+)
+_PRIVILEGED_EVENTS = {"pull_request_target", "workflow_run"}
+
+
+def _expand_env(value: str, env: dict[Any, Any]) -> str:
+    return _ENV_REF.sub(lambda m: str(env.get(m.group(1), "")), value)
+
+
+def _read_only(perms: Any) -> bool:
+    if perms in ("read-all", {}) or perms == "{}":
+        return True
+    return isinstance(perms, dict) and all(v in ("read", "none") for v in perms.values())
+
+
+def _uses_secrets(job: dict[str, Any]) -> bool:
+    """Secrets other than a (read-only) GITHUB_TOKEN reach the job."""
+    text = json.dumps(job, default=str)
+    return bool(re.search(r"secrets\.(?!GITHUB_TOKEN\b)\w+|secrets\[", text))
+
+
+def _executes_from(path: str, steps: list[dict[str, Any]]) -> bool:
+    """Whether later steps run code from a checkout placed at ``path`` (not only read it)."""
+    p = re.escape(path.strip("./") or ".")
+    in_dir = re.compile(
+        rf"(?:^|[\s;&|(])(?:cd|pushd)\s+['\"]?(?:\$\{{?GITHUB_WORKSPACE\}}?/)?{p}\b|"
+        rf"(?:^|[;&|(]|\bthen|\bdo)\s*\.?/?{p}/\S+|"  # pr/build.sh in command position
+        rf"\b(?:bash|sh|node|python3?|ruby|perl|npx|tsx|deno|bun|source)\s+['\"]?"
+        rf"(?:\$\{{?GITHUB_WORKSPACE\}}?/)?\.?/?{p}/\S+|"
+        rf"(?:-C|--prefix|--dir|--cwd|--project|--manifest-path)[\s=]+['\"]?{p}\b",
+        re.M,
+    )
+    for step in steps:
+        wd = str(step.get("working-directory") or "")
+        if wd.strip("./").startswith(path.strip("./")) and step.get("run"):
+            return True
+        uses = str(step.get("uses") or "")
+        if uses.startswith(("./" + path.strip("./") + "/", path.strip("./") + "/")):
+            return True
+        run = step.get("run")
+        if isinstance(run, str):
+            # arguments like `--root pr` or `git -C pr diff` only read the tree
+            cleaned = re.sub(r"\bgit\s+-C\s+\S+", "git", run)
+            if in_dir.search(cleaned):
+                return True
+    return False
+
+
+def _pwn_request_flags(path: str, text: str, data: dict[str, Any], events: set[Any]) -> list[Flag]:
+    """Privileged triggers (pull_request_target, workflow_run) that check out and run the
+    PR's code. A read-only job without secrets that only reads the PR from a separate
+    folder is the documented safe pattern and is not flagged."""
+    if not events & _PRIVILEGED_EVENTS:
+        return []
+    flags: list[Flag] = []
+    wf_env = _d(data.get("env"))
+    for job in _d(data.get("jobs")).values():
+        job = _d(job)
+        env = {**wf_env, **_d(job.get("env"))}
+        steps = [s for s in _l(job.get("steps")) if isinstance(s, dict)]
+        perms = job.get("permissions", data.get("permissions"))
+        safe_token = perms is not None and _read_only(perms)
+        secrets = _uses_secrets(job)
+        for i, step in enumerate(steps):
+            with_ = _d(step.get("with"))
+            uses = str(step.get("uses") or "")
+            ref = str(with_.get("ref") or "")
+            # follow ${{ env.X }} one level: env: HEAD: ${{ github.event.pull_request.head.sha }}
+            step_env = {**env, **_d(step.get("env"))}
+            ref = _expand_env(ref, step_env)
+            repo_ref = str(with_.get("repository") or "")
+            run = step.get("run") if isinstance(step.get("run"), str) else ""
+            if uses.startswith("actions/checkout") and (
+                _HEAD_CHECKOUT.search(ref) or "pull_request.head.repo" in repo_ref
+            ):
+                where = str(with_.get("path") or "")
+                needle = with_.get("ref") or "pull_request.head"
+            elif run and (fetch := _PR_FETCH.search(str(run))):
+                where, needle = "", fetch.group(0)
+            else:
+                continue
+            later = steps[i + 1 :] if uses else steps[i:]
+            separate = bool(where.strip("./"))
+            if separate and not _executes_from(where, later):
+                if safe_token and not secrets:
+                    continue  # PR files are only read, with nothing worth stealing
+                severity = "low"
+                why = "checks out untrusted PR code into a separate folder while secrets are available"
+            else:
+                severity = (
+                    "medium" if (job.get("environment") or (safe_token and not secrets)) else "high"
+                )
+                why = "runs untrusted PR code while secrets or a write token are available"
+                if job.get("environment"):
+                    why += " (behind an environment approval)"
+                elif safe_token and not secrets:
+                    why = "runs untrusted PR code with a read-only token (cache poisoning risk)"
+            trigger = "pull_request_target" if "pull_request_target" in events else "workflow_run"
+            flags.append(
+                Flag(
+                    id="workflow-pwn-request",
+                    category="security",
+                    severity=severity,  # type: ignore[arg-type]
+                    message=f"{trigger} {why}",
+                    path=path,
+                    line=_line_of_ref(text, str(needle)),
+                )
+            )
+    return flags
+
+
+def _line_of_ref(text: str, needle: str) -> int | None:
+    """Line of ``needle``, preferring an occurrence on a ``ref:``/``run:`` line."""
+    first = None
+    for m in re.finditer(re.escape(needle), text):
+        start = text.rfind("\n", 0, m.start()) + 1
+        line = text[start : m.start()]
+        if first is None:
+            first = m.start()
+        if re.search(r"\b(ref|run):|^\s*[^:#]*$", line):
+            return text.count("\n", 0, m.start()) + 1
+    return text.count("\n", 0, first) + 1 if first is not None else None
 
 
 def _steps(data: dict[str, Any]) -> Iterable[tuple[dict[str, Any], dict[str, Any]]]:
@@ -385,7 +623,7 @@ def _workflow_flags(workflow_texts: dict[str, str], errors: list[str]) -> list[F
             continue
         on = data.get("on", data.get(True))  # YAML 1.1 reads a bare `on` key as True
         events = set(on) if isinstance(on, dict | list) else {on} if isinstance(on, str) else set()
-        for job, step in _steps(data):
+        for _job, step in _steps(data):
             with_ = _d(step.get("with"))
             scripts = [step.get("run"), with_.get("script")]
             for script in scripts:
@@ -401,25 +639,7 @@ def _workflow_flags(workflow_texts: dict[str, str], errors: list[str]) -> list[F
                             line=_line_of(text, m.group(0)),
                         )
                     )
-            uses = str(step.get("uses") or "")
-            if (
-                "pull_request_target" in events
-                and uses.startswith("actions/checkout")
-                and _HEAD_CHECKOUT.search(str(with_.get("ref") or ""))
-            ):
-                gated = bool(job.get("environment"))
-                flags.append(
-                    Flag(
-                        id="workflow-pwn-request",
-                        category="security",
-                        severity="medium" if gated else "high",
-                        message="pull_request_target checks out untrusted PR code while "
-                        "secrets are available"
-                        + (" (behind an environment approval)" if gated else ""),
-                        path=path,
-                        line=_line_of(text, "pull_request.head"),
-                    )
-                )
+        flags += _pwn_request_flags(path, text, data, events)
     return _dedupe(flags)
 
 
@@ -516,7 +736,10 @@ def _ai_settings_flags(files: RepoFiles) -> list[Flag]:
 
 # ------------------------------------------------------------------------- ownership
 
-_BOT = re.compile(r"(?i)\[bot\]|dependabot|renovate|github-actions|\bbot\b|actions-user")
+_BOT = re.compile(
+    r"(?i)\[bot\]|dependabot|renovate|github[- ]actions|\bbot\b|actions-user|-bot$|"
+    r"^(?:semantic-release|greenkeeper|snyk|web-flow|copilot|pre-commit-ci|mergify)\b"
+)
 
 
 def _ownership_flags(ownership: Ownership, declared: Declared, archived: bool) -> list[Flag]:
@@ -533,7 +756,9 @@ def _ownership_flags(ownership: Ownership, declared: Declared, archived: bool) -
             )
         )
     humans = [c for c in ownership.top_contributors if not _BOT.search(c.name)]
-    total = sum(c.commits for c in humans)
+    bots = sum(c.commits for c in ownership.top_contributors if _BOT.search(c.name))
+    # share of ALL human commits, not of the top-10 list (that overstates a lead author)
+    total = max(ownership.commit_count - bots, sum(c.commits for c in humans))
     if humans and total >= 30 and humans[0].commits / total >= 0.9:
         share = round(100 * humans[0].commits / total)
         flags.append(

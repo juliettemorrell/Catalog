@@ -37,6 +37,9 @@ frameworks | React Native | mobile | react-native
 frameworks | Expo | mobile | expo
 frameworks | Ionic | mobile | @ionic/core, @ionic/react, @ionic/angular
 frameworks | Flutter | mobile | flutter
+frameworks | Android | mobile | com.android.application*, com.android.tools.build:gradle
+frameworks | Jetpack Compose | mobile, ui | androidx.compose*
+frameworks | .NET MAUI | mobile, desktop-app | microsoft.maui.controls*
 frameworks | Express | rest-api, backend | express
 frameworks | Fastify | rest-api, backend | fastify
 frameworks | NestJS | rest-api, backend | @nestjs/core
@@ -72,7 +75,10 @@ frameworks | Gin | rest-api, backend | github.com/gin-gonic/gin
 frameworks | Echo | rest-api, backend | github.com/labstack/echo*
 frameworks | Fiber | rest-api, backend | github.com/gofiber/fiber*
 frameworks | Chi | rest-api, backend | github.com/go-chi/chi*
-frameworks | gRPC | rpc-api | grpc, @grpc/grpc-js, grpcio, google.golang.org/grpc, io.grpc:*
+frameworks | gRPC | rpc-api | grpc.aspnetcore*, grpc-server, @grpc/grpc-js-server
+# client/runtime libraries: stack.py promotes them to the gRPC framework when the repo
+# defines its own services in .proto files (a client alone is not an API)
+libraries | gRPC | rpc-client | grpc, @grpc/grpc-js, grpcio, google.golang.org/grpc, io.grpc:*, grpc.net.client*, grpc.core*
 frameworks | Cobra | cli | github.com/spf13/cobra
 frameworks | Actix | rest-api, backend | actix-web
 frameworks | Axum | rest-api, backend | axum
@@ -98,6 +104,8 @@ libraries | Zustand | state-management | zustand
 libraries | TanStack Query | data-fetching | @tanstack/react-query, react-query
 libraries | SWR | data-fetching | swr
 libraries | Axios | http-client | axios
+libraries | Retrofit | http-client | com.squareup.retrofit2:*
+libraries | Hilt | dependency-injection | com.google.dagger:hilt*, com.google.dagger.hilt.android*
 libraries | React Hook Form | forms | react-hook-form
 libraries | Formik | forms | formik
 libraries | Zod | validation | zod
@@ -201,14 +209,16 @@ testing | Factory Boy | test-fixtures | factory-boy
 testing | tox | test-automation | tox
 testing | nox | test-automation | nox
 testing | coverage.py | coverage | coverage, pytest-cov
-testing | JUnit | unit-testing | junit:junit, org.junit.jupiter:*
+testing | JUnit | unit-testing | junit:junit, org.junit.jupiter:*, org.springframework.boot:spring-boot-starter-test
 testing | Mockito | mocking | org.mockito:*
 testing | Testcontainers | integration-testing | org.testcontainers:*, testcontainers, github.com/testcontainers/*
 testing | testify | unit-testing | github.com/stretchr/testify
 testing | RSpec | unit-testing | rspec, rspec-rails
 testing | PHPUnit | unit-testing | phpunit/phpunit
-testing | xUnit | unit-testing | xunit
-testing | NUnit | unit-testing | nunit
+testing | xUnit | unit-testing | xunit, xunit.v3*, xunit.core, xunit.runner*
+testing | NUnit | unit-testing | nunit, nunit3testadapter, nunit.*
+testing | MSTest | unit-testing | mstest, mstest.*, microsoft.visualstudio.testplatform*
+testing | Pest | unit-testing | pestphp/pest
 testing | k6 | load-testing | k6
 testing | Locust | load-testing | locust
 # ---- linting / formatting / typing ----------------------------------------------------
@@ -229,6 +239,11 @@ linting | Husky | | husky
 linting | lint-staged | | lint-staged
 linting | commitlint | | @commitlint/cli
 linting | RuboCop | | rubocop
+linting | Checkstyle | | com.puppycrawl.tools:checkstyle, org.apache.maven.plugins:maven-checkstyle-plugin
+linting | Spring Java Format | | io.spring.javaformat:*
+linting | Laravel Pint | | laravel/pint
+linting | PHP-CS-Fixer | | friendsofphp/php-cs-fixer
+linting | Spotless | | com.diffplug.spotless:*
 # ---- build tools ------------------------------------------------------------------------
 build_tools | Vite | | vite
 build_tools | Webpack | | webpack
@@ -249,7 +264,7 @@ build_tools | Poetry | | poetry-core, poetry
 build_tools | setuptools | | setuptools
 build_tools | Maturin | | maturin
 # ---- databases / storage ---------------------------------------------------------------
-databases | PostgreSQL | sql-database | pg, postgres, psycopg, psycopg2, psycopg2-binary, asyncpg, github.com/lib/pq, github.com/jackc/pgx*, org.postgresql:postgresql, npgsql
+databases | PostgreSQL | sql-database | pg, postgres, psycopg, psycopg2, psycopg2-binary, asyncpg, github.com/lib/pq, github.com/jackc/pgx*, org.postgresql:postgresql, npgsql*, aspire.npgsql*, @prisma/adapter-pg
 databases | MySQL | sql-database | mysql, mysql2, pymysql, mysqlclient, github.com/go-sql-driver/mysql, com.mysql:*, mysql:mysql-connector-java
 databases | SQLite | sql-database, embedded-database | sqlite3, better-sqlite3, sqlite, aiosqlite, github.com/mattn/go-sqlite3
 databases | SQL Server | sql-database | mssql, tedious, pyodbc, pymssql, microsoft.data.sqlclient
@@ -263,7 +278,7 @@ databases | OpenSearch | search, search-engine | @opensearch-project/opensearch,
 databases | Neo4j | graph-database | neo4j, neo4j-driver
 databases | Firestore | document-database | @google-cloud/firestore, google-cloud-firestore, firebase
 databases | Supabase | backend-as-a-service, sql-database | @supabase/supabase-js, supabase
-databases | Snowflake | data-warehouse | snowflake-connector-python, snowflake-sdk, snowflake-sqlalchemy
+databases | Snowflake | data-warehouse | snowflake-connector-python, snowflake-sdk, snowflake-sqlalchemy, snowflake-snowpark-python, dbt-snowflake, apache-airflow-providers-snowflake, net.snowflake:*
 databases | BigQuery | data-warehouse | google-cloud-bigquery, @google-cloud/bigquery
 databases | DuckDB | analytics-database | duckdb, @duckdb/*
 databases | ClickHouse | analytics-database | clickhouse-connect, @clickhouse/client
@@ -280,6 +295,7 @@ databases | Django ORM migrations | db-migrations | django
 databases | Flyway | db-migrations | org.flywaydb:*
 databases | Liquibase | db-migrations | org.liquibase:*
 databases | Hibernate | orm | org.hibernate*:*
+databases | Room | orm, embedded-database | androidx.room:*
 databases | GORM | orm | gorm.io/gorm
 databases | Entity Framework | orm | microsoft.entityframeworkcore*
 databases | ActiveRecord | orm | activerecord
@@ -287,8 +303,8 @@ databases | S3 storage | file-storage | @aws-sdk/client-s3, aws-sdk-s3, s3fs, mi
 databases | Google Cloud Storage | file-storage | @google-cloud/storage, google-cloud-storage
 databases | Azure Blob Storage | file-storage | @azure/storage-blob, azure-storage-blob
 # ---- messaging ---------------------------------------------------------------------------
-messaging | Kafka | event-streaming | kafkajs, kafka-python, confluent-kafka, org.apache.kafka:*, github.com/segmentio/kafka-go, github.com/confluentinc/confluent-kafka-go*
-messaging | RabbitMQ | queue | amqplib, pika, aio-pika, github.com/rabbitmq/amqp091-go, com.rabbitmq:*
+messaging | Kafka | event-streaming | kafkajs, kafka-python, confluent-kafka, org.apache.kafka:*, org.springframework.kafka:*, confluent.kafka, github.com/segmentio/kafka-go, github.com/confluentinc/confluent-kafka-go*
+messaging | RabbitMQ | queue | amqplib, pika, aio-pika, github.com/rabbitmq/amqp091-go, com.rabbitmq:*, rabbitmq.client, masstransit.rabbitmq, aspire.rabbitmq*, org.springframework.boot:spring-boot-starter-amqp
 messaging | SQS | queue | @aws-sdk/client-sqs
 messaging | SNS | pub-sub, notifications | @aws-sdk/client-sns
 messaging | Google Pub/Sub | pub-sub | @google-cloud/pubsub, google-cloud-pubsub
@@ -300,18 +316,19 @@ messaging | Sidekiq | background-jobs | sidekiq
 messaging | Temporal | workflow-orchestration | @temporalio/*, temporalio, go.temporal.io/sdk
 messaging | Inngest | background-jobs, workflow-orchestration | inngest
 # ---- cloud ------------------------------------------------------------------------------
-cloud | AWS | | aws-sdk, @aws-sdk/*, boto3, botocore, aioboto3, github.com/aws/aws-sdk-go*, software.amazon.awssdk:*, com.amazonaws:*, awssdk.*
+cloud | AWS | | aws-sdk, @aws-sdk/*, boto3, botocore, aioboto3, github.com/aws/aws-sdk-go*, software.amazon.awssdk:*, com.amazonaws:*, awssdk.*, hashicorp/aws, terraform-aws-modules/*
 cloud | AWS Lambda | serverless | aws-lambda, @types/aws-lambda, aws-lambda-powertools, mangum, github.com/aws/aws-lambda-go
 cloud | AWS CDK | infrastructure-as-code | aws-cdk-lib, aws-cdk, constructs
-cloud | Google Cloud | | @google-cloud/*, google-cloud-*, cloud.google.com/go*, com.google.cloud:*
-cloud | Firebase | backend-as-a-service | firebase, firebase-admin, firebase-functions
-cloud | Azure | | @azure/*, azure-*, github.com/azure/azure-sdk-for-go*, com.azure:*
+cloud | Google Cloud | | @google-cloud/*, google-cloud-*, cloud.google.com/go*, com.google.cloud:*, hashicorp/google, hashicorp/google-beta, terraform-google-modules/*
+cloud | Firebase | backend-as-a-service | firebase, firebase-admin, firebase-functions, com.google.firebase:*
+cloud | Azure | | @azure/*, azure-*, github.com/azure/azure-sdk-for-go*, com.azure:*, hashicorp/azurerm, hashicorp/azuread, azure/azapi
+infrastructure | .NET Aspire | cloud-native | aspire.*
 cloud | Vercel | | @vercel/*, vercel
 cloud | Cloudflare | edge | wrangler, @cloudflare/*
 cloud | Pulumi | infrastructure-as-code | @pulumi/*, pulumi, pulumi-*
 cloud | Serverless Framework | serverless | serverless
 # ---- observability ----------------------------------------------------------------------
-observability | OpenTelemetry | tracing | @opentelemetry/*, opentelemetry-*, go.opentelemetry.io/*, io.opentelemetry:*
+observability | OpenTelemetry | tracing | @opentelemetry/*, opentelemetry-*, go.opentelemetry.io/*, io.opentelemetry:*, opentelemetry, opentelemetry.*
 observability | Sentry | error-tracking | @sentry/*, sentry-sdk, github.com/getsentry/sentry-go, io.sentry:*
 observability | Datadog | monitoring | dd-trace, ddtrace, datadog, @datadog/*
 observability | New Relic | monitoring | newrelic
@@ -322,6 +339,7 @@ observability | structlog | logging | structlog
 observability | Loguru | logging | loguru
 observability | Zap | logging | go.uber.org/zap
 observability | Logrus | logging | github.com/sirupsen/logrus
+observability | Serilog | logging | serilog, serilog.*
 # ---- auth ------------------------------------------------------------------------------
 auth | Auth.js / NextAuth | authentication | next-auth, @auth/*
 auth | Clerk | authentication | @clerk/*
@@ -459,6 +477,10 @@ linting | mypy | | mypy.ini, .mypy.ini
 linting | Pyright | | pyrightconfig.json
 linting | golangci-lint | | .golangci.yml, .golangci.yaml, .golangci.toml
 linting | RuboCop | | .rubocop.yml
+linting | rustfmt | | rustfmt.toml, .rustfmt.toml, **/rustfmt.toml
+linting | Clippy | | clippy.toml, .clippy.toml
+linting | Checkstyle | | **/checkstyle*.xml
+linting | Laravel Pint | | pint.json
 linting | Stylelint | | .stylelintrc, .stylelintrc.*, stylelint.config.*
 linting | EditorConfig | | .editorconfig
 linting | pre-commit | | .pre-commit-config.yaml
@@ -494,6 +516,9 @@ frameworks | Sphinx | documentation-site | docs/conf.py, doc/conf.py, docs/sourc
 frameworks | Hugo | static-site | hugo.toml, hugo.yaml
 frameworks | Jekyll | static-site | _config.yml, Gemfile.jekyll
 frameworks | Storybook | design-system, ui-components | .storybook/**
+frameworks | Android | mobile | **/AndroidManifest.xml
+libraries | Airflow | etl, orchestration | **/dags/*.py, airflow.cfg
+libraries | dbt | etl, data-modeling | **/dbt_project.yml
 libraries | Tailwind CSS | styling | **/tailwind.config.*
 libraries | OpenAPI | rest-api, api-spec | **/openapi*.yaml, **/openapi*.yml, **/openapi*.json, **/swagger*.yaml, **/swagger*.yml, **/swagger*.json
 libraries | GraphQL schema | graphql-api, api-spec | **/*.graphql, **/*.gql
