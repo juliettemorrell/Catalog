@@ -51,3 +51,4 @@ addopts = "-q"
 "src/repo_catalog/analyzers/flags.py" = ["E501"]  # secret patterns read best unwrapped
 "src/repo_catalog/analyzers/deps_more.py" = ["E501"]  # manifest regexes read best unwrapped
 "tests/test_scan.py" = ["E501"]  # fixture file contents read best unwrapped
+"tests/test_cli.py" = ["E501"]  # fixture file contents read best unwrapped
