@@ -18,8 +18,9 @@ It is built for SDLC agents: the same data is available as JSON (with JSON Schem
 |---|---|
 | Local scanning (`--local`) | Verified on 22 public OSS repos: 0 crashes, 0 scan errors, ~1 minute for the lot |
 | Outputs | JSON validated by the Pydantic models; SBOMs and AI-BOM pass strict CycloneDX 1.6 schema validation |
-| Tests | 94 Python tests (`uv run pytest`), 17 site tests (`cd site && npm test`); ruff, mypy, tsc, actionlint and zizmor clean |
-| Independent review | Four adversarial reviews (dependency parsing, org links/OSV/SBOM, security, package/UI) found 37 issues; all were fixed, and every high and medium code finding has a regression test in `tests/test_review_fixes.py`. The UI findings were re-verified in a browser: all 329 facet counts match their results and all 147 Insights bars lead to results. Credential canaries never reach any output or OSV; pathological files scan in well under a second |
+| Tests | 196 Python tests (`uv run pytest`), 36 site tests (`cd site && npm test`); ruff, mypy, tsc, actionlint and zizmor clean |
+| Independent review | Four adversarial reviews (dependency parsing, org links/OSV/SBOM, security, package/UI) found 37 issues; all were fixed, and every high and medium code finding has a regression test in `tests/test_review_fixes.py`. The UI findings were re-verified in a browser: all 329 facet counts match their results and all 147 Insights bars lead to results. Credential canaries never reach any output or OSV; pathological files scan in well under a second. A second sweep (nightly-run robustness, AI detection accuracy, repo accuracy, a fresh look at the dependency fixes, and a 4,000-repo scale test) found about 60 more issues; all high and medium ones are fixed with tests in `tests/test_sweep2_*.py` and `tests/test_scale.py`. Re-verified in a browser: 380 facet counts and 150 Insights bars, 0 mismatches, axe 0 violations |
+| Scale | 4,000 synthetic repos (34k AI assets, 4.6M dependencies): build 141 s at 2.2 GB peak memory; nightly scan with every repo unchanged about 3.5 minutes at 2.3 GB; the web UI shows results in about 1 s with a 9.4 MB gzipped download; the MCP `dependency_usage` answer takes about 20 ms |
 | Web UI | Axe accessibility checks: 0 violations in light and dark themes; no mobile overflow |
 | **Not verified live** | GitHub org discovery against a real org (tested with mocked HTTP only), `--github-sbom`, `--osv` (OSV.dev was unreachable from the build sandbox; tested with mocked responses) and `--llm` summaries. Run a small trial first: `repo-catalog scan --org <org> --limit 5` |
 
@@ -37,7 +38,7 @@ cd site && npm ci && npm run dev             # UI at http://localhost:5173 (read
 
 Without network or a token: clone repos into a folder and run `repo-catalog scan --local <folder>`.
 
-A prebuilt UI is in `site-dist/` (if this came as a zip): serve that folder with a `data/` subfolder containing `catalog.json` and `ai-assets.json`. `demo-data/` holds a catalog of 22 public open-source repos to explore before scanning your own.
+A prebuilt UI is in `site-dist/` (if this came as a zip): serve that folder with a `data/` subfolder containing `catalog.json`, `ai-assets.json` and the `site/` folder of detail files that `repo-catalog build` writes (without `site/`, drawers show summaries only). `demo-data/` holds a catalog of 22 public open-source repos to explore before scanning your own.
 
 ## Integration points (pick what fits the existing work)
 
@@ -85,6 +86,9 @@ Conventions (also in `CLAUDE.md`): detectors never raise on bad input (errors go
 - The GitHub App needs read-only permissions; nothing writes to scanned repos.
 
 ## Known limitations
+
+- Exit codes: `0` success, `2` the catalog was written but some repos failed or stored records were rejected (see `meta.failures` in `catalog.json` and the log), `1` nothing usable. The workflow publishes on `2` and adds a warning.
+- Long lists are capped: `used_by`/`depends_on` at 200 per repo and `duplicates` at 20 per asset (the site shows true totals; SQLite `repo_links` has every link).
 
 - There is no per-repo wall-clock timeout. Every file-parsing regex has been checked for catastrophic backtracking, but if an org has something truly pathological, scan it with `--exclude`.
 

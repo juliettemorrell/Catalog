@@ -7,10 +7,13 @@ FTS tables for fuzzy search, and the full JSON record on every row for anything 
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+from collections.abc import Iterable, Mapping
 from pathlib import Path
+from types import TracebackType
 
-from ..models import AIAsset, Repo
+from ..models import AIAsset, Repo, RepoLink
 
 SCHEMA = """
 PRAGMA journal_mode = OFF;
@@ -28,7 +31,7 @@ CREATE TABLE repo_capabilities (repo_id TEXT, capability TEXT);
 CREATE TABLE repo_topics (repo_id TEXT, topic TEXT);
 CREATE TABLE repo_languages (repo_id TEXT, language TEXT, lines INTEGER, percent REAL);
 CREATE TABLE dependencies (repo_id TEXT, name TEXT, version TEXT, ecosystem TEXT,
-  scope TEXT, manifest TEXT, resolved TEXT, purl TEXT, vulns TEXT);
+  scope TEXT, manifest TEXT, resolved TEXT, purl TEXT, vulns TEXT, norm_name TEXT);
 CREATE TABLE packages (repo_id TEXT, name TEXT, path TEXT, ecosystem TEXT, version TEXT,
   description TEXT);
 CREATE TABLE practice_checks (repo_id TEXT, check_id TEXT, category TEXT, label TEXT,
@@ -37,7 +40,8 @@ CREATE TABLE ai_assets (
   id TEXT PRIMARY KEY, repo_id TEXT, kind TEXT, ecosystem TEXT, name TEXT, title TEXT,
   description TEXT, summary TEXT, category TEXT, path TEXT, url TEXT, scope TEXT,
   confidence TEXT, quality_score INTEGER, word_count INTEGER, last_modified TEXT,
-  last_author TEXT, duplicate_count INTEGER, content TEXT, json TEXT NOT NULL
+  last_author TEXT, duplicate_count INTEGER, content TEXT, json TEXT NOT NULL,
+  use_cases TEXT, tags TEXT
 );
 CREATE TABLE asset_tools (asset_id TEXT, tool TEXT);
 CREATE TABLE asset_models (asset_id TEXT, model TEXT);
@@ -51,30 +55,32 @@ CREATE TABLE runtime_versions (repo_id TEXT, runtime TEXT, version TEXT, path TE
 CREATE VIRTUAL TABLE repos_fts USING fts5(
   id UNINDEXED, name, description, summary, readme, tech, capabilities, topics,
   tokenize = 'unicode61 remove_diacritics 2');
+-- external content: the text is read from ai_assets (no second copy of every asset body)
 CREATE VIRTUAL TABLE assets_fts USING fts5(
-  id UNINDEXED, name, description, summary, content, tags,
-  tokenize = 'unicode61 remove_diacritics 2');
+  id UNINDEXED, name, description, summary, use_cases, content, tags,
+  content = 'ai_assets', tokenize = 'unicode61 remove_diacritics 2');
+"""
+
+# created after the rows are in (bulk loading into indexed tables is much slower)
+INDEXES = """
 CREATE INDEX idx_tech ON repo_tech(name COLLATE NOCASE);
 CREATE INDEX idx_tech_repo ON repo_tech(repo_id);
 CREATE INDEX idx_cap ON repo_capabilities(capability);
 CREATE INDEX idx_dep ON dependencies(name COLLATE NOCASE);
+CREATE INDEX idx_dep_norm ON dependencies(norm_name);
+CREATE INDEX idx_dep_repo ON dependencies(repo_id);
 CREATE INDEX idx_dep_purl ON dependencies(purl);
 CREATE INDEX idx_asset_kind ON ai_assets(kind, ecosystem);
 CREATE INDEX idx_asset_repo ON ai_assets(repo_id);
 CREATE INDEX idx_flags ON flags(flag_id, severity);
 CREATE INDEX idx_reusable ON reusables(kind);
+CREATE INDEX idx_links_src ON repo_links(repo_id);
+CREATE INDEX idx_links_dst ON repo_links(depends_on);
 CREATE VIEW flag_summary AS
   SELECT flag_id, category, severity, COUNT(*) AS findings,
          COUNT(DISTINCT repo_id) AS repo_count
   FROM flags GROUP BY flag_id, category, severity ORDER BY
   CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, findings DESC;
-CREATE VIEW dependency_versions AS
-  SELECT ecosystem, name, COUNT(DISTINCT repo_id) AS repo_count,
-         COUNT(DISTINCT COALESCE(resolved, version)) AS version_count,
-         GROUP_CONCAT(DISTINCT COALESCE(resolved, version)) AS versions
-  FROM dependencies WHERE COALESCE(resolved, version) IS NOT NULL AND scope != 'transitive'
-  GROUP BY ecosystem, name HAVING COUNT(DISTINCT repo_id) > 1
-  ORDER BY version_count DESC, repo_count DESC;
 CREATE VIEW vulnerable_dependencies AS
   SELECT d.repo_id, d.ecosystem, d.name, COALESCE(d.resolved, d.version) AS version, d.scope,
          d.manifest, d.vulns FROM dependencies d WHERE d.vulns IS NOT NULL
@@ -82,10 +88,26 @@ CREATE VIEW vulnerable_dependencies AS
 CREATE VIEW tech_usage AS
   SELECT category, name, COUNT(DISTINCT repo_id) AS repo_count
   FROM repo_tech GROUP BY category, name ORDER BY repo_count DESC;
-CREATE VIEW dependency_usage AS
+"""
+
+# Aggregates over every (transitive) dependency take seconds on a large org, too slow for
+# an interactive query: they are computed once here, as tables. Same names and columns as
+# the views they replace, plus norm_name (indexed) to look a package up.
+AGGREGATES = """
+CREATE TABLE dependency_versions AS
   SELECT ecosystem, name, COUNT(DISTINCT repo_id) AS repo_count,
-         GROUP_CONCAT(DISTINCT version) AS versions
+         COUNT(DISTINCT COALESCE(resolved, version)) AS version_count,
+         GROUP_CONCAT(DISTINCT COALESCE(resolved, version)) AS versions,
+         MIN(norm_name) AS norm_name
+  FROM dependencies WHERE COALESCE(resolved, version) IS NOT NULL AND scope != 'transitive'
+  GROUP BY ecosystem, name HAVING COUNT(DISTINCT repo_id) > 1
+  ORDER BY version_count DESC, repo_count DESC;
+CREATE TABLE dependency_usage AS
+  SELECT ecosystem, name, COUNT(DISTINCT repo_id) AS repo_count,
+         GROUP_CONCAT(DISTINCT version) AS versions, MIN(norm_name) AS norm_name
   FROM dependencies GROUP BY ecosystem, name ORDER BY repo_count DESC;
+CREATE INDEX idx_dep_usage ON dependency_usage(norm_name);
+CREATE INDEX idx_dep_versions ON dependency_versions(norm_name);
 """
 
 _TECH_FIELDS = (
@@ -106,28 +128,94 @@ _TECH_FIELDS = (
 )
 
 
+def norm_name(ecosystem: str, name: str) -> str:
+    """Lookup key for a package name: PyPI treats -, _ and . alike (PEP 503), so
+    ``typing_extensions`` == ``Typing.Extensions``; other ecosystems just ignore case."""
+    name = name.lower()
+    return re.sub(r"[-_.]+", "-", name) if ecosystem == "pypi" else name
+
+
+class CatalogDB:
+    """Builds catalog.db one repo and one asset at a time (a large org's dependencies need
+    not all be in memory at once). Written to a temp file and moved into place by
+    ``finish``, so readers never see a half-built database."""
+
+    def __init__(self, path: Path, meta: Mapping[str, str]) -> None:
+        self.path = path
+        self.tmp = path.with_suffix(".tmp")
+        self.tmp.unlink(missing_ok=True)
+        self.con = sqlite3.connect(self.tmp)
+        self.con.executescript(SCHEMA)
+        self.con.executemany("INSERT INTO meta VALUES (?, ?)", meta.items())
+
+    def add_repo(self, repo: Repo, depends_on: list[RepoLink] | None = None) -> None:
+        """``depends_on``: the complete link list when ``repo.depends_on`` is capped."""
+        _insert_repo(self.con, repo, repo.depends_on if depends_on is None else depends_on)
+
+    def add_asset(self, asset: AIAsset, duplicate_count: int | None = None) -> None:
+        """``duplicate_count``: the total when ``asset.duplicates`` is capped."""
+        count = len(asset.duplicates) if duplicate_count is None else duplicate_count
+        _insert_asset(self.con, asset, count)
+
+    def finish(self) -> None:
+        con = self.con
+        try:
+            con.executescript(INDEXES)
+            con.executescript(AGGREGATES)
+            # the index of an external-content table is built from ai_assets in one pass
+            # (no VACUUM from here on: it may renumber the rows the index points to, and a
+            # freshly built file has nothing to reclaim)
+            con.execute("INSERT INTO assets_fts(assets_fts) VALUES ('rebuild')")
+            con.commit()
+        finally:
+            con.close()
+        self.tmp.replace(self.path)
+
+    def abort(self) -> None:
+        self.con.close()
+        self.tmp.unlink(missing_ok=True)
+
+    def __enter__(self) -> CatalogDB:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if exc_type is None:
+            self.finish()
+        else:
+            self.abort()
+
+
 def build_sqlite(
-    path: Path, repos: list[Repo], assets: list[AIAsset], meta: dict[str, str]
+    path: Path,
+    repos: Iterable[Repo],
+    assets: Iterable[AIAsset],
+    meta: Mapping[str, str],
+    *,
+    links: Mapping[str, list[RepoLink]] | None = None,
+    duplicate_counts: Mapping[str, int] | None = None,
 ) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.unlink(missing_ok=True)
-    con = sqlite3.connect(tmp)
-    try:
-        con.executescript(SCHEMA)
-        con.executemany("INSERT INTO meta VALUES (?, ?)", meta.items())
+    """``links`` / ``duplicate_counts``: complete link lists and copy counts by id, as
+    returned by ``link_org`` and ``mark_duplicates`` (the records hold capped lists)."""
+    with CatalogDB(path, meta) as db:
         for r in repos:
-            _insert_repo(con, r)
+            db.add_repo(r, links.get(r.id) if links is not None else None)
         for a in assets:
-            _insert_asset(con, a)
-        con.commit()
-        con.execute("VACUUM")
-    finally:
-        con.close()
-    tmp.replace(path)
+            db.add_asset(a, duplicate_counts.get(a.id) if duplicate_counts is not None else None)
 
 
-def _insert_repo(con: sqlite3.Connection, r: Repo) -> None:
+def _insert_repo(con: sqlite3.Connection, r: Repo, depends_on: list[RepoLink]) -> None:
     s = r.stack
+    # the full record minus locked transitive deps (thousands per repo, and all of them
+    # are rows in `dependencies`); used_by/depends_on are the capped lists
+    direct = [d for d in r.dependencies if d.scope != "transitive"]
+    record = (
+        r if len(direct) == len(r.dependencies) else r.model_copy(update={"dependencies": direct})
+    )
     con.execute(
         "INSERT INTO repos VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
@@ -157,7 +245,7 @@ def _insert_repo(con: sqlite3.Connection, r: Repo) -> None:
             r.ai.asset_count,
             r.structure.file_count,
             r.structure.total_lines,
-            r.model_dump_json(),
+            record.model_dump_json(),
         ),
     )
     tech: list[tuple[str, str, str]] = []
@@ -175,7 +263,7 @@ def _insert_repo(con: sqlite3.Connection, r: Repo) -> None:
         [(r.id, lang.name, lang.lines, lang.percent) for lang in s.languages],
     )
     con.executemany(
-        "INSERT INTO dependencies VALUES (?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO dependencies VALUES (?,?,?,?,?,?,?,?,?,?)",
         [
             (
                 r.id,
@@ -187,6 +275,7 @@ def _insert_repo(con: sqlite3.Connection, r: Repo) -> None:
                 d.resolved,
                 d.purl,
                 " ".join(d.vulns) or None,
+                norm_name(d.ecosystem, d.name),
             )
             for d in r.dependencies
         ],
@@ -217,7 +306,7 @@ def _insert_repo(con: sqlite3.Connection, r: Repo) -> None:
         ],
     )
     con.executemany(
-        "INSERT INTO repo_links VALUES (?,?,?)", [(r.id, ln.repo, ln.via) for ln in r.depends_on]
+        "INSERT INTO repo_links VALUES (?,?,?)", [(r.id, ln.repo, ln.via) for ln in depends_on]
     )
     con.executemany(
         "INSERT INTO runtime_versions VALUES (?,?,?,?)",
@@ -243,9 +332,9 @@ def _insert_repo(con: sqlite3.Connection, r: Repo) -> None:
     )
 
 
-def _insert_asset(con: sqlite3.Connection, a: AIAsset) -> None:
+def _insert_asset(con: sqlite3.Connection, a: AIAsset, duplicate_count: int) -> None:
     con.execute(
-        "INSERT INTO ai_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO ai_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             a.id,
             a.repo,
@@ -264,9 +353,11 @@ def _insert_asset(con: sqlite3.Connection, a: AIAsset) -> None:
             a.word_count,
             _iso(a.last_modified),
             a.last_author,
-            len(a.duplicates),
+            duplicate_count,
             a.content,
             a.model_dump_json(exclude={"content"}),
+            " ".join(a.use_cases),
+            " ".join(a.tags),
         ),
     )
     con.executemany(
@@ -276,17 +367,6 @@ def _insert_asset(con: sqlite3.Connection, a: AIAsset) -> None:
     con.executemany("INSERT INTO asset_tools VALUES (?,?)", [(a.id, t) for t in a.tools])
     con.executemany("INSERT INTO asset_models VALUES (?,?)", [(a.id, m) for m in a.models])
     con.executemany("INSERT INTO asset_tags VALUES (?,?)", [(a.id, t) for t in a.tags])
-    con.execute(
-        "INSERT INTO assets_fts VALUES (?,?,?,?,?,?)",
-        (
-            a.id,
-            a.name,
-            a.description or "",
-            " ".join(filter(None, [a.summary, " ".join(a.use_cases)])),
-            a.content or "",
-            " ".join(a.tags),
-        ),
-    )
 
 
 def _iso(v: object) -> str | None:

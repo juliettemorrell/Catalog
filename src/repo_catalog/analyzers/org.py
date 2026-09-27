@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from collections.abc import Callable, Iterable
 from datetime import UTC, date, datetime, timedelta
 
 from ..models import AIAsset, Flag, Repo, RepoLink, Severity
@@ -36,7 +37,21 @@ _GITHUB_REF = re.compile(
 )
 
 
-def link_org(repos: list[Repo], assets: list[AIAsset], today: date | None = None) -> None:
+# repo id -> (ecosystem, name, version) of transitive dependencies held outside the record
+TransitiveRefs = Callable[[str], Iterable[tuple[str, str, str | None]]]
+
+
+def link_org(
+    repos: list[Repo],
+    assets: list[AIAsset],
+    today: date | None = None,
+    transitive: TransitiveRefs | None = None,
+) -> dict[str, list[RepoLink]]:
+    """Derived flags plus ``depends_on`` / ``used_by`` (each capped at ``MAX_LINKS``
+    entries). Returns every repo's complete ``depends_on`` list (for SQLite ``repo_links``).
+
+    ``transitive``: the transitive dependencies of records loaded without them
+    (``store.load_previous(direct_only=True)``); they link repos too."""
     today = today or datetime.now(UTC).date()
     for repo in repos:
         repo.flags = [f for f in repo.flags if f.id not in DERIVED_FLAGS]
@@ -51,7 +66,7 @@ def link_org(repos: list[Repo], assets: list[AIAsset], today: date | None = None
             continue
         repo.flags += eol_flags(repo, today)
         repo.flags += model_flags(repo, by_repo.get(repo.id, []))
-    _link(repos, by_repo)
+    return _link(repos, by_repo, transitive)
 
 
 # ------------------------------------------------------------------------ end of life
@@ -243,7 +258,11 @@ def _owner(candidates: list[Repo], consumer: Repo) -> Repo | None:
     return live[0] if len(live) == 1 else None
 
 
-def _link(repos: list[Repo], assets_by_repo: dict[str, list[AIAsset]] | None = None) -> None:
+def _link(
+    repos: list[Repo],
+    assets_by_repo: dict[str, list[AIAsset]] | None = None,
+    transitive: TransitiveRefs | None = None,
+) -> dict[str, list[RepoLink]]:
     assets_by_repo = assets_by_repo or {}
     by_id = {r.id.lower(): r for r in repos}
     publishers = _publishers(repos)
@@ -276,10 +295,15 @@ def _link(repos: list[Repo], assets_by_repo: dict[str, list[AIAsset]] | None = N
             api_providers.setdefault(_entity_name(api), set()).add(repo.id)
 
     for repo in repos:
-        for dep in repo.dependencies:
-            key = (dep.ecosystem, _norm(dep.ecosystem, dep.name))
+        deps = [(d.ecosystem, d.name, d.version, d.scope) for d in repo.dependencies]
+        if transitive is not None:
+            deps += [
+                (eco, name, version, "transitive") for eco, name, version in transitive(repo.id)
+            ]
+        for ecosystem, name, version, scope in deps:
+            key = (ecosystem, _norm(ecosystem, name))
             candidates = publishers.get(key)
-            if candidates is None and dep.ecosystem == "go":
+            if candidates is None and ecosystem == "go":
                 # a package path inside a module: walk its prefixes (github.com/a/b/c -> a/b)
                 parts = key[1].split("/")
                 for i in range(len(parts) - 1, 0, -1):
@@ -288,20 +312,20 @@ def _link(repos: list[Repo], assets_by_repo: dict[str, list[AIAsset]] | None = N
                         candidates = publishers[module]
                         break
             if candidates:
-                link(repo, _owner(candidates, repo), f"{dep.ecosystem} {dep.name}", dep.scope)
+                link(repo, _owner(candidates, repo), f"{ecosystem} {name}", scope)
                 continue
-            if dep.ecosystem == "docker" and dep.name.startswith("ghcr.io/"):
-                parts = dep.name.split("/")
+            if ecosystem == "docker" and name.startswith("ghcr.io/"):
+                parts = name.split("/")
                 if len(parts) >= 3:
-                    link(repo, f"{parts[1]}/{parts[2]}", f"image {dep.name}", dep.scope)
+                    link(repo, f"{parts[1]}/{parts[2]}", f"image {name}", scope)
                 continue
-            if dep.ecosystem in ("terraform", "github-actions"):
+            if ecosystem in ("terraform", "github-actions"):
                 continue  # resolved from `references`, which keep the exact file
-            for text in (dep.name, dep.version or ""):
+            for text in (name, version or ""):
                 if m := _GITHUB_REF.search(text):
                     target_id = f"{m.group(1)}/{m.group(2)}".lower()
                     if target_id in by_id:
-                        link(repo, target_id, f"{dep.ecosystem} {dep.name}", dep.scope)
+                        link(repo, target_id, f"{ecosystem} {name}", scope)
                         break
         for ref in repo.references:
             if ref.target in by_id:
@@ -323,13 +347,21 @@ def _link(repos: list[Repo], assets_by_repo: dict[str, list[AIAsset]] | None = N
 
     labels = {1: " (optional)", 2: " (dev)", 3: " (build)", 4: " (transitive)"}
     flagged: set[tuple[str, str]] = set()
+    # (relevance, link) per repo: the MAX_LINKS most relevant links are kept on the record
+    out_links: dict[str, list[tuple[tuple[int, bool, str, str], RepoLink]]] = {}
+    in_links: dict[str, list[tuple[tuple[int, bool, str, str], RepoLink]]] = {}
     for (src_id, dst_id), vias in sorted(routes.items()):
         src, dst = by_id[src_id.lower()], by_id[dst_id.lower()]
         ordered = sorted(vias.items(), key=lambda kv: (kv[1], kv[0]))[:MAX_ROUTES_PER_PAIR]
         for via, rank in ordered:
             label = via + labels.get(rank, "")
-            src.depends_on.append(RepoLink(repo=dst.id, via=label))
-            dst.used_by.append(RepoLink(repo=src.id, via=label))
+            # runtime before dev/build/transitive, live repos before archived ones
+            out_links.setdefault(src.id, []).append(
+                ((rank, dst.archived, dst.id.lower(), label), RepoLink(repo=dst.id, via=label))
+            )
+            in_links.setdefault(dst.id, []).append(
+                ((rank, src.archived, src.id.lower(), label), RepoLink(repo=src.id, via=label))
+            )
         if dst.archived and not src.archived and (src.id, dst.id) not in flagged:
             flagged.add((src.id, dst.id))
             src.flags.append(
@@ -340,6 +372,17 @@ def _link(repos: list[Repo], assets_by_repo: dict[str, list[AIAsset]] | None = N
                     message=f"Depends on archived repo {dst.id} ({ordered[0][0]})",
                 )
             )
+    complete: dict[str, list[RepoLink]] = {}
     for repo in repos:
-        repo.depends_on.sort(key=lambda link: link.repo.lower())
-        repo.used_by.sort(key=lambda link: link.repo.lower())
+        outgoing = out_links.get(repo.id, [])
+        complete[repo.id] = sorted((ln for _, ln in outgoing), key=lambda ln: ln.repo.lower())
+        repo.depends_on = _most_relevant(outgoing)
+        repo.used_by = _most_relevant(in_links.get(repo.id, []))
+    return complete
+
+
+def _most_relevant(links: list[tuple[tuple[int, bool, str, str], RepoLink]]) -> list[RepoLink]:
+    """At most MAX_LINKS links (strongest first when capped), listed by repo name."""
+    if len(links) > MAX_LINKS:
+        links = sorted(links, key=lambda x: x[0])[:MAX_LINKS]
+    return sorted((ln for _, ln in links), key=lambda ln: ln.repo.lower())

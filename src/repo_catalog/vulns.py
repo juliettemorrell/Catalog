@@ -17,6 +17,7 @@ import re
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -264,48 +265,79 @@ def _distinct(ids: list[str], advisories: dict[str, dict[str, Any]]) -> list[lis
     return list(groups.values())
 
 
-def apply_vulnerabilities(
-    repos: list[Repo], cache_dir: Path, transport: httpx.BaseTransport | None = None
-) -> int:
-    """Annotate deps with advisory ids and add `vulnerable-dependency` flags. Returns the
-    number of vulnerable (repo, dependency) pairs; 0 when OSV is unreachable."""
-    for repo in repos:
-        repo.flags = [f for f in repo.flags if f.id != "vulnerable-dependency"]
-        for dep in repo.dependencies:
-            dep.vulns = []
-    keyed = [
-        (repo, dep, key)
-        for repo in repos
-        for dep in repo.dependencies
-        if (key := _key(dep)) is not None
-    ]
-    if not keyed:
-        return 0
+@dataclass
+class OsvFindings:
+    """What OSV reported for a set of locked versions, applied one repo at a time
+    (``annotate``) so a large catalog never needs every dependency in memory at once.
+    ``ok`` is False when there was nothing to look up or OSV was unreachable: advisory ids
+    and flags are then cleared and the dependency summaries left as they were."""
+
+    found: dict[Key, list[str]] = field(default_factory=dict)
+    advisories: dict[str, dict[str, Any]] = field(default_factory=dict)
+    ok: bool = False
+    _groups: dict[Key, list[list[str]]] = field(default_factory=dict, repr=False)
+
+    def groups(self, key: Key) -> list[list[str]]:
+        """Distinct advisories (aliases merged) for a package version."""
+        ids = [i for i in self.found.get(key, []) if i in self.advisories]
+        if not ids:
+            return []
+        if key not in self._groups:
+            self._groups[key] = _distinct(ids, self.advisories)
+        return self._groups[key]
+
+    def vulns_for(self, dep: Dependency) -> list[str]:
+        key = _key(dep) if self.ok else None
+        return [g[0] for g in self.groups(key)] if key is not None else []
+
+
+def dependency_keys(deps: Iterable[Dependency]) -> Iterable[Key]:
+    return (key for dep in deps if (key := _key(dep)) is not None)
+
+
+def lookup_vulnerabilities(
+    keys: Iterable[Key], cache_dir: Path, transport: httpx.BaseTransport | None = None
+) -> OsvFindings:
+    unique = list(dict.fromkeys(keys))
+    if not unique:
+        return OsvFindings()
     try:
         client = OsvClient(cache_dir, transport)
-        found = client.vulns_for(key for _, _, key in keyed)
+        found = client.vulns_for(unique)
     except (httpx.HTTPError, OSError, ValueError) as exc:
         log.warning("OSV lookup skipped (%s): vulnerability data not included", exc)
-        return 0
+        return OsvFindings()
     ids = sorted({i for v in found.values() for i in v})[:MAX_ADVISORIES]
     with ThreadPoolExecutor(max_workers=8) as pool:
         fetched = dict(zip(ids, pool.map(client.advisory, ids), strict=True))
     # an advisory that could not be fetched still counts: OSV said this version is affected
     advisories = {i: a if a is not None else {"id": i} for i, a in fetched.items()}
+    return OsvFindings(found={k: v for k, v in found.items() if v}, advisories=advisories, ok=True)
 
+
+def annotate(repo: Repo, findings: OsvFindings) -> int:
+    """Set advisory ids on ``repo``'s dependencies (all of them, transitive included) and
+    its `vulnerable-dependency` flags. Returns the number of vulnerable package versions."""
+    repo.flags = [f for f in repo.flags if f.id != "vulnerable-dependency"]
+    for dep in repo.dependencies:
+        dep.vulns = []
+    if not findings.ok:
+        return 0
     hits = 0
-    per_repo: dict[str, list[Flag]] = {}
-    flagged: set[tuple[str, Key]] = set()
-    for repo, dep, key in keyed:
-        groups = _distinct([i for i in found.get(key, []) if i in advisories], advisories)
-        if not groups:
+    flags: list[Flag] = []
+    flagged: set[Key] = set()
+    for dep in repo.dependencies:
+        key = _key(dep)
+        groups = findings.groups(key) if key is not None else []
+        if key is None or not groups:
             continue
+        advisories = findings.advisories
         vuln_ids = [g[0] for g in groups]
         members = [i for g in groups for i in g]
         dep.vulns = vuln_ids
-        if (repo.id, key) in flagged:
+        if key in flagged:
             continue  # same package@version from another manifest in this repo
-        flagged.add((repo.id, key))
+        flagged.add(key)
         hits += 1
         # sources can disagree on severity (GHSA label vs a PYSEC CVSS vector): take the worst
         worst = min((_severity(advisories[i]) for i in members), key=lambda s: _RANK[s])
@@ -319,7 +351,7 @@ def apply_vulnerabilities(
             f"{len(vuln_ids)} known advisor{'y' if len(vuln_ids) == 1 else 'ies'} ({shown})"
             + (f"; fixed in {', '.join(fixed[:3])}" if fixed else "; no fixed version listed")
         )
-        per_repo.setdefault(repo.id, []).append(
+        flags.append(
             Flag(
                 id="vulnerable-dependency",
                 category="security",
@@ -328,8 +360,17 @@ def apply_vulnerabilities(
                 path=dep.manifest,
             )
         )
-    for repo in repos:
-        flags = sorted(per_repo.get(repo.id, []), key=lambda f: _RANK[f.severity])
-        repo.flags += flags[:MAX_FLAGS_PER_REPO]
-        repo.dependency_summary = summarize(repo.dependencies)
+    flags.sort(key=lambda f: _RANK[f.severity])
+    repo.flags += flags[:MAX_FLAGS_PER_REPO]
+    repo.dependency_summary = summarize(repo.dependencies)
     return hits
+
+
+def apply_vulnerabilities(
+    repos: list[Repo], cache_dir: Path, transport: httpx.BaseTransport | None = None
+) -> int:
+    """Annotate deps with advisory ids and add `vulnerable-dependency` flags. Returns the
+    number of vulnerable (repo, dependency) pairs; 0 when OSV is unreachable."""
+    keys = dependency_keys(d for repo in repos for d in repo.dependencies)
+    findings = lookup_vulnerabilities(keys, cache_dir, transport)
+    return sum(annotate(repo, findings) for repo in repos)

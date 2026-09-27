@@ -42,7 +42,7 @@ repo-catalog scan --org my-org --llm                    # add Claude summaries (
 repo-catalog scan --org my-org --match '^svc-' --limit 20 --skip-archived
 ```
 
-Re-runs are incremental: a repo whose default-branch HEAD hasn't changed is reused without cloning or analysis. Use `--force` to rescan everything. Each repo's record is saved as soon as it finishes, so an interrupted run keeps its progress. Exit codes: `0` success, `2` the catalog was written but some repos failed (listed in `meta.failures` of `catalog.json`), `1` nothing usable. Records are pruned only when GitHub returns a complete repo list.
+Re-runs are incremental: a repo whose default-branch HEAD hasn't changed is reused without cloning or analysis. Use `--force` to rescan everything. Each repo's record is saved as soon as it finishes, so an interrupted run keeps its progress. Exit codes: `0` success, `2` the catalog was written but some repos failed (listed in `meta.failures` of `catalog.json`) or some stored records in `data/repos` could not be loaded (a WARNING names them; they are left out until rescanned), `1` nothing usable. `repo-catalog build` exits `2` in the latter case too. Records are pruned only when GitHub returns a complete repo list.
 
 ## What gets cataloged
 
@@ -103,7 +103,7 @@ Field-by-field reference: [docs/catalog-data.md](docs/catalog-data.md). JSON Sch
 
 ## Querying it
 
-**Web UI** (`site/`): instant search over repos, AI assets and building blocks, with facets, detail drawers, an insights dashboard (findings, most depended-on repos, version drift) and CSV export. The query syntax is shared across the UI:
+**Web UI** (`site/`): instant search over repos, AI assets and building blocks, with facets, detail drawers, an insights dashboard (findings, most depended-on repos, version drift) and CSV export. It loads slim list files (`catalog.json`, `ai-assets.json`) and fetches a repo's or asset's full record from `data/site/` only when its drawer opens, so it stays fast at thousands of repos. The query syntax is shared across the UI:
 
 ```
 payments lang:python -type:library     fastapi missing:tests grade:D
@@ -134,7 +134,7 @@ repo-catalog sql "SELECT repo_id FROM practice_checks WHERE check_id='tests' AND
 { "mcpServers": { "repo-catalog": { "command": "uv", "args": ["run", "--extra", "mcp", "repo-catalog", "mcp", "--out", "data"] } } }
 ```
 
-Tools: `search_repos`, `get_repo`, `search_ai_assets`, `get_ai_asset`, `find_building_blocks`, `repo_relationships`, `list_flags`, `dependency_usage`, `repos_using`, `technology_usage`, `sql` (read-only). The skill in [`.claude/skills/repo-catalog`](.claude/skills/repo-catalog/SKILL.md) teaches an agent how to use them for prior-art searches.
+Tools: `search_repos`, `get_repo`, `search_ai_assets`, `get_ai_asset`, `find_building_blocks`, `repo_relationships`, `list_flags`, `dependency_usage`, `repos_using`, `technology_usage`, `sql` (read-only). Answers stay small enough for a context window: `get_repo` returns direct dependencies only and caps long lists (a `truncated` field gives the totals), `repo_relationships` shows up to 100 links per direction with `*_total` counts; `dependency_usage` and `sql` reach the rest. The skill in [`.claude/skills/repo-catalog`](.claude/skills/repo-catalog/SKILL.md) teaches an agent how to use them for prior-art searches.
 
 ## Running it on a schedule
 

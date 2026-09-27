@@ -68,6 +68,9 @@ class ScanResult:
     assets: list[AIAsset]
     readme: str = ""
     reused: bool = False
+    # transitive dependencies dropped from memory; they are in the per-repo file
+    # (store.strip_transitive / store.write_repo(merge_transitive=True))
+    light: bool = False
 
 
 @dataclass
@@ -457,8 +460,14 @@ def _license_from_files(files: RepoFiles) -> str | None:
     return "Other" if hits else None
 
 
-def mark_duplicates(assets: list[AIAsset]) -> None:
-    """Link assets whose content is identical across the org (copy-pasted skills/rules)."""
+MAX_DUPLICATES = 20  # ids listed per asset; a file copied into every repo lists 20, not 4,000
+
+
+def mark_duplicates(assets: list[AIAsset]) -> dict[str, int]:
+    """Link assets whose content is identical across the org (copy-pasted skills/rules).
+
+    Each asset lists at most ``MAX_DUPLICATES`` other copies, the first ones in ``assets``
+    order. Returns the total number of other copies per asset id (for counts)."""
     groups: dict[str, list[AIAsset]] = defaultdict(list)
     for a in assets:
         if (
@@ -467,10 +476,13 @@ def mark_duplicates(assets: list[AIAsset]) -> None:
             and a.word_count >= 10
         ):
             groups[a.content_sha].append(a)
+    totals: dict[str, int] = {}
     for group in groups.values():
-        ids = [a.id for a in group]
+        head = [a.id for a in group[: MAX_DUPLICATES + 1]]
         for a in group:
-            a.duplicates = [i for i in ids if i != a.id]
+            a.duplicates = [i for i in head if i != a.id][:MAX_DUPLICATES]
+            totals[a.id] = len(group) - 1
+    return totals
 
 
 def slug(repo_id: str) -> str:

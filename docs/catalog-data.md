@@ -6,15 +6,21 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 
 | File | Contents |
 |---|---|
-| `repos/<owner>__<name>.json` | Source of truth: one repo record plus its AI assets. |
-| `catalog.json` | `{meta, repos: Repo[]}`, loaded by the web UI. |
-| `ai-assets.json` | `{meta, assets: AIAsset[]}`, loaded by the web UI. |
+| `repos/<owner>__<name>.json` | Source of truth: one repo record plus its AI assets. One JSON member per line (one line per dependency), so git diffs stay readable. A file whose content did not change is not rewritten. A record that no longer loads (hand-edited, or written by an incompatible version) is left out of the build with a WARNING, and `build`/`scan` exit `2`. |
+| `catalog.json` | `{meta, repos: [...]}`: one slim list entry per repo, loaded by the web UI (see below). |
+| `ai-assets.json` | `{meta, assets: [...]}`: one slim list entry per AI asset, loaded by the web UI (see below). |
+| `site/repos/<owner>__<name>.json` | `{repo: Repo, assets: [{id, kind, name, path}]}`: the full repo record as built (direct dependencies, org links, build-time flags), loaded when the UI drawer opens. |
+| `site/assets/<id>.json` | The full `AIAsset` (content, frontmatter, bundled files, duplicates), loaded when the UI drawer opens. |
+| `site/insights.json` | `{version_drift: [...]}`: aggregates the UI Insights page needs from dependency versions, computed at build time. |
 | `catalog.db` | SQLite with FTS5 (tables below). |
 | `backstage-entities.yaml` | One Backstage `Component` per repo. |
 | `ai-bom.cdx.json` | CycloneDX 1.6 AI bill of materials. |
 | `sbom/<owner>__<name>.cdx.json` | CycloneDX 1.6 SBOM per repo: every dependency with purl, version, scope, and OSV advisories when built with `--osv`. |
 
-`catalog.json` leaves out locked transitive dependencies (often thousands per repo) to keep the web UI fast; they are in the per-repo files, `catalog.db` and the SBOMs.
+`catalog.json` and `ai-assets.json` hold only what the web UI needs to list, search, filter, chart and export, so it loads fast at thousands of repos (at 4,000 repos and 34,000 assets: about 90 MB instead of 560 MB). Full records are in `site/` (one file per repo and per asset, fetched on demand), the per-repo files, `catalog.db` and the SBOMs; read those, not the list files, when you need complete data (`store.load_aggregates` does). A list entry differs from the full record as follows:
+
+- **Repo entry**: the `Repo` fields `id name owner url description homepage topics visibility archived fork default_branch head_sha license stars pushed_at lifecycle capabilities summary dependency_summary ai flags reusables depends_on scanned_at`; `declared` with only `owner`, `system`; `stack` without `runtimes`/`runtime_versions` and `languages` as `{name, percent}`; `structure` as `{repo_type, is_monorepo, packages: [{name}]}`; `practices.checks` as `{id, label, passed}`; `ownership` as `{codeowners, last_commit}`. Instead of `dependencies` and `used_by`: `dependency_names` (unique direct dependency names), `vulnerable_dependencies` (names with known advisories) and `used_by_count`. Locked transitive dependencies are never in the web files.
+- **Asset entry**: the `AIAsset` fields `id kind ecosystem name title description repo path url scope confidence tools models mcp_servers tags excerpt headings quality_score last_modified summary use_cases category flags`, plus `duplicate_count` instead of `duplicates`. No `content`, `frontmatter`, `files`, `quality_notes` or git provenance; the UI's full-text search covers the excerpt and headings, not the whole content (`catalog.db`'s `assets_fts` does).
 
 ## Repo
 
@@ -41,7 +47,7 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 | `flags[]` | Findings: `id`, `category` (security, maintenance, ownership, ai-governance), `severity` (high, medium, low), `message`, `path`, `line`. See the table below | flag detectors |
 | `reusables[]` | Building blocks: `kind` (action, reusable-workflow, terraform-module, helm-chart, template, api, config-package), `name`, `path`, `description`, `details` (inputs, secrets, variables, outputs, providers, operations and a sample, version…) | files |
 | `references[]` | Pointers to other repos: `kind` (action, reusable-workflow, terraform, container, git), `target` (`owner/repo`, lowercase), `path` | workflows, `.tf`, Dockerfiles, `.gitmodules` |
-| `depends_on[]`, `used_by[]` | Org repos linked by packages, actions, workflows, modules, images or git deps: `repo`, `via` (e.g. `npm @acme/ui`). Filled at build time, so only in `catalog.json`/SQLite, not per-repo files | org-wide |
+| `depends_on[]`, `used_by[]` | Org repos linked by packages, actions, workflows, modules, images or git deps: `repo`, `via` (e.g. `npm @acme/ui`). Filled at build time, so only in `site/repos/*.json` and SQLite (`catalog.json` has `depends_on` and `used_by_count`), not per-repo files. Each list holds at most 200 links (a core library can be used by thousands of repos): when there are more, the strongest ones are kept (runtime before optional/dev/build/transitive, live repos before archived ones), still listed by repo name. The SQLite `repo_links` table has every link | org-wide |
 | `scanned_at`, `scanner_version`, `scan_errors` | Provenance of the record | scanner |
 
 ### Flags
@@ -117,12 +123,12 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 | `last_modified`, `last_author`, `commit_count` | From `git log` on the file |
 | `quality_score`, `quality_notes` | 0–100 heuristic: description present and well-sized, body substance, structure, examples, length, plus kind-specific checks (Agent Skills naming rules, least-privilege tools, parameters, build/test instructions) |
 | `summary`, `use_cases`, `category` | Claude (`--llm`) |
-| `duplicates` | IDs of assets with byte-identical content elsewhere in the org |
+| `duplicates` | IDs of assets with byte-identical content elsewhere in the org: at most 20 (the first copies in repo-name order); `ai_assets.duplicate_count` in SQLite has the total |
 | `flags[]` | Governance findings for this asset (same shape as repo flags) |
 
 ## SQLite (`catalog.db`)
 
-Tables: `repos` (flat columns + `json`), `repo_tech(repo_id, category, name)`, `repo_capabilities`, `repo_topics`, `repo_languages`, `dependencies`, `packages`, `practice_checks`, `ai_assets` (flat columns + `content` + `json`), `asset_tools`, `asset_models`, `asset_tags`, `flags(repo_id, asset_id, flag_id, category, severity, message, path, line)`, `reusables(repo_id, kind, name, path, description, details)`, `repo_links(repo_id, depends_on, via)`, `dependencies` (also `resolved`, `purl`, `vulns`), `runtime_versions`, and `meta`. Full-text search: `repos_fts`, `assets_fts` (unicode61, prefix matching). Views: `tech_usage`, `dependency_usage`, `dependency_versions` (version drift, by locked version), `vulnerable_dependencies`, `flag_summary`.
+Tables: `repos` (flat columns + `json`: the full record without locked transitive dependencies, which are rows in `dependencies`), `repo_tech(repo_id, category, name)`, `repo_capabilities`, `repo_topics`, `repo_languages`, `dependencies`, `packages`, `practice_checks`, `ai_assets` (flat columns + `content` + `json`, plus space-separated `use_cases` and `tags`), `asset_tools`, `asset_models`, `asset_tags`, `flags(repo_id, asset_id, flag_id, category, severity, message, path, line)`, `reusables(repo_id, kind, name, path, description, details)`, `repo_links(repo_id, depends_on, via)`, `dependencies` (also `resolved`, `purl`, `vulns`, and `norm_name`: the indexed lookup key, lower case and PEP 503-normalized for PyPI, so `WHERE norm_name = 'typing-extensions'` finds `typing_extensions`), `runtime_versions`, and `meta`. Full-text search: `repos_fts`, `assets_fts` (unicode61, prefix matching; `assets_fts` is an external-content table over `ai_assets`, columns `id, name, description, summary, use_cases, content, tags`). Views: `tech_usage`, `vulnerable_dependencies`, `flag_summary`. `dependency_usage` and `dependency_versions` (version drift, by locked version) have the same columns as before plus `norm_name`, but are tables computed at build time: aggregating every transitive dependency of a large org takes seconds.
 
 ```sql
 -- Which repos already integrate Stripe, newest first?

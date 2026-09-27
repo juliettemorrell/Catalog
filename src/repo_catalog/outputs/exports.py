@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import re
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,7 +12,7 @@ import yaml
 
 from .. import __version__
 from ..models import AIAsset, Repo
-from .store import write_atomic
+from .store import dumps, write_atomic
 
 _BACKSTAGE_TYPE = {
     "service": "service",
@@ -208,7 +208,7 @@ def aibom(repos: list[Repo], assets: list[AIAsset], source: str) -> dict[str, ob
 
 
 def write_aibom(path: Path, repos: list[Repo], assets: list[AIAsset], source: str) -> None:
-    write_atomic(path, json.dumps(aibom(repos, assets, source), indent=1))
+    write_atomic(path, dumps(aibom(repos, assets, source)))
 
 
 _CDX_SCOPE = {"dev": "optional", "build": "excluded", "optional": "optional"}
@@ -311,14 +311,29 @@ def repo_sbom(r: Repo) -> dict[str, object]:
     }
 
 
-def write_sboms(folder: Path, repos: list[Repo]) -> None:
+class SbomWriter:
+    """Writes ``<owner>__<name>.cdx.json`` one repo at a time (only files whose content
+    changed are rewritten); ``finish`` drops the files of repos no longer in the catalog."""
+
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        self.wanted: set[str] = set()
+        folder.mkdir(parents=True, exist_ok=True)
+
+    def write(self, repo: Repo) -> bool:
+        name = re.sub(r"[^A-Za-z0-9._-]+", "__", repo.id) + ".cdx.json"
+        self.wanted.add(name)
+        return write_atomic(self.folder / name, dumps(repo_sbom(repo)))
+
+    def finish(self) -> None:
+        for old in self.folder.glob("*.cdx.json"):
+            if old.name not in self.wanted:
+                old.unlink()
+
+
+def write_sboms(folder: Path, repos: Iterable[Repo]) -> None:
     """One ``<owner>__<name>.cdx.json`` per repo; stale files from removed repos are dropped."""
-    folder.mkdir(parents=True, exist_ok=True)
-    wanted = set()
+    writer = SbomWriter(folder)
     for r in repos:
-        name = re.sub(r"[^A-Za-z0-9._-]+", "__", r.id) + ".cdx.json"
-        wanted.add(name)
-        write_atomic(folder / name, json.dumps(repo_sbom(r), indent=1))
-    for old in folder.glob("*.cdx.json"):
-        if old.name not in wanted:
-            old.unlink()
+        writer.write(r)
+    writer.finish()

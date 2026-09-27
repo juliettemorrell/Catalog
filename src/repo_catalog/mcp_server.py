@@ -83,7 +83,9 @@ def build_server(db_path: Path) -> MCPServer:
     @server.tool(annotations=READ_ONLY)
     def get_repo(repo_id: str) -> dict[str, Any] | str:
         """Full catalog record for one repo ("owner/name" or just "name"): summary, stack,
-        dependencies, structure, best-practice checks, ownership and AI usage."""
+        dependencies, structure, best-practice checks, ownership and AI usage. Direct
+        dependencies only, and long lists are capped (see `truncated` for totals): use
+        dependency_usage, repo_relationships or sql for the rest."""
         return query.get_repo(con(), repo_id) or f"No repo named {repo_id!r}."
 
     @server.tool(annotations=READ_ONLY)
@@ -161,7 +163,8 @@ def build_server(db_path: Path) -> MCPServer:
     @server.tool(annotations=READ_ONLY)
     def repo_relationships(repo_id: str) -> dict[str, Any] | str:
         """Org repos this repo depends on (packages, actions, workflows, Terraform modules,
-        images, submodules) and the repos that depend on it."""
+        images, submodules) and the repos that depend on it. Each list shows up to 100
+        links (runtime ones first); depends_on_total / used_by_total count them all."""
         return query.repo_relationships(con(), repo_id) or f"No repo named {repo_id!r}."
 
     @server.tool(annotations=READ_ONLY)

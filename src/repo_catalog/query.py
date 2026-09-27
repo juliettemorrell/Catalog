@@ -8,6 +8,13 @@ import sqlite3
 import time
 from typing import Any
 
+from .outputs.sqlite import norm_name
+
+# list sizes in get_repo / repo_relationships answers (agents read them into a context
+# window); totals say how many there are and `sql` / `dependency_usage` return the rest
+MAX_LIST = 100
+MAX_DEPENDENCIES = 200
+
 
 def fts_query(text: str, mode: str = "AND") -> str:
     """Turn free text into a safe FTS5 expression with prefix matching.
@@ -177,7 +184,7 @@ def search_assets(
         con,
         query=query,
         fts="assets_fts",
-        weights="0, 8, 4, 4, 1, 3",
+        weights="0, 8, 4, 4, 4, 1, 3",
         cols=(
             "a.id, a.kind, a.ecosystem, a.name, a.description, a.summary, a.category, "
             "a.repo_id AS repo, a.path, a.url, a.quality_score, a.duplicate_count"
@@ -254,39 +261,114 @@ def list_flags(
     )
 
 
-def repo_relationships(con: sqlite3.Connection, repo_id: str) -> dict[str, Any] | None:
-    """Which org repos this one depends on, and which depend on it (blast radius)."""
+# runtime links first, then optional, dev, build and transitive ones (the via suffix)
+_LINK_ORDER = (
+    "CASE WHEN via LIKE '% (transitive)' THEN 4 WHEN via LIKE '% (build)' THEN 3 "
+    "WHEN via LIKE '% (dev)' THEN 2 WHEN via LIKE '% (optional)' THEN 1 ELSE 0 END, rowid"
+)
+
+
+def repo_relationships(
+    con: sqlite3.Connection, repo_id: str, *, limit: int = MAX_LIST
+) -> dict[str, Any] | None:
+    """Which org repos this one depends on, and which depend on it (blast radius). Each
+    list holds at most ``limit`` links, runtime ones first; ``*_total`` counts them all."""
     found = resolve_repo(con, repo_id)
     if isinstance(found, list):
         return _ambiguous(found)
     if found is None:
         return None
     rid = found
-    return {
-        "repo": rid,
-        "depends_on": _rows(
-            con.execute("SELECT depends_on AS repo, via FROM repo_links WHERE repo_id = ?", (rid,))
-        ),
-        "used_by": _rows(
-            con.execute("SELECT repo_id AS repo, via FROM repo_links WHERE depends_on = ?", (rid,))
-        ),
-    }
+    limit = _clamp(limit, 1000)
+    out: dict[str, Any] = {"repo": rid}
+    for key, col, other in (
+        ("depends_on", "repo_id", "depends_on"),
+        ("used_by", "depends_on", "repo_id"),
+    ):
+        out[key] = _rows(
+            con.execute(
+                f"SELECT {other} AS repo, via FROM repo_links WHERE {col} = ? "
+                f"ORDER BY {_LINK_ORDER} LIMIT ?",
+                (rid, limit),
+            )
+        )
+        total = con.execute(f"SELECT COUNT(*) FROM repo_links WHERE {col} = ?", (rid,)).fetchone()
+        out[f"{key}_total"] = total[0]
+    if out["depends_on_total"] > limit or out["used_by_total"] > limit:
+        out["note"] = (
+            f'Lists are capped at {limit} links. All of them: sql "SELECT repo_id, depends_on, '
+            f"via FROM repo_links WHERE depends_on = '{rid}'\" (used_by) or WHERE repo_id = "
+            "... (depends_on)."
+        )
+    return out
 
 
 def get_repo(
-    con: sqlite3.Connection, repo_id: str, *, include_transitive: bool = False
+    con: sqlite3.Connection,
+    repo_id: str,
+    *,
+    include_transitive: bool = False,
+    max_items: int | None = MAX_LIST,
 ) -> dict[str, Any] | None:
-    """Full record. Locked transitive dependencies (often thousands) are left out unless
-    asked for; `dependency_summary` has their count and `dependency_usage` queries them."""
+    """Full record, sized for an agent's context. Locked transitive dependencies (often
+    thousands) are left out unless asked for (`dependency_summary` counts them and
+    `dependency_usage` queries them); direct dependencies are capped at MAX_DEPENDENCIES
+    and other long lists (used_by, depends_on, flags...) at ``max_items``, with the full
+    lengths in `truncated`. ``max_items=None`` returns everything."""
     found = resolve_repo(con, repo_id)
     if isinstance(found, list):
         return _ambiguous(found)
     row = con.execute("SELECT json FROM repos WHERE id = ?", (found,)).fetchone() if found else None
     if not row:
         return None
+    rid = str(found)
     data: dict[str, Any] = json.loads(row[0])
-    if not include_transitive:
-        data["dependencies"] = [d for d in data["dependencies"] if d["scope"] != "transitive"]
+    # the json column holds direct dependencies; every row (transitive too) is in the table
+    data["dependencies"] = [d for d in data["dependencies"] if d["scope"] != "transitive"]
+    if include_transitive:
+        data["dependencies"] = [
+            {
+                "name": d["name"],
+                "version": d["version"],
+                "ecosystem": d["ecosystem"],
+                "scope": d["scope"],
+                "manifest": d["manifest"],
+                "resolved": d["resolved"],
+                "purl": d["purl"],
+                "vulns": d["vulns"].split() if d["vulns"] else [],
+            }
+            for d in _rows(
+                con.execute("SELECT * FROM dependencies WHERE repo_id = ? ORDER BY rowid", (rid,))
+            )
+        ]
+    total_used_by = con.execute(
+        "SELECT COUNT(*) FROM repo_links WHERE depends_on = ?", (rid,)
+    ).fetchone()[0]
+    total_depends_on = con.execute(
+        "SELECT COUNT(*) FROM repo_links WHERE repo_id = ?", (rid,)
+    ).fetchone()[0]
+    totals = {
+        "used_by": max(total_used_by, len(data.get("used_by", []))),
+        "depends_on": max(total_depends_on, len(data.get("depends_on", []))),
+    }
+    if max_items is None:
+        return data
+    truncated: dict[str, dict[str, int]] = {}
+    for key, value in list(data.items()):
+        cap = MAX_DEPENDENCIES if key == "dependencies" else max_items
+        total = totals.get(key, len(value) if isinstance(value, list) else 0)
+        if isinstance(value, list) and total > cap:
+            data[key] = value[:cap]
+            truncated[key] = {"shown": len(data[key]), "total": total}
+        elif key in totals and total > len(value):  # the record itself holds a capped list
+            truncated[key] = {"shown": len(value), "total": total}
+    if truncated:
+        data["truncated"] = truncated
+        data["truncated_note"] = (
+            "Long lists are cut to keep this answer small. The rest: dependency_usage or sql "
+            f"\"SELECT * FROM dependencies WHERE repo_id = '{rid}'\"; repo_relationships or "
+            "the repo_links table for used_by/depends_on; list_flags(repo=...) for flags."
+        )
     return data
 
 
@@ -301,13 +383,14 @@ def dependency_usage(
 ) -> list[dict[str, Any]]:
     """Every repo that ships a package (exact name, case-insensitive), with the declared and
     locked version, whether it is direct or transitive, where, and known advisories."""
-    # PyPI treats -, _ and . alike (PEP 503): typing_extensions == typing-extensions
-    pep503 = re.sub(r"[-_.]+", "-", name.lower())
+    # norm_name is indexed: lower case, and PEP 503 for PyPI (typing_extensions ==
+    # typing-extensions); other ecosystems keep - _ . distinct
+    lower, pep503 = norm_name("", name), norm_name("pypi", name)
     where = [
-        "(d.name = ? COLLATE NOCASE OR (d.ecosystem = 'pypi' AND "
-        "replace(replace(lower(d.name), '_', '-'), '.', '-') = ?))"
+        "d.norm_name IN (?, ?)",
+        "d.norm_name = CASE d.ecosystem WHEN 'pypi' THEN ? ELSE ? END",
     ]
-    params: list[Any] = [name, pep503]
+    params: list[Any] = [lower, pep503, pep503, lower]
     if ecosystem:
         where.append("d.ecosystem = ?")
         params.append(ecosystem)

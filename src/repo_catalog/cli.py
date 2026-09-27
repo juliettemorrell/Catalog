@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -10,7 +11,9 @@ import re
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -20,9 +23,9 @@ from .analyzers.org import link_org
 from .github import GitHubClient, GitHubError, RepoRef
 from .models import AIAsset, Repo
 from .outputs import exports, store
-from .outputs.sqlite import build_sqlite, dump_meta
+from .outputs.sqlite import CatalogDB, dump_meta
 from .scanner import ScanOptions, ScanResult, analyze_checkout, mark_duplicates, scan_all
-from .vulns import apply_vulnerabilities
+from .vulns import annotate, dependency_keys, lookup_vulnerabilities
 
 log = logging.getLogger("repo_catalog")
 
@@ -203,14 +206,25 @@ def cmd_scan(args: argparse.Namespace) -> int:
         provenance=not args.no_provenance,
         github_sbom=args.github_sbom,
     )
-    previous = store.load_previous(args.out)
+    # records without their transitive deps: those stay in the files (see store.write_repo)
+    with _gc_paused():
+        previous = store.load_previous(args.out, direct_only=True)
+    gc.freeze()  # long-lived and cycle-free: keep the collector from re-scanning it all run
     results: list[ScanResult] = []
     failures: dict[str, str] = {}
     discovered: set[str] = set()
     incomplete: set[str] = set()
 
+    saved_duplicates: dict[str, list[list[str]]] = {}
+
     def save(result: ScanResult) -> None:  # as each repo finishes: a killed run keeps work
-        store.write_repo(args.out, result.repo, result.assets)
+        # reused results come from `previous`, so their transitive deps are in the file
+        light = result.light or result.reused
+        store.write_repo(args.out, result.repo, result.assets, merge_transitive=light)
+        saved_duplicates[result.repo.id] = [a.duplicates for a in result.assets]
+        # a big org's transitive deps would not fit in memory for the whole run
+        store.strip_transitive(result.repo)
+        result.light = True
 
     if args.org or args.repo:
         try:
@@ -222,6 +236,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         report = scan_all(refs, opts, previous, on_result=save)
         results += report.results
         failures.update(report.failures)
+        del report
     local = _local_refs(args.local)
     if args.local and not local and not (args.org or args.repo):
         log.error("no git repositories found under %s", ", ".join(map(str, args.local)))
@@ -239,6 +254,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     continue
                 results.append(result)
                 save(result)
+            futures.clear()
     fresh = len(results)
 
     for failed in failures:  # keep last good data rather than dropping the repo
@@ -247,14 +263,19 @@ def cmd_scan(args: argparse.Namespace) -> int:
             note = f"latest scan failed: {failures[failed]}"
             errors = [e for e in repo.scan_errors if not e.startswith("latest scan failed")]
             repo = repo.model_copy(update={"scan_errors": [*errors, note]})
-            results.append(ScanResult(repo=repo, assets=assets, reused=True))
+            results.append(ScanResult(repo=repo, assets=assets, reused=True, light=True))
+    previous.clear()
+    gc.unfreeze()
 
     mark_duplicates([a for r in results for a in r.assets])
     for r in results:  # persist first: enrichment problems must never lose scan results
-        store.write_repo(args.out, r.repo, r.assets)
+        if saved_duplicates.get(r.repo.id) != [a.duplicates for a in r.assets]:
+            store.write_repo(args.out, r.repo, r.assets, merge_transitive=r.light or r.reused)
+    saved_duplicates.clear()
     if args.llm and _enrich(args, results):
         for r in results:
-            store.write_repo(args.out, r.repo, r.assets)
+            if not r.reused:  # only fresh scans are enriched
+                store.write_repo(args.out, r.repo, r.assets, merge_transitive=r.light)
     if args.org and not (args.match or args.exclude or args.limit):
         owners = {
             o.lower()
@@ -270,20 +291,17 @@ def cmd_scan(args: argparse.Namespace) -> int:
             _prune_clones(args.workdir, removed)
 
     source = ",".join([f"org:{o}" for o in args.org] + args.repo + [str(p) for p in args.local])
-    _build(args.out, source, llm=args.llm, osv=args.osv, failures=failures)
-    log.info(
-        "done: %d repos (%d scanned, %d reused), %d failed",
-        len(results),
-        sum(not r.reused for r in results),
-        sum(r.reused for r in results),
-        len(failures),
-    )
+    counts = (len(results), sum(not r.reused for r in results), sum(r.reused for r in results))
+    results.clear()  # _build reloads everything from the files; free this run's copies
+    rejected = _build(args.out, source, llm=args.llm, osv=args.osv, failures=failures)
+    log.info("done: %d repos (%d scanned, %d reused), %d failed", *counts, len(failures))
     for name, err in failures.items():
         log.warning("FAILED %s: %s", name, err)
-    # 1: nothing usable; 2: the catalog was written but some repos failed (see meta)
-    if failures:
-        return 1 if not fresh else 2
-    return 0
+    # 1: nothing usable; 2: the catalog was written but some repos failed (see meta) or
+    # stored records could not be loaded (see the warning above)
+    if failures and not fresh:
+        return 1
+    return 2 if failures or rejected else 0
 
 
 def _prune_clones(workdir: Path, slugs: list[str]) -> None:
@@ -434,30 +452,93 @@ def _enrich(args: argparse.Namespace, results: list[ScanResult]) -> bool:
 def cmd_build(args: argparse.Namespace) -> int:
     if not (args.out / store.REPOS_DIR).is_dir():
         sys.exit(f"{args.out / store.REPOS_DIR} not found; run `repo-catalog scan` first.")
-    _build(args.out, args.source, llm=False, osv=args.osv)
-    return 0
+    rejected = _build(args.out, args.source, llm=False, osv=args.osv)
+    return 2 if rejected else 0
+
+
+@contextmanager
+def _gc_paused() -> Iterator[None]:
+    """Building creates millions of small objects and hardly any reference cycles; the
+    cyclic collector would re-scan the growing heap over and over (most of the load time
+    at scale), so it is paused for the duration."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def _build(
     out: Path, source: str, llm: bool, osv: bool = False, failures: dict[str, str] | None = None
-) -> None:
-    prev = store.load_previous(out)
-    repos: list[Repo] = sorted((r for r, _ in prev.values()), key=lambda r: r.id.lower())
-    assets: list[AIAsset] = [
-        a for r in repos for a in sorted(prev[r.id][1], key=lambda a: (a.kind, a.path))
-    ]
-    mark_duplicates(assets)
-    link_org(repos, assets)
-    if osv:
-        hits = apply_vulnerabilities(repos, Path(".cache/osv"))
-        log.info("OSV: %d vulnerable dependency versions", hits)
-    llm = llm or any(r.summary.source == "llm" for r in repos)
-    meta = store.write_aggregates(out, repos, assets, source, llm, failures or {})
-    build_sqlite(out / DB_FILE, repos, assets, dump_meta(meta.model_dump(mode="json")))
-    exports.write_backstage(out / "backstage-entities.yaml", repos)
-    exports.write_aibom(out / "ai-bom.cdx.json", repos, assets, source)
-    exports.write_sboms(out / "sbom", repos)
-    log.info("wrote %d repos and %d AI assets to %s", len(repos), len(assets), out)
+) -> int:
+    """Aggregates, SQLite and exports from ``out/repos``. Returns the number of stored
+    records that could not be loaded (they are left out of the catalog).
+
+    Memory stays proportional to the direct dependencies: locked transitive ones (most of
+    a large org's dependency rows) are read back from each repo's file, one repo at a
+    time, for the outputs that list them (SQLite, SBOMs, the OSV lookup)."""
+    with _gc_paused():
+        prev = store.load_previous(out, direct_only=True)
+        if prev.rejected:
+            log.warning(
+                "%d stored record(s) in %s could not be loaded and are NOT in this catalog "
+                "(rescan them, or delete the files): %s",
+                len(prev.rejected),
+                out / store.REPOS_DIR,
+                ", ".join(sorted(prev.rejected)[:20]) + (" ..." if len(prev.rejected) > 20 else ""),
+            )
+        repos: list[Repo] = sorted((r for r, _ in prev.values()), key=lambda r: r.id.lower())
+        assets: list[AIAsset] = [
+            a for r in repos for a in sorted(prev[r.id][1], key=lambda a: (a.kind, a.path))
+        ]
+        paths = prev.paths
+        rejected = len(prev.rejected)
+
+        def full(r: Repo) -> Repo:  # the record with its transitive deps, for one output
+            return r.model_copy(update={"dependencies": store.full_dependencies(paths[r.id], r)})
+
+        duplicate_counts = mark_duplicates(assets)
+        links = link_org(repos, assets, transitive=prev.transitive_refs)
+        del prev  # with the packed transitive names, only needed for linking
+        findings = None
+        if osv:
+            keys = dependency_keys(d for r in repos for d in full(r).dependencies)
+            findings = lookup_vulnerabilities(keys, Path(".cache/osv"))
+            hits = 0
+            for r in repos:
+                record = full(r)  # shares r's direct Dependency objects: they get the ids
+                hits += annotate(record, findings)
+                r.flags, r.dependency_summary = record.flags, record.dependency_summary
+            log.info("OSV: %d vulnerable dependency versions", hits)
+        llm = llm or any(r.summary.source == "llm" for r in repos)
+        used_by_totals: dict[str, int] = {}
+        for targets in links.values():
+            for link in targets:
+                used_by_totals[link.repo] = used_by_totals.get(link.repo, 0) + 1
+        meta = store.write_aggregates(
+            out, repos, assets, source, llm, failures or {}, used_by_totals, duplicate_counts
+        )
+        store.write_site_details(out, repos, assets)  # drawer/Insights detail for the web UI
+        exports.write_backstage(out / "backstage-entities.yaml", repos)
+        exports.write_aibom(out / "ai-bom.cdx.json", repos, assets, source)
+        sboms = exports.SbomWriter(out / "sbom")
+        with CatalogDB(out / DB_FILE, dump_meta(meta.model_dump(mode="json"))) as db:
+            for r in repos:
+                record = full(r)
+                if findings is not None:
+                    for d in record.dependencies:
+                        if d.scope == "transitive":
+                            d.vulns = findings.vulns_for(d)
+                db.add_repo(record, links.get(r.id))
+                sboms.write(record)
+            for a in assets:
+                db.add_asset(a, duplicate_counts.get(a.id))
+        sboms.finish()
+        log.info("wrote %d repos and %d AI assets to %s", len(repos), len(assets), out)
+    gc.collect()
+    return rejected
 
 
 def _connect(out: Path) -> sqlite3.Connection:
