@@ -314,7 +314,7 @@ def _link(repos: list[Repo], assets_by_repo: dict[str, list[AIAsset]] | None = N
             for target in sorted(api_providers.get(_entity_name(api), ())):
                 link(repo, target, f"consumes API {api}")
         for asset in assets_by_repo.get(repo.id, []):
-            if asset.kind != "mcp-config":
+            if asset.kind not in ("mcp-config", "settings"):
                 continue
             servers = asset.frontmatter.get("servers")
             for name, cfg in (servers if isinstance(servers, dict) else {}).items():

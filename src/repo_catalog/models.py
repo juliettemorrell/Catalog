@@ -285,6 +285,7 @@ AssetKind = Literal[
     "instructions",  # always-on context: CLAUDE.md, AGENTS.md, rules files
     "mcp-server",  # an MCP server implemented in this repo
     "mcp-config",  # MCP servers this repo configures/consumes
+    "settings",  # agent tool settings: permission policy, auto-approved MCP servers
     "hook",  # agent lifecycle hooks
     "plugin",  # plugin / marketplace manifest bundling other assets
     "eval",  # evals / prompt tests

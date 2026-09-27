@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -31,12 +32,37 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     except (yaml.YAMLError, RecursionError, ValueError):
         pass
     fallback: dict[str, Any] = {}
+    last_key: str | None = None
     for line in raw.splitlines():
+        item = line.strip()
+        if last_key and item.startswith("- ") and (line[:1] in (" ", "\t", "-")):
+            # block list under the previous key (``tools:`` then ``  - Read`` lines)
+            current = fallback.get(last_key)
+            if current == "" or isinstance(current, list):
+                items = current if isinstance(current, list) else []
+                items.append(_fallback_value(item[2:]))
+                fallback[last_key] = items
+            continue
         key, sep, val = line.partition(":")
         if sep and key.strip() and not key.startswith((" ", "\t", "-")):
-            v = val.strip().strip("'\"")
-            fallback[key.strip()] = {"true": True, "false": False}.get(v.lower(), v)
+            last_key = key.strip()
+            fallback[last_key] = _fallback_value(val.strip())
     return fallback, body
+
+
+def _fallback_value(v: str) -> Any:
+    """One frontmatter value when the whole block is not valid YAML: flow lists and maps
+    (``tools: ["Read", "Grep"]``, ``[Read, Grep]``) are parsed on their own."""
+    if v[:1] in ("[", "{"):
+        for parse in (json.loads, load_yaml):
+            try:
+                parsed = parse(v)
+            except (ValueError, yaml.YAMLError, RecursionError, TypeError):
+                continue
+            if isinstance(parsed, list | dict):
+                return _jsonable(parsed)
+    v = v.strip("'\"")
+    return {"true": True, "false": False}.get(v.lower(), v)
 
 
 def _jsonable(v: Any, depth: int = 0) -> Any:
@@ -94,6 +120,37 @@ def excerpt(body: str, limit: int = 280) -> str | None:
     return text if len(text) <= limit else text[: limit - 1].rsplit(" ", 1)[0] + "…"
 
 
+_HTML = re.compile(
+    r"<(?:!doctype\s+html|html|head|body|div|span|table|tr|td|th|style|script|meta|link|br|"
+    r"img|form|input|button|ul|ol|li|h[1-6]|p|a\s+href)\b[^>]{0,300}>",
+    re.I,
+)
+
+
+def looks_like_html(text: str) -> bool:
+    """HTML templates and pages, which are not prompts even when named ``*_template``."""
+    head = text.lstrip()[:200].lower()
+    if head.startswith(("<!doctype html", "<html", "<svg")):
+        return True
+    return len(_HTML.findall(text[:50_000])) >= 8
+
+
+NEGATION = re.compile(
+    r"(?i)\b(?:never|don'?t|do\s+not|does\s+not|must\s+not|should\s+not|shouldn'?t|avoid|"
+    r"without|instead\s+of|forbid(?:den)?|prohibited|disallow(?:ed)?)\b"
+)
+
+
+def negated(text: str, start: int) -> bool:
+    """True when the match at ``start`` sits in a clearly negated sentence on its line
+    ("Never pass --dangerously-skip-permissions", "Do NOT use curl ... | sh")."""
+    line_start = text.rfind("\n", 0, start) + 1
+    prefix = text[line_start:start]
+    # only the current sentence: "Never do X. Run curl | sh" is not negated
+    prefix = re.split(r"[.!?;](?:\s|$)", prefix)[-1]
+    return NEGATION.search(prefix) is not None
+
+
 EXAMPLE_PATH = re.compile(
     r"(^|/)(examples?|samples?|demos?|templates?|cookbooks?|tutorials?|starters?|snippets|docs_src)/",
     re.I,
@@ -142,6 +199,9 @@ class AssetDraft:
     license: str | None = None
     version: str | None = None
     line: int | None = None
+    # the description was written by the scanner (e.g. "MCP server exposing 3 tool(s)"),
+    # not by the asset's author: it must not earn quality points
+    auto_description: bool = False
 
     def build(self, ctx: RepoContext) -> AIAsset:
         from .flags import find_secrets  # local import: flags depends on manifests
@@ -198,7 +258,7 @@ class AssetDraft:
                     path=self.path,
                 )
             )
-        score_asset(asset, body)
+        score_asset(asset, body, authored_description=not self.auto_description)
         return asset
 
 
@@ -215,8 +275,9 @@ def _uniq(items: list[str]) -> list[str]:
 _SKILL_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 
-def score_asset(a: AIAsset, body: str) -> None:
-    """0-100 heuristic of how reusable/well-specified an asset is, with actionable notes."""
+def score_asset(a: AIAsset, body: str, authored_description: bool = True) -> None:
+    """0-100 heuristic of how reusable/well-specified an asset is, with actionable notes.
+    ``authored_description=False`` when the scanner generated the description itself."""
     score, notes = 0, []
 
     def add(points: int, ok: bool, note: str) -> None:
@@ -226,19 +287,19 @@ def score_asset(a: AIAsset, body: str) -> None:
         else:
             notes.append(note)
 
-    desc = a.description or ""
+    desc = (a.description or "") if authored_description else ""
     add(25, bool(desc), "Missing description (agents route on it).")
     add(10, 40 <= len(desc) <= 1024 or not desc, "Description is very short or over 1024 chars.")
     add(15, a.word_count >= 60, "Body is thin; add instructions, context or examples.")
     add(
         10,
-        bool(a.headings) or a.kind in ("mcp-config", "hook", "sdk-usage", "mcp-server"),
+        bool(a.headings) or a.kind in ("mcp-config", "settings", "hook", "sdk-usage", "mcp-server"),
         "No section headings; structure helps both humans and models.",
     )
     add(
         10,
         bool(re.search(r"```|<example>|\bexample", body, re.I))
-        or a.kind in ("mcp-config", "hook", "instructions", "sdk-usage"),
+        or a.kind in ("mcp-config", "settings", "hook", "instructions", "sdk-usage"),
         "No examples.",
     )
     add(10, a.line_count <= 500, "Very long (>500 lines); consider splitting into references.")

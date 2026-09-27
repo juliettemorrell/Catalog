@@ -53,3 +53,4 @@ addopts = "-q"
 "tests/test_scan.py" = ["E501"]  # fixture file contents read best unwrapped
 "tests/test_cli.py" = ["E501"]  # fixture file contents read best unwrapped
 "tests/test_review_fixes.py" = ["E501"]  # fixture file contents read best unwrapped
+"tests/test_sweep2_*.py" = ["E501"]  # fixture file contents read best unwrapped

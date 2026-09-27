@@ -14,7 +14,7 @@ interface State { tab: Tab; q: string; open: string | null }
 const PAGE = 60;
 const KIND_LABEL: Record<string, string> = {
   skill: "Skill", agent: "Agent", command: "Command", prompt: "Prompt", instructions: "Rules / instructions",
-  "mcp-server": "MCP server", "mcp-config": "MCP config", hook: "Hook", plugin: "Plugin", eval: "Eval",
+  "mcp-server": "MCP server", "mcp-config": "MCP config", settings: "Settings", hook: "Hook", plugin: "Plugin", eval: "Eval",
   workflow: "Workflow", "sdk-usage": "LLM SDK usage",
 };
 const TAB_TITLE: Record<Tab, string> = { repos: "Repositories", assets: "AI Asset Library", blocks: "Building blocks", insights: "Insights" };

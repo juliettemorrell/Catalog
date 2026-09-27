@@ -96,8 +96,9 @@ def build_server(db_path: Path) -> MCPServer:
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         """Search the AI asset library. kind: skill, agent, command, prompt, instructions,
-        mcp-server, mcp-config, hook, plugin, eval, workflow, sdk-usage. ecosystem: claude-code,
-        agent-skills, copilot, cursor, agents-md, windsurf, gemini, crewai, langgraph, ..."""
+        mcp-server, mcp-config, settings, hook, plugin, eval, workflow, sdk-usage.
+        ecosystem: claude-code, agent-skills, copilot, cursor, agents-md, windsurf, gemini,
+        crewai, langgraph, ..."""
         return query.search_assets(
             con(),
             query_text,

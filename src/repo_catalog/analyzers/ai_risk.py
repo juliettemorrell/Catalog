@@ -11,6 +11,7 @@ import shlex
 from typing import Any
 
 from ..models import AIAsset, Flag, Severity
+from .ai_common import negated
 
 _BYPASS = re.compile(
     r"--dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox|"
@@ -22,11 +23,20 @@ _REMOTE_EXEC = re.compile(
     r"\b(?:curl|wget)\b[^|;&\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b|"
     r"\b(?:ba|z)?sh\s+-c\s+[\"']?\$\((?:curl|wget)\b|\biex\s*\(\s*(?:irm|iwr|Invoke-WebRequest)"
 )
-_SHELL_TOOLS = {"Bash", "Bash(*)", "Bash(:*)", "Bash(*:*)"}
+_SHELL_TOOLS = {"Bash", "Bash(*)", "Bash(:*)", "Bash(*:*)", "run_shell_command"}
 _LOCAL_HOSTS = re.compile(
     r"^https?://(?:localhost|127\.|0\.0\.0\.0|\[::1\]|host\.docker\.internal)"
 )
-_BYPASS_KINDS = {"hook", "mcp-config", "workflow", "plugin", "command", "agent", "skill"}
+_BYPASS_KINDS = {
+    "hook",
+    "mcp-config",
+    "settings",
+    "workflow",
+    "plugin",
+    "command",
+    "agent",
+    "skill",
+}
 
 
 def asset_flags(a: AIAsset) -> list[Flag]:
@@ -39,12 +49,12 @@ def asset_flags(a: AIAsset) -> list[Flag]:
             )
 
     content = a.content or ""
-    if a.kind in _BYPASS_KINDS and (m := _BYPASS.search(content)):
+    if a.kind in _BYPASS_KINDS and (m := _affirmed(_BYPASS, content)):
         # docs-like assets describing the flag are less certain than configs running it
         sev: Severity = "medium" if a.kind in ("skill", "agent", "command") else "high"
         add("ai-permissions-bypassed", sev, f"Runs an agent with approvals disabled ({m.group(0)})")
-    if a.kind in ("hook", "command", "skill", "workflow", "plugin") and _REMOTE_EXEC.search(
-        content
+    if a.kind in ("hook", "command", "skill", "workflow", "plugin") and _affirmed(
+        _REMOTE_EXEC, content
     ):
         # hooks/workflows run it automatically; skills and commands tell an agent to
         remote_sev: Severity = "high" if a.kind in ("hook", "workflow", "plugin") else "medium"
@@ -55,12 +65,81 @@ def asset_flags(a: AIAsset) -> list[Flag]:
             "low",
             "Allows any shell command; scope it (e.g. Bash(git:*), Bash(npm test:*))",
         )
-    if a.kind == "mcp-config":
+    if a.detector == "claude-settings":
+        _settings_flags(a.frontmatter, add)
+    if a.kind in ("mcp-config", "settings"):
         servers = a.frontmatter.get("servers")
         for name, cfg in (servers if isinstance(servers, dict) else {}).items():
             if isinstance(cfg, dict):
                 _mcp_server_flags(str(name), cfg, add)
     return flags
+
+
+def _affirmed(rx: re.Pattern[str], text: str) -> re.Match[str] | None:
+    """First match that is not in a clearly negated sentence ("Never pass --yolo")."""
+    for m in rx.finditer(text):
+        if not negated(text, m.start()):
+            return m
+    return None
+
+
+# interpreters and launchers: ``Bash(python:*)`` approves arbitrary code, not one tool
+_INTERPRETERS = (
+    "python",
+    "python3",
+    "node",
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "pwsh",
+    "powershell",
+    "ruby",
+    "perl",
+    "php",
+    "deno",
+    "bun",
+    "npx",
+    "uvx",
+    "eval",
+    "sudo",
+    "env",
+    "xargs",
+    "curl",
+    "wget",
+)
+_BROAD_BASH = re.compile(
+    r"^Bash(?:\(\s*(?:\*|:\*|\*:\*|(?:" + "|".join(_INTERPRETERS) + r")(?:\s*:?\s*\*))\s*\))?$"
+)
+
+
+def _settings_flags(settings: dict[str, Any], add: Any) -> None:
+    """Claude Code settings committed to the repo apply to everyone who opens it."""
+    perms = settings.get("permissions")
+    perms = perms if isinstance(perms, dict) else {}
+    allow = [str(x) for x in perms.get("allow") or [] if isinstance(x, str)]
+    broad = [x for x in allow if _BROAD_BASH.match(x.strip())]
+    if broad:
+        add(
+            "ai-unrestricted-shell",
+            "medium",
+            "Settings auto-approve arbitrary shell commands ("
+            + ", ".join(broad[:3])
+            + "); allow specific commands instead",
+        )
+    if settings.get("enableAllProjectMcpServers") is True:
+        add(
+            "mcp-auto-approved",
+            "medium",
+            "Settings auto-enable every MCP server in .mcp.json (enableAllProjectMcpServers); "
+            "list approved servers in enabledMcpjsonServers",
+        )
+    if settings.get("local"):
+        add(
+            "ai-local-settings-committed",
+            "low",
+            "settings.local.json holds personal overrides and should be git-ignored",
+        )
 
 
 def _mcp_server_flags(name: str, cfg: dict[str, Any], add: Any) -> None:

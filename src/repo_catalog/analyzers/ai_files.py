@@ -32,7 +32,7 @@ from ..textutil import (
     redact_url,
     sanitize_config,
 )
-from .ai_common import AssetDraft, as_list, parse_frontmatter
+from .ai_common import AssetDraft, as_list, looks_like_html, parse_frontmatter
 from .flags import find_secrets
 
 log = logging.getLogger(__name__)
@@ -48,7 +48,9 @@ MARKDOWN_RULES: list[tuple[str, str, str, str]] = [
     ("**/CLAUDE.local.md", "instructions", "claude-code", "claude-md"),
     ("**/AGENTS.md", "instructions", "agents-md", "agents-md"),
     ("**/AGENT.md", "instructions", "agents-md", "agents-md"),
+    ("**/AGENTS.override.md", "instructions", "codex", "agents-md"),
     ("**/GEMINI.md", "instructions", "gemini", "gemini-md"),
+    ("**/.gemini/agents/**/*.md", "agent", "gemini", "gemini-subagent"),
     ("**/.github/copilot-instructions.md", "instructions", "copilot", "copilot-instructions"),
     ("**/.github/prompts/**/*.prompt.md", "command", "copilot", "copilot-prompt"),
     ("**/.github/agents/**/*.md", "agent", "copilot", "copilot-agent"),
@@ -63,9 +65,12 @@ MARKDOWN_RULES: list[tuple[str, str, str, str]] = [
     ("**/.windsurfrules", "instructions", "windsurf", "windsurf-rule"),
     ("**/.windsurf/workflows/**/*.md", "command", "windsurf", "windsurf-workflow"),
     ("**/.clinerules", "instructions", "cline", "cline-rule"),
+    ("**/.clinerules/workflows/**/*.md", "command", "cline", "cline-workflow"),
     ("**/.clinerules/**/*.md", "instructions", "cline", "cline-rule"),
     ("**/.cline/rules/**/*.md", "instructions", "cline", "cline-rule"),
     ("**/.roo/rules*/**/*.md", "instructions", "roo", "roo-rule"),
+    ("**/.roo/commands/**/*.md", "command", "roo", "roo-command"),
+    ("**/.rules", "instructions", "zed", "zed-rules"),
     ("**/.kiro/steering/**/*.md", "instructions", "kiro", "kiro-steering"),
     ("**/.amazonq/rules/**/*.md", "instructions", "amazon-q", "amazonq-rule"),
     ("**/.junie/guidelines.md", "instructions", "junie", "junie-guidelines"),
@@ -108,6 +113,18 @@ _PROMPT_EXT = (
     ".liquid",
 )
 _SKIP_NAMES = {"readme.md", "license", "license.md", "changelog.md", "index.md"}
+# Folders whose files talk *about* prompts (docs, sites, blogs, translations) or exercise
+# the tool under test (fixtures): a "prompts.md" there is a page, not a prompt asset.
+_NOT_PROMPT_DIR = re.compile(
+    r"(^|/)(docs?|site|website|www|blog|i18n|locales?|tests?|__tests__|spec|fixtures?|"
+    r"__fixtures__|testdata|test[-_]?data|mocks?|__mocks__|e2e|snapshots?|__snapshots__)/",
+    re.I,
+)
+# Test-utility folders: promptfoo configs and MCP servers there exercise the tooling.
+_TEST_UTIL_DIR = re.compile(r"(^|/)(fixtures?|__fixtures__|testdata|test[-_]?utils?)/", re.I)
+# Names that must match exactly (the agents read them case-sensitively on Linux, and
+# ``docs/agents.md`` or ``docs/skill.md`` are ordinary pages).
+_EXACT_NAME = re.compile(r"^[^*?\[{]+$")
 _TRIGGER_KEYS = ("globs", "applyTo", "paths", "fileMatchPattern", "regex")
 _TRIGGER_SCALARS = ("trigger", "when-to-use", "when_to_use", "inclusion")
 
@@ -122,6 +139,7 @@ MCP_CONFIG_GLOBS = (
     "**/claude_desktop_config.json",
     "**/.gemini/settings.json",
     "**/.claude/settings.json",
+    "**/.claude/settings.local.json",
     "**/.idx/mcp.json",
     "**/.trae/mcp.json",
 )
@@ -137,12 +155,39 @@ class FileDetector:
         self.mcp_consumed: set[str] = set()
         self.mcp_provided: set[str] = set()
         self.plugin_roots = self._plugin_roots()
+        # folders of Agent Skills: their templates, references and examples belong to the
+        # skill (they are bundled into its ``files``), never separate repo-level assets
+        self.skill_dirs = sorted(
+            {
+                str(PurePosixPath(f.path).parent)
+                for f in self.files.glob("**/SKILL.md")
+                if f.name == "SKILL.md" and "/" in f.path
+            },
+            key=len,
+            reverse=True,
+        )
+
+    def _in_skill(self, path: str) -> bool:
+        return any(path.startswith(d + "/") for d in self.skill_dirs) and not (
+            path.endswith("/SKILL.md")
+        )
+
+    def _in_bundle(self, path: str) -> bool:
+        """Inside a skill folder or a (non-root) plugin: claimed by that skill/plugin."""
+        if self._in_skill(path):
+            return True
+        root = self._plugin_root_of(path)
+        return bool(root)
 
     def run(self) -> list[AssetDraft]:
         steps: list[tuple[Callable[[], Iterable[Any]], Callable[[Any], None]]] = [
             (lambda: self.files.glob("**/.claude-plugin/plugin.json"), self._claude_plugin),
             (lambda: self.files.glob("**/plugin.json"), self._agent_plugin),
             (lambda: self.files.glob("**/.claude-plugin/marketplace.json"), self._marketplace),
+            (
+                lambda: self.files.glob("**/.agents/plugins/marketplace.json"),
+                lambda e: self._marketplace(e, "codex"),
+            ),
             (lambda: self.files.glob("**/gemini-extension.json"), self._gemini_extension),
             (self._markdown_entries, self._markdown_one),
             (lambda: self.files.glob("**/*.mdc"), self._cursor_mdc),
@@ -155,6 +200,13 @@ class FileDetector:
                 lambda: self.files.glob("**/hooks.json", "**/.github/hooks/**/*.json"),
                 self._hook_file,
             ),
+            (lambda: self.files.glob("**/.kiro/hooks/*.kiro.hook"), self._kiro_hook),
+            (self._kiro_specs, self._kiro_spec),
+            (
+                lambda: self.files.glob("**/.gemini/settings.json"),
+                lambda e: self._hooks_from_json(e, "gemini-settings-hooks", ecosystem="gemini"),
+            ),
+            (lambda: self.files.glob("**/.aider.conf.{yml,yaml}"), self._aider),
             (
                 lambda: self.files.glob(
                     "**/.claude/settings.json", "**/.claude/settings.local.json"
@@ -165,12 +217,19 @@ class FileDetector:
             (lambda: self.files.files, self._prompt_dir),
             (lambda: self.files.glob(*MCP_CONFIG_GLOBS), self._mcp_config_json),
             (lambda: self.files.glob("**/.codex/config.toml"), self._mcp_config_codex),
+            (lambda: self.files.glob("**/opencode.{json,jsonc}"), self._opencode),
+            (
+                lambda: self.files.glob("**/.continue/mcpServers/*.{yaml,yml,json}"),
+                self._continue_mcp,
+            ),
             (lambda: self.files.glob("**/server.json"), self._mcp_registry),
             (lambda: self.files.glob("**/.gemini/commands/**/*.toml"), self._gemini_command),
             (lambda: self.files.glob("**/.roomodes"), self._roomodes),
             (
                 lambda: self.files.glob(
-                    "**/.well-known/agent{,-card}.json", "**/agent{-,_,}card.json"
+                    "**/.well-known/agent{,-card}.json",
+                    "**/*agent{-,_,}card.json",
+                    "**/agent{-,_}cards/**/*.json",
                 ),
                 self._a2a_card,
             ),
@@ -179,9 +238,13 @@ class FileDetector:
             (lambda: self.files.glob("**/langgraph.json"), self._langgraph),
             (
                 lambda: self.files.glob(
-                    "**/promptfooconfig.{yaml,yml,json}", "**/promptfoo*.{yaml,yml}"
+                    "**/*promptfooconfig*.{yaml,yml,json}", "**/promptfoo*.{yaml,yml}"
                 ),
                 self._promptfoo,
+            ),
+            (
+                lambda: self.files.glob(".github/workflows/copilot-setup-steps.{yml,yaml}"),
+                self._copilot_setup,
             ),
             (lambda: self.files.glob(".github/workflows/*.{yml,yaml}"), self._ai_workflow),
         ]
@@ -258,7 +321,15 @@ class FileDetector:
         out: list[tuple[FileEntry, str, str, str]] = []
         seen: set[str] = set()
         for glob, kind, eco, detector in MARKDOWN_RULES:
+            last = glob.rsplit("/", 1)[-1]
+            exact = last if _EXACT_NAME.match(last) else None
             for entry in self.files.glob(glob):
+                if exact and entry.name != exact:
+                    continue  # docs/agents.md, docs/skill.md: pages, not conventions
+                if entry.name.lower().startswith("readme.") or self._in_skill(entry.path):
+                    # README.instructions.md indexes; templates/ inside a skill folder
+                    seen.add(entry.path)
+                    continue
                 if entry.path not in seen:
                     seen.add(entry.path)
                     out.append((entry, kind, eco, detector))
@@ -292,7 +363,8 @@ class FileDetector:
         elif kind == "instructions" and not name:
             name = (
                 entry.path
-                if path.name.upper() in {"CLAUDE.MD", "AGENTS.MD", "GEMINI.MD", "AGENT.MD"}
+                if path.name.upper()
+                in {"CLAUDE.MD", "AGENTS.MD", "GEMINI.MD", "AGENT.MD", "AGENTS.OVERRIDE.MD"}
                 else path.name.split(".")[0] or path.name
             )
         else:
@@ -314,13 +386,18 @@ class FileDetector:
             version=_str(fm.get("version")),
             tags=tags,
         )
+        draft.auto_description = not _str(fm.get("description")) and bool(draft.description)
         draft.tools = as_list(fm.get("allowed-tools") or fm.get("tools") or fm.get("allowedTools"))
         model = fm.get("model")
         if isinstance(model, dict):
             conf = model.get("configuration")
             model = (conf.get("model") if isinstance(conf, dict) else None) or model.get("name")
-        if model and str(model) != "inherit":
-            draft.models.append(str(model))
+        # Copilot agents list fallback models: ``model: ['GPT-5', 'Claude Sonnet 4.6']``
+        draft.models += [
+            str(m).strip()
+            for m in (as_list(model) if isinstance(model, list) else [model])
+            if _model_ok(m)
+        ]
         for key in _TRIGGER_KEYS:
             draft.triggers += as_list(fm.get(key))
         for key in _TRIGGER_SCALARS:
@@ -424,11 +501,14 @@ class FileDetector:
             or not name_lc.endswith(_PROMPT_EXT)
             or name_lc.endswith((".prompt.yml", ".prompt.yaml"))
             or name_lc in _SKIP_NAMES
+            or "promptfoo" in name_lc  # eval configs (handled by _promptfoo)
             or entry.size > 200_000
+            or _NOT_PROMPT_DIR.search(entry.path)
+            or self._in_bundle(entry.path)
         ):
             return
         text = self._read(entry)
-        if not text or len(text.strip()) < 40:
+        if not text or len(text.strip()) < 40 or looks_like_html(text):
             return
         fm, body = parse_frontmatter(text)
         variables = sorted(set(re.findall(r"\{\{\s*([\w.]+)\s*\}\}|\{(\w+)\}", body)))
@@ -475,6 +555,11 @@ class FileDetector:
         data = self._json(entry)
         if not isinstance(data, dict):
             return
+        if entry.name in ("settings.json", "settings.local.json") and "/.claude/" in (
+            "/" + entry.path
+        ):
+            self._claude_settings(entry, data)
+            return
         servers = data.get("mcpServers") or data.get("servers") or {}
         if isinstance(servers, dict) and servers:
             self._mcp_config_asset(entry, servers, _mcp_eco(entry.path))
@@ -484,10 +569,10 @@ class FileDetector:
         if isinstance(servers, dict) and servers:
             self._mcp_config_asset(entry, servers, "codex")
 
-    def _mcp_config_asset(self, entry: FileEntry, servers: dict[str, Any], eco: str) -> None:
+    def _mcp_summary(self, servers: dict[str, Any]) -> dict[str, dict[str, Any]]:
         summary: dict[str, dict[str, Any]] = {}
         for name, cfg in servers.items():
-            cfg = cfg if isinstance(cfg, dict) else {}
+            cfg = _normalize_server(cfg)
             args: list[Any] = cfg["args"] if isinstance(cfg.get("args"), list) else []
             url = cfg.get("url") or cfg.get("serverUrl") or cfg.get("httpUrl")
             env: dict[str, Any] = cfg["env"] if isinstance(cfg.get("env"), dict) else {}
@@ -503,6 +588,18 @@ class FileDetector:
                 "inline_secret": _has_inline_secret(cfg, env),
             }
             self.mcp_consumed.add(str(name))
+        return summary
+
+    def _mcp_config_asset(
+        self,
+        entry: FileEntry,
+        servers: dict[str, Any],
+        eco: str,
+        scope: str = "repo",
+    ) -> None:
+        summary = self._mcp_summary(servers)
+        if not summary:
+            return
         self.drafts.append(
             AssetDraft(
                 kind="mcp-config",
@@ -516,9 +613,129 @@ class FileDetector:
                 mcp_servers=list(summary),
                 description=f"Configures {len(summary)} MCP server(s): "
                 + ", ".join(list(summary)[:8]),
+                scope=scope,
+                auto_description=True,
             )
         )
         self.claimed.add(entry.path)
+
+    def _bundled_mcp(self, entry: FileEntry, value: Any, root: str, eco: str) -> None:
+        """``mcpServers`` of a plugin/extension manifest: inline, or a path to a JSON file.
+        They launch like any .mcp.json server, so they get the same governance checks."""
+        if isinstance(value, str) and not value.startswith(("/", "http")):
+            target = (PurePosixPath(root or ".") / value.removeprefix("./")).as_posix()
+            if target.startswith("./"):
+                target = target[2:]
+            if (
+                target in self.claimed
+                or not self.files.exists(target)
+                or PurePosixPath(target).name in (".mcp.json", "mcp.json")  # globbed anyway
+            ):
+                return
+            data = load_json(self.files.read(target) or "{}")
+            value = data.get("mcpServers", data) if isinstance(data, dict) else None
+        if isinstance(value, dict) and value:
+            self._mcp_config_asset(entry, value, eco, scope="plugin")
+
+    def _claude_settings(self, entry: FileEntry, data: dict[str, Any]) -> None:
+        """Claude Code ``.claude/settings(.local).json``: permission rules and MCP approval.
+        Only the policy is kept (never env values or other personal settings)."""
+        perms: dict[str, Any] = (
+            data["permissions"] if isinstance(data.get("permissions"), dict) else {}
+        )
+        local = entry.name == "settings.local.json"
+        policy: dict[str, Any] = {
+            "defaultMode": _str(perms.get("defaultMode")),
+            "allow": [str(x) for x in as_list_raw(perms.get("allow"))][:200],
+            "deny": [str(x) for x in as_list_raw(perms.get("deny"))][:200],
+            "ask": [str(x) for x in as_list_raw(perms.get("ask"))][:200],
+        }
+        enabled = [str(x) for x in as_list_raw(data.get("enabledMcpjsonServers"))][:100]
+        settings: dict[str, Any] = {
+            "permissions": {k: v for k, v in policy.items() if v},
+            "enableAllProjectMcpServers": data.get("enableAllProjectMcpServers") is True,
+            "enabledMcpjsonServers": enabled,
+            "local": local,
+            "env": sorted(str(k) for k in data["env"]) if isinstance(data.get("env"), dict) else [],
+        }
+        servers = data.get("mcpServers")
+        summary = self._mcp_summary(servers) if isinstance(servers, dict) else {}
+        if summary:
+            settings["servers"] = summary
+        policy_set = settings["permissions"] or settings["enableAllProjectMcpServers"] or enabled
+        if not (policy_set or summary or (local and data)):
+            return
+        allow = policy["allow"]
+        self.drafts.append(
+            AssetDraft(
+                kind="settings",
+                ecosystem="claude-code",
+                name=f"Claude Code settings ({entry.path})",
+                path=entry.path,
+                detector="claude-settings",
+                text=json.dumps(settings, indent=2),
+                frontmatter=settings,
+                tools=allow[:100],
+                mcp_servers=list(summary) or enabled,
+                description=(
+                    f"Claude Code {'local ' if local else ''}settings: "
+                    f"{len(allow)} allowed, {len(policy['deny'])} denied tool rule(s)"
+                    + (f", default mode {policy['defaultMode']}" if policy["defaultMode"] else "")
+                ),
+                auto_description=True,
+                tags=["settings"],
+            )
+        )
+        self.claimed.add(entry.path)
+
+    def _opencode(self, entry: FileEntry) -> None:
+        """OpenCode ``opencode.json``: its ``mcp`` block and agents defined inline."""
+        data = self._json(entry)
+        if not isinstance(data, dict) or not ({"mcp", "agent", "$schema"} & data.keys()):
+            return
+        if "$schema" in data and "opencode" not in str(data.get("$schema")):
+            return
+        mcp = data.get("mcp")
+        if isinstance(mcp, dict) and mcp:
+            self._mcp_config_asset(entry, mcp, "opencode")
+        agents = data.get("agent")
+        for name, spec in agents.items() if isinstance(agents, dict) else []:
+            if not isinstance(spec, dict):
+                continue
+            prompt = _str(spec.get("prompt")) or ""
+            tools = spec.get("tools")
+            self.drafts.append(
+                AssetDraft(
+                    kind="agent",
+                    ecosystem="opencode",
+                    name=str(name),
+                    path=entry.path,
+                    detector="opencode-agent",
+                    text=json.dumps({str(name): sanitize_config(spec)}, indent=1),
+                    body=prompt,
+                    description=_str(spec.get("description")),
+                    models=[str(spec["model"])] if _model_ok(spec.get("model")) else [],
+                    tools=[str(k) for k, v in tools.items() if v]
+                    if isinstance(tools, dict)
+                    else [],
+                )
+            )
+        self.claimed.add(entry.path)
+
+    def _continue_mcp(self, entry: FileEntry) -> None:
+        """Continue ``.continue/mcpServers/*.yaml``: ``mcpServers`` is a list of blocks."""
+        data = self._json(entry) if entry.suffix == ".json" else self._yaml(entry)
+        if not isinstance(data, dict):
+            return
+        servers = data.get("mcpServers")
+        if isinstance(servers, list):
+            servers = {
+                str(s.get("name") or f"server-{i}"): s
+                for i, s in enumerate(servers)
+                if isinstance(s, dict)
+            }
+        if isinstance(servers, dict) and servers:
+            self._mcp_config_asset(entry, servers, "continue")
 
     def _mcp_registry(self, entry: FileEntry) -> None:
         text = self._read(entry) or ""
@@ -553,12 +770,70 @@ class FileDetector:
             return
         root = self._plugin_root_of(entry.path)
         in_claude = root is not None or "/.claude/" in "/" + entry.path
+        in_cursor = "/.cursor/" in "/" + entry.path
         self._hooks_from_json(
             entry,
             "hook-file",
             scope="plugin" if root is not None else "repo",
-            ecosystem="claude-code" if in_claude else None,
+            ecosystem="cursor" if in_cursor else "claude-code" if in_claude else None,
         )
+
+    def _kiro_hook(self, entry: FileEntry) -> None:
+        """Kiro agent hooks: ``{name, when: {type, patterns}, then: {type, prompt|command}}``."""
+        data = self._json(entry)
+        if not isinstance(data, dict):
+            return
+        when = data["when"] if isinstance(data.get("when"), dict) else {}
+        then = data["then"] if isinstance(data.get("then"), dict) else {}
+        action = _str(then.get("prompt")) or _str(then.get("command")) or ""
+        event = _str(when.get("type")) or "hook"
+        clean = sanitize_config(data)
+        self._add(
+            AssetDraft(
+                kind="hook",
+                ecosystem="kiro",
+                name=_str(data.get("name")) or PurePosixPath(entry.path).name.split(".")[0],
+                path=entry.path,
+                detector="kiro-hook",
+                text=json.dumps(clean, indent=2),
+                body=action,
+                description=_str(data.get("description"))
+                or f"{event} hook: {_str(then.get('type')) or 'action'}",
+                auto_description=not _str(data.get("description")),
+                triggers=[event, *as_list(when.get("patterns"))][:20],
+                frontmatter={
+                    "event": event,
+                    "action": _str(then.get("type")),
+                    "commands": [str(sanitize_config(action))] if action else [],
+                    "enabled": data.get("enabled"),
+                },
+            )
+        )
+
+    def _kiro_specs(self) -> list[FileEntry]:
+        """One entry per spec folder: its requirements.md, else design.md, else tasks.md."""
+        by_folder: dict[str, FileEntry] = {}
+        order = ("requirements.md", "design.md", "tasks.md")
+        for f in self.files.glob("**/.kiro/specs/*/*.md"):
+            if f.name not in order:
+                continue
+            folder = str(PurePosixPath(f.path).parent)
+            best = by_folder.get(folder)
+            if best is None or order.index(f.name) < order.index(best.name):
+                by_folder[folder] = f
+        return [by_folder[k] for k in sorted(by_folder)]
+
+    def _kiro_spec(self, main: FileEntry) -> None:
+        """A Kiro spec: requirements/design/tasks documents for one feature."""
+        folder = str(PurePosixPath(main.path).parent)
+        docs = [f for f in self.files.under(folder) if f.suffix == ".md"]
+        text = self._read(main) or ""
+        draft = self._markdown_asset(main, text, "instructions", "kiro", "kiro-spec")
+        draft.name = PurePosixPath(folder).name
+        draft.files = self._bundle(folder, main.path)
+        draft.tags.append("spec")
+        self._add(draft)
+        self.claimed.update(f.path for f in docs)
 
     def _hooks_from_json(
         self, entry: FileEntry, detector: str, scope: str = "repo", ecosystem: str | None = None
@@ -571,6 +846,10 @@ class FileDetector:
             return
         self.claimed.add(entry.path)
         for event, groups in hooks.items():
+            if isinstance(groups, dict):  # a single hook object instead of a list
+                groups = [groups]
+            if not isinstance(groups, list) or not any(isinstance(g, dict) for g in groups):
+                continue  # e.g. Gemini's "disabled": ["hook-name"]
             commands: list[str] = []
             matchers: list[str] = []
             copilot_style = False
@@ -605,6 +884,7 @@ class FileDetector:
                     text=json.dumps({event: sanitize_config(groups)}, indent=2),
                     scope=scope,
                     triggers=[str(event), *matchers],
+                    auto_description=True,
                     description=f"{event} hook running: "
                     + "; ".join(c[:120] for c in commands[:3]),
                     frontmatter={"event": event, "matchers": matchers, "commands": commands},
@@ -651,6 +931,7 @@ class FileDetector:
                 scope="plugin",
             )
         )
+        self._bundled_mcp(entry, data.get("mcpServers"), root, "claude-code")
 
     def _agent_plugin(self, entry: FileEntry) -> None:
         """Open agent-plugin manifests (e.g. Copilot plugins): ``plugin.json`` with a schema."""
@@ -666,12 +947,15 @@ class FileDetector:
             )
         ):
             return
-        root = str(PurePosixPath(entry.path).parent)
+        codex = "/.codex-plugin/" in "/" + entry.path
+        eco = "codex" if codex else "agent-plugins"
+        parent = PurePosixPath(entry.path).parent
+        root = str(parent.parent if codex else parent)
         root = "" if root == "." else root
         self._add(
             AssetDraft(
                 kind="plugin",
-                ecosystem="agent-plugins",
+                ecosystem=eco,
                 name=str(data["name"]),
                 path=entry.path,
                 detector="agent-plugin",
@@ -688,23 +972,28 @@ class FileDetector:
                 scope="plugin",
             )
         )
+        self._bundled_mcp(entry, data.get("mcpServers"), root, eco)
 
-    def _marketplace(self, entry: FileEntry) -> None:
+    def _marketplace(self, entry: FileEntry, eco: str = "claude-code") -> None:
         data = self._json(entry)
         if not isinstance(data, dict):
             return
         plugins = [p for p in data.get("plugins") or [] if isinstance(p, dict)]
         meta: dict[str, Any] = data["metadata"] if isinstance(data.get("metadata"), dict) else {}
+        for p in plugins:  # Codex: "source": {"source": "local", "path": "./plugins/x"}
+            if isinstance(p.get("source"), dict) and isinstance(p["source"].get("path"), str):
+                p["source"] = p["source"]["path"]
         self._add(
             AssetDraft(
                 kind="plugin",
-                ecosystem="claude-code",
+                ecosystem=eco,
                 name=_str(data.get("name")) or "marketplace",
                 path=entry.path,
-                detector="claude-marketplace",
+                detector="claude-marketplace" if eco == "claude-code" else f"{eco}-marketplace",
                 text=json.dumps(sanitize_config(data), indent=1),
                 description=_str(meta.get("description"))
                 or f"Plugin marketplace listing {len(plugins)} plugin(s)",
+                auto_description=not _str(meta.get("description")),
                 tools=[str(p.get("name")) for p in plugins if p.get("name")][:100],
                 frontmatter={
                     "plugins": [
@@ -746,6 +1035,8 @@ class FileDetector:
                 },
             )
         )
+        root = str(PurePosixPath(entry.path).parent)
+        self._bundled_mcp(entry, data.get("mcpServers"), "" if root == "." else root, "gemini")
 
     def _gemini_command(self, entry: FileEntry) -> None:
         text = self._read(entry)
@@ -866,6 +1157,7 @@ class FileDetector:
                 path=entry.path,
                 detector="crewai-tasks-yaml",
                 text=json.dumps(sanitize_config(data), indent=1),
+                auto_description=True,
                 description=f"{len(data)} task(s): " + ", ".join(map(str, list(data)[:8])),
                 frontmatter={
                     "tasks": {
@@ -888,12 +1180,15 @@ class FileDetector:
                 path=entry.path,
                 detector="langgraph-json",
                 text=json.dumps(sanitize_config(data), indent=1),
+                auto_description=True,
                 description="LangGraph deployment with graphs: " + ", ".join(map(str, graphs)),
                 frontmatter={"graphs": sanitize_config(graphs)},
             )
         )
 
     def _promptfoo(self, entry: FileEntry) -> None:
+        if entry.path in self.claimed or _TEST_UTIL_DIR.search(entry.path):
+            return  # fixtures that exercise promptfoo itself are not the org's evals
         text = self._read(entry) or ""
         data = load_json(text) if entry.suffix == ".json" else load_yaml(text)
         if not isinstance(data, dict):
@@ -921,6 +1216,55 @@ class FileDetector:
             )
         )
 
+    def _aider(self, entry: FileEntry) -> None:
+        """Aider: ``.aider.conf.yml`` loads convention files (``read:``) into every chat.
+        CONVENTIONS.md is only an AI asset when Aider is configured to read it."""
+        data = self._yaml(entry)
+        if not isinstance(data, dict):
+            return
+        base = PurePosixPath(entry.path).parent
+        reads = [str(r) for r in as_list_raw(data.get("read")) if isinstance(r, str)]
+        conventions = (base / "CONVENTIONS.md").as_posix().removeprefix("./")
+        targets = [(base / r.removeprefix("./")).as_posix().removeprefix("./") for r in reads]
+        if self.files.exists(conventions) and conventions not in targets:
+            targets.append(conventions)
+        model = data.get("model")
+        for target in targets[:20]:
+            found = self.files.glob(escape_glob(target))
+            if not found or target in self.claimed:
+                continue
+            text = self._read(found[0])
+            if text is None:
+                continue
+            draft = self._markdown_asset(
+                found[0], text, "instructions", "aider", "aider-conventions"
+            )
+            if _model_ok(model):
+                draft.models.append(str(model))
+            self._add(draft)
+
+    def _copilot_setup(self, entry: FileEntry) -> None:
+        """``copilot-setup-steps.yml``: the environment the Copilot coding agent runs in."""
+        text = self._read(entry) or ""
+        try:
+            data = load_yaml(text)
+        except Exception:
+            data = None
+        data = data if isinstance(data, dict) else {}
+        self._add(
+            AssetDraft(
+                kind="workflow",
+                ecosystem="copilot",
+                name=_str(data.get("name")) or "Copilot Setup Steps",
+                path=entry.path,
+                detector="copilot-setup-steps",
+                text=text,
+                description="Prepares the environment of the GitHub Copilot coding agent",
+                auto_description=True,
+                tags=["ci", "automation"],
+            )
+        )
+
     def _ai_workflow(self, entry: FileEntry) -> None:
         actions = {
             "anthropics/claude-code-action": "claude-code",
@@ -931,6 +1275,8 @@ class FileDetector:
             "github/ai-inference": "github-models",
             "actions/ai-inference": "github-models",
         }
+        if entry.path in self.claimed:
+            return
         text = self._read(entry) or ""
         used = {eco for action, eco in actions.items() if action in text}
         if not used:
@@ -959,6 +1305,7 @@ class FileDetector:
                 detector="ai-github-action",
                 text=text,
                 body="\n\n".join(prompts) or text,
+                auto_description=True,
                 description=f"GitHub Actions workflow using {', '.join(sorted(used))}"
                 + (f" on {', '.join(map(str, events))}" if events else ""),
                 triggers=[str(e) for e in events],
@@ -1032,6 +1379,14 @@ def _first_line(body: str) -> str | None:
     return None
 
 
+def _model_ok(m: Any) -> bool:
+    return (
+        m is not None
+        and not isinstance(m, dict | list | bool)
+        and str(m).strip() not in ("", "inherit")
+    )
+
+
 def _str(v: Any) -> str | None:
     if v is None or v == "" or isinstance(v, dict | list):
         return None
@@ -1041,24 +1396,102 @@ def _str(v: Any) -> str | None:
 _ENV_REF = re.compile(r"^\s*(?:\$\{?|%|<|\{\{|\$env:|op://|vault:)|^\s*$")
 
 
+def _normalize_server(cfg: Any) -> dict[str, Any]:
+    """One MCP server entry in the common shape (command + args + env + url + headers).
+    OpenCode uses ``command: [exe, ...args]`` and ``environment``."""
+    if not isinstance(cfg, dict):
+        return {}
+    out = dict(cfg)
+    command = cfg.get("command")
+    if isinstance(command, list) and command:
+        out["command"] = str(command[0])
+        extra = cfg["args"] if isinstance(cfg.get("args"), list) else []
+        out["args"] = [*command[1:], *extra]
+    if "env" not in cfg and isinstance(cfg.get("environment"), dict):
+        out["env"] = cfg["environment"]
+        del out["environment"]
+    if out.get("type") in ("local", "remote"):  # OpenCode spelling
+        out["type"] = "stdio" if out["type"] == "local" else "http"
+    return out
+
+
+def _is_credential(value: str) -> bool:
+    """Credential-looking: long, no spaces, mixes letters and digits (not "github-app")."""
+    value = re.sub(r"(?i)^(?:bearer|basic|token)\s+", "", value)
+    return bool(
+        len(value) >= 16
+        and not _ENV_REF.match(value)
+        and not re.search(r"\s", value)
+        and re.search(r"\d", value)
+        and re.search(r"[A-Za-z]", value)
+    )
+
+
+_URL_PASSWORD = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]+:([^\s/@]+)@([^\s/:?#]+)")
+_QUERY_PARAM = re.compile(r"[?&]([^=&#\s]+)=([^&#\s]+)")
+_PLACEHOLDER = re.compile(
+    r"(?i)^(?:<.*>|\[.*\]|\{.*\}|\*+|x+|\.+|password|passwd|pass|pwd|secret|changeme|example|"
+    r"(?:your|my)[-_].*|.*[-_](?:here|placeholder))$"
+)
+_LOCAL_HOST = re.compile(
+    r"(?i)^(?:localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|host\.docker\.internal)$"
+)
+
+
+def _string_secret(value: str) -> bool:
+    """A credential inside one arg or URL: ``postgresql://user:pw@db`` or ``?api_key=...``."""
+    for m in _URL_PASSWORD.finditer(value):
+        pw, host = m.group(1), m.group(2)
+        if not (_ENV_REF.match(pw) or _PLACEHOLDER.match(pw) or _LOCAL_HOST.match(host)):
+            return True
+    for key, val in _QUERY_PARAM.findall(value):
+        if (
+            SECRET_NAME.search(key)
+            and len(val) >= 8
+            and not _ENV_REF.match(val)
+            and not _PLACEHOLDER.match(val)
+        ):
+            return True
+    return False
+
+
+def _args_secret(args: list[Any]) -> bool:
+    expect_value = False
+    for raw in args:
+        a = str(raw)
+        if expect_value:
+            expect_value = False
+            if _is_credential(a):
+                return True
+            continue
+        if _string_secret(a):
+            return True
+        if a.startswith("-") and SECRET_NAME.search(a):
+            _, eq, val = a.partition("=")
+            if eq:
+                if _is_credential(val):
+                    return True
+            else:
+                expect_value = True
+            continue
+        key, eq, val = a.partition("=")
+        if eq and SECRET_NAME.search(key) and "/" not in key and _is_credential(val):
+            return True
+    return False
+
+
 def _has_inline_secret(cfg: dict[str, Any], env: dict[str, Any]) -> bool:
     raw = json.dumps(cfg, default=str)
     if next(iter(find_secrets(raw)), None):
         return True
     for key, value in {**env, **_headers(cfg)}.items():
-        if not isinstance(value, str) or not SECRET_NAME.search(str(key)):
-            continue
-        value = re.sub(r"(?i)^(?:bearer|basic|token)\s+", "", value)
-        # credential-looking: long, no spaces, mixes letters and digits (not "github-app")
-        if (
-            len(value) >= 16
-            and not _ENV_REF.match(value)
-            and not re.search(r"\s", value)
-            and re.search(r"\d", value)
-            and re.search(r"[A-Za-z]", value)
-        ):
+        if isinstance(value, str) and SECRET_NAME.search(str(key)) and _is_credential(value):
             return True
-    return False
+    args = cfg["args"] if isinstance(cfg.get("args"), list) else []
+    url = cfg.get("url") or cfg.get("serverUrl") or cfg.get("httpUrl")
+    return _args_secret([cfg.get("command") or "", *args]) or (
+        isinstance(url, str) and _string_secret(url)
+    )
 
 
 def _headers(cfg: dict[str, Any]) -> dict[str, Any]:

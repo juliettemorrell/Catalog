@@ -57,6 +57,7 @@ Re-runs are incremental: a repo whose default-branch HEAD hasn't changed is reus
 | `instructions` | `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, Copilot instructions, Cursor/Windsurf/Cline/Roo/Kiro/Amazon Q/Junie/Continue rules, `llms.txt` |
 | `mcp-server` | MCP servers implemented in the repo (Python/TS/Go/C#/Java SDKs and hand-written JSON-RPC), with their tools and descriptions; MCP registry `server.json` |
 | `mcp-config` | `.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, Gemini/Codex/Kiro/Roo configs (env **values are never stored**, only names) |
+| `settings` | `.claude/settings.json` and committed `settings.local.json`: permission mode, allow/deny rules, auto-approved MCP servers (env names only) |
 | `hook` | Claude Code hooks in `.claude/settings.json` and plugin `hooks/hooks.json` |
 | `plugin` | Claude Code plugins and marketplaces, Gemini CLI extensions |
 | `eval` | promptfoo configs and CI actions |

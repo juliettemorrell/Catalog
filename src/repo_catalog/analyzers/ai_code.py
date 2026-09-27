@@ -9,8 +9,9 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
 from ..fs import FileEntry, RepoFiles
+from ..textutil import load_yaml
 from . import ai_python
-from .ai_common import AssetDraft
+from .ai_common import AssetDraft, looks_like_html
 
 CODE_EXT = {
     ".py",
@@ -261,7 +262,9 @@ MODEL_RX = re.compile(r"\b(" + "|".join(MODEL_PATTERNS) + r")\b", re.I)
 _MCP_SERVER_IMPORT = re.compile(
     r"from\s+mcp\.server|from\s+fastmcp|import\s+fastmcp|@modelcontextprotocol/sdk/server|"
     r"mark3labs/mcp-go/server|modelcontextprotocol/go-sdk/mcp|ModelContextProtocol\.Server|"
-    r"io\.modelcontextprotocol\.server|rmcp::|from\s+['\"]fastmcp['\"]"
+    r"io\.modelcontextprotocol\.server|io\.modelcontextprotocol\.kotlin\.sdk|"
+    r"org\.springframework\.ai\.mcp|org\.springaicommunity\.mcp|rmcp::|"
+    r"from\s+['\"]fastmcp['\"]"
 )
 _MCP_SERVER_NAME = [
     re.compile(r"\b(?:FastMCP|MCPServer)\(\s*(?:name\s*=\s*)?['\"]([^'\"]+)['\"]"),
@@ -271,10 +274,16 @@ _MCP_SERVER_NAME = [
     re.compile(
         r"(?i)server_?info['\"]?\s*[=:]\s*\{[^}]{0,2000}?['\"]name['\"]\s*:\s*['\"]([^'\"]+)"
     ),
+    re.compile(r"\.serverInfo\(\s*\"([^\"]+)\""),  # Java McpServer.sync(t).serverInfo("x", v)
+    re.compile(r"\bImplementation\(\s*name\s*=\s*\"([^\"]+)\""),  # Kotlin SDK
+    re.compile(r"\bImplementation\s*\{[^}]{0,500}?\bname:\s*\"([^\"]+)\""),  # Rust rmcp
+    re.compile(r"ServerInfo\s*=\s*new[^{]{0,40}\{[^}]{0,300}?\bName\s*=\s*\"([^\"]+)\""),  # C#
 ]
 _MCP_SERVER_CTOR = re.compile(
     r"\b(FastMCP|MCPServer)\(|new\s+McpServer\(|new\s+Server\(\s*\{|NewMCPServer\(|mcp\.NewServer\(|"
-    r"AddMcpServer\(|McpServer\.(?:sync|async)\(|new\s+FastMCP\("
+    r"AddMcpServer\(|McpServer\.(?:sync|async)\(|new\s+FastMCP\(|"
+    r"\bimpl\s+(?:rmcp::)?ServerHandler\s+for\b|#\[tool_router\b|"  # Rust rmcp
+    r"\bServer\(\s*(?:serverInfo\s*=\s*)?Implementation\("  # Kotlin SDK
 )
 _HANDWRITTEN_MCP = re.compile(
     r"(?:==|===|\bcase)\s*['\"]tools/call['\"]|['\"]tools/call['\"]\s*[:)]\s*(?!\s*['\"])"
@@ -347,6 +356,10 @@ def scan_code(files: RepoFiles, claimed: set[str]) -> CodeFindings:
     sdk_models: dict[str, set[str]] = defaultdict(set)
     mcp_tools: list[tuple[str, str, str | None]] = []  # (path, tool, description)
     mcp_servers: list[AssetDraft] = []
+    # tools that only count once an MCP server is known: Spring AI @Tool methods (served
+    # by the Spring MCP server starter) and ``server.registerTool`` in helper modules
+    deferred_tools: list[tuple[str, str, str | None]] = []
+    spring_servers: list[AssetDraft] = []
 
     for entry, text in files.iter_text(candidates, MAX_FILE):
         is_code = entry.suffix in CODE_EXT
@@ -354,10 +367,16 @@ def scan_code(files: RepoFiles, claimed: set[str]) -> CodeFindings:
         for m in file_models:
             out.models[m] = out.models.get(m, 0) + 1
         if not is_code:
+            spring = _spring_mcp_server(entry, text)
+            if spring:
+                spring_servers.append(spring)
             continue
+        tree = ai_python.parse(text) if entry.suffix == ".py" else None
+        # docstrings (``>>> from openai import OpenAI``) are documentation, not imports
+        import_src = ai_python.without_multiline_strings(tree, text) if tree else text
         matched = {
             _SDK_BY_GROUP[g]
-            for mt in SDK_IMPORT_RX.finditer(_import_lines(text, entry.suffix))
+            for mt in SDK_IMPORT_RX.finditer(_import_lines(import_src, entry.suffix))
             for g, v in mt.groupdict().items()
             if v is not None
         }
@@ -371,7 +390,6 @@ def scan_code(files: RepoFiles, claimed: set[str]) -> CodeFindings:
             if len(sdk_snippets[key]) < 6 and lines:
                 sdk_snippets[key].append(_snippet(entry.path, text, lines[0]))
 
-        tree = ai_python.parse(text) if entry.suffix == ".py" else None
         if tree is not None:
             py = ai_python.analyze(tree, text, entry.path, want_prompts=entry.path not in claimed)
             out.drafts.extend(py.prompts + py.agents)
@@ -389,16 +407,25 @@ def scan_code(files: RepoFiles, claimed: set[str]) -> CodeFindings:
         if entry.path not in claimed:
             out.drafts.extend(_inline_prompts(entry, code))
         out.drafts.extend(_code_agents(entry, code))
+        out.drafts.extend(_agent_cards(entry, code))
+        deferred_tools += [(entry.path, t, d) for t, d in spring_tools(code)]
         if _MCP_SERVER_IMPORT.search(code):
             mcp_tools += [(entry.path, t, d) for t, d in _mcp_tools(entry, code)]
             if _MCP_SERVER_CTOR.search(code):
                 mcp_servers.append(_mcp_server(entry, code))
+        elif entry.suffix in _JS_SUFFIXES and _ORPHAN_TOOL.search(code):
+            deferred_tools += [(entry.path, t, d) for t, d in _mcp_tools(entry, code)]
         elif _handwritten_mcp(code):
             # MCP spoken directly over JSON-RPC (no SDK): common in quick internal servers
             server = _mcp_server(entry, code, detector="mcp-server-jsonrpc")
             server.confidence = "medium"
             mcp_servers.append(server)
             mcp_tools += [(entry.path, t, d) for t, d in _JSON_TOOL.findall(code)]
+
+    if spring_servers:
+        mcp_servers += spring_servers
+    if mcp_servers:
+        mcp_tools += deferred_tools
 
     for key, hits in sdk_hits.items():
         label = SDKS[key][0]
@@ -417,6 +444,7 @@ def scan_code(files: RepoFiles, claimed: set[str]) -> CodeFindings:
                 models=sorted(sdk_models[key]),
                 confidence="high",
                 description=f"{label} used in {len(paths)} file(s), ~{call_sites} call site(s).",
+                auto_description=True,
                 frontmatter={"files": paths[:100], "call_sites": call_sites},
                 tags=["sdk"],
             )
@@ -429,9 +457,11 @@ def scan_code(files: RepoFiles, claimed: set[str]) -> CodeFindings:
             server.frontmatter.setdefault("tool_descriptions", {})[tool] = desc
         for s in mcp_servers:
             out.mcp_provided.add(s.name)
-            s.description = s.description or (
-                f"MCP server exposing {len(s.tools)} tool(s): " + ", ".join(s.tools[:12])
-            )
+            if not s.description:
+                s.auto_description = True
+                s.description = f"MCP server exposing {len(s.tools)} tool(s)" + (
+                    ": " + ", ".join(s.tools[:12]) if s.tools else ""
+                )
             out.drafts.append(s)
     return out
 
@@ -507,7 +537,7 @@ def _is_test_fixture(path: str) -> bool:
     return bool(
         re.search(
             r"(^|/)(tests?|__tests__|spec|fixtures?|__snapshots__|testdata|mocks?|e2e|"
-            r"integration[-_]tests?|test[-_]utils?|testing)/|"
+            r"integration[-_]tests?|test[-_]?utils?|test[-_]?helpers?|testing|mcptest)/|"
             r"(^|/)test_[^/]+\.py$|_test\.(py|go)$|\.(test|spec|eval)\.[cm]?[jt]sx?$|"
             r"(^|/)conftest\.py$",
             path,
@@ -547,6 +577,8 @@ def _inline_prompts(entry: FileEntry, text: str) -> list[AssetDraft]:
                 continue
             if len(body.strip()) < _MIN_PROMPT or body.count(" ") < 20:
                 continue
+            if "html" in name.lower() or looks_like_html(body):
+                continue  # HTML templates render pages; they do not prompt a model
             seen.add(m.start())
             line = _line_of(text, m.start())
             variables = sorted(set(re.findall(r"\{(\w+)\}|\$\{(\w+)\}|\{\{\s*(\w+)\s*\}\}", body)))
@@ -683,6 +715,7 @@ def _code_agents(entry: FileEntry, text: str) -> list[AssetDraft]:
                 description=f"LangGraph StateGraph with nodes: {', '.join(nodes[:15])}"
                 if nodes
                 else "LangGraph StateGraph",
+                auto_description=True,
                 confidence="medium",
                 frontmatter={"nodes": nodes},
             )
@@ -727,9 +760,93 @@ def _str_at(text: str) -> str | None:
     return next((g for g in m.groups() if g is not None), None) if m else None
 
 
-def _mcp_tools(entry: FileEntry, text: str) -> list[tuple[str, str | None]]:
-    """Tools registered in JS/TS or Go source (Python is handled by ``ai_python``)."""
+_RS_TOOL = re.compile(
+    r"#\[tool(?:\((?P<args>[^\]]*)\))?\]\s*(?:#\[[^\]]*\]\s*)*"
+    r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(?P<fn>\w+)"
+)
+_CS_TOOL = re.compile(
+    r"\[McpServerTool\b(?P<args>[^\]]*)\](?P<attrs>(?:\s*\[[^\]]*\])*)\s*"
+    r"(?:(?:public|private|internal|protected|static|async|override|virtual)\s+)*"
+    r"[\w<>\[\],.? ]+?\s+(?P<fn>\w+)\s*\("
+)
+_JAVA_METHOD = (
+    r"(?P<attrs>(?:\s*@\w+(?:\([^)]*\))?)*)\s*"
+    r"(?:(?:public|private|protected|static|final|suspend|fun)\s+)*"
+    r"(?:[\w<>\[\],.? ]+?\s+)?(?P<fn>\w+)\s*\("
+)
+_JAVA_TOOL_ANN = re.compile(
+    r"@(?:Mcp)?Tool\b(?:\((?P<args>(?:[^()]|\([^()]*\))*)\))?" + _JAVA_METHOD
+)
+_JAVA_SDK_TOOL = re.compile(
+    r"new\s+(?:McpSchema\.)?Tool\(\s*\"([^\"]+)\"\s*,\s*(?:\"((?:[^\"\\]|\\.)*)\")?|"
+    r"\bTool\.builder\(\)\s*\.name\(\s*\"([^\"]+)\"\s*\)"
+    r"(?:\s*\.title\([^)]*\))?(?:\s*\.description\(\s*\"((?:[^\"\\]|\\.)*)\")?"
+)
+_SPRING_TOOL_IMPORT = re.compile(r"import\s+org\.springframework\.ai\.tool\.annotation\.Tool\b")
+_ORPHAN_TOOL = re.compile(r"\b(?:server|mcpServer|mcp_server|mcp)\.(?:registerTool|tool)\(")
+_JS_SUFFIXES = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts"}
+
+
+def _attr_str(args: str | None, key: str) -> str | None:
+    """``key = "value"`` / ``key: "value"`` inside annotation or attribute arguments."""
+    m = re.search(rf"\b{key}\s*[=:]\s*" + _STR, args or "")
+    return _group(m)
+
+
+def _annotated_tools(text: str, rx: re.Pattern[str], name_key: str) -> list[tuple[str, str | None]]:
     tools: list[tuple[str, str | None]] = []
+    for m in list(rx.finditer(text))[:_MAX_CALLS]:
+        args = m.group("args") or ""
+        attrs = m.groupdict().get("attrs") or ""
+        name = _attr_str(args, name_key) or m.group("fn")
+        desc = _attr_str(args, "description") or _group(
+            re.search(r"Description\(\s*" + _STR, args + attrs)
+        )
+        if name and re.fullmatch(r"[\w.\-/]{1,100}", name):
+            tools.append((name, desc[:300] if desc else None))
+    return tools
+
+
+def spring_tools(text: str) -> list[tuple[str, str | None]]:
+    """Spring AI ``@Tool`` methods (exposed over MCP when an MCP server starter is set up)."""
+    if not _SPRING_TOOL_IMPORT.search(text):
+        return []
+    return _annotated_tools(text, _JAVA_TOOL_ANN, "name")
+
+
+def _const_str(text: str, ident: str) -> str | None:
+    m = re.search(
+        rf"(?:const|let|var|val)\s+{re.escape(ident)}\s*(?::\s*[\w<>\[\]| ]+)?=\s*" + _STR, text
+    )
+    return _group(m)
+
+
+def _const_obj_desc(text: str, ident: str) -> str | None:
+    m = re.search(rf"(?:const|let|var)\s+{re.escape(ident)}\s*(?::\s*[\w<>\[\]| .]+)?=\s*\{{", text)
+    if not m:
+        return None
+    return _group(re.search(r"\bdescription\s*:\s*" + _STR, _balanced(text, m.end(), 6000)))
+
+
+def _mcp_tools(entry: FileEntry, text: str) -> list[tuple[str, str | None]]:
+    """Tools registered in JS/TS, Go, Rust, C#, Java or Kotlin source (Python is handled
+    by ``ai_python``)."""
+    tools: list[tuple[str, str | None]] = []
+    if entry.suffix == ".rs":
+        return _annotated_tools(text, _RS_TOOL, "name")
+    if entry.suffix == ".cs":
+        return _annotated_tools(text, _CS_TOOL, "Name")
+    if entry.suffix in (".java", ".kt"):
+        for m in list(_JAVA_SDK_TOOL.finditer(text))[:_MAX_CALLS]:
+            name = m.group(1) or m.group(3)
+            desc = m.group(2) or m.group(4)
+            tools.append((name, desc[:300] if desc else None))
+        if "@McpTool" in text:
+            tools += [
+                t
+                for t in _annotated_tools(text, _JAVA_TOOL_ANN, "name")
+                if t[0] not in {x for x, _ in tools}
+            ]
     if entry.suffix == ".go":
         for m in list(_GO_NEWTOOL.finditer(text))[:_MAX_CALLS]:
             args = _balanced(text, m.end(), 4000)
@@ -749,14 +866,21 @@ def _mcp_tools(entry: FileEntry, text: str) -> list[tuple[str, str | None]]:
         first = _FIRST_STR.match(args)
         tool_name = _group(first)
         rest = args[first.end() :] if first else args
-        if tool_name is None:  # addTool({ name: "x", description: "..." })
-            tool_name = _group(re.search(r"\bname\s*:\s*" + _STR, args))
+        ident = re.match(r"\s*([A-Za-z_$][\w$]*)\s*,", args) if first is None else None
+        if ident:  # registerTool(NAME, config, ...) with ``const NAME = "x"`` in the file
+            tool_name = _const_str(text, ident.group(1))
+            rest = args[ident.end() - 1 :]
+        if tool_name is None:  # addTool({ name: "x" }) / Kotlin addTool(name = "x")
+            tool_name = _group(re.search(r"\bname\s*[:=]\s*" + _STR, args))
         if not tool_name or not re.fullmatch(r"[\w.\-/]{1,100}", tool_name):
             continue
         after = rest.lstrip()
         text_desc = _group(_FIRST_STR.match(after[1:])) if after.startswith(",") else None
         if text_desc is None:
-            text_desc = _group(re.search(r"\bdescription\s*:\s*" + _STR, rest))
+            text_desc = _group(re.search(r"\bdescription\s*[:=]\s*" + _STR, rest))
+        if text_desc is None:  # registerTool(name, config, ...) with ``const config = {...}``
+            conf = re.match(r"\s*,\s*([A-Za-z_$][\w$]*)\s*[,)]", rest)
+            text_desc = _const_obj_desc(text, conf.group(1)) if conf else None
         tools.append((tool_name, text_desc[:300] if text_desc else None))
     return tools
 
@@ -787,6 +911,90 @@ def _mcp_server(entry: FileEntry, text: str, detector: str = "mcp-server-code") 
         frontmatter={"language": lang, "resources_and_prompts": resources},
         tags=[f"lang:{lang}"],
     )
+
+
+_SPRING_MCP_PROP = re.compile(r"^\s*spring\.ai\.mcp\.server\.([\w.-]+)\s*[=:]\s*(.*?)\s*$", re.M)
+
+
+def _spring_mcp_server(entry: FileEntry, text: str) -> AssetDraft | None:
+    """Spring AI MCP server starter configured in application.properties / .yml."""
+    if "mcp" not in text or not entry.name.startswith(("application", "bootstrap")):
+        return None
+    props: dict[str, str] = {}
+    if entry.suffix == ".properties":
+        props = {k: v for k, v in _SPRING_MCP_PROP.findall(text)}
+    elif entry.suffix in (".yml", ".yaml"):
+        try:
+            data = load_yaml(text)
+        except Exception:
+            return None
+        node = data
+        for key in ("spring", "ai", "mcp", "server"):
+            node = node.get(key) if isinstance(node, dict) else None
+        if isinstance(node, dict):
+            props = {str(k): str(v) for k, v in node.items() if not isinstance(v, dict | list)}
+        elif node is None:
+            return None
+    if not props and "spring.ai.mcp.server" not in text:
+        return None
+    if props.get("enabled", "true").lower() == "false":
+        return None
+    keep = {k: v for k, v in props.items() if k in ("name", "version", "type", "protocol")}
+    module = entry.path.split("/src/")[0] if "/src/" in entry.path else ""
+    return AssetDraft(
+        kind="mcp-server",
+        ecosystem="mcp",
+        name=props.get("name") or PurePosixPath(module).name or "spring-mcp-server",
+        path=entry.path,
+        detector="mcp-server-spring",
+        # only the MCP server settings: the rest of the file may hold datasource passwords
+        text="\n".join(f"spring.ai.mcp.server.{k}={v}" for k, v in keep.items()),
+        description=props.get("instructions") or None,
+        version=props.get("version"),
+        frontmatter={"language": "java", "framework": "spring-ai", **keep},
+        tags=["lang:java", "spring-ai"],
+    )
+
+
+_TS_AGENT_CARD = re.compile(r":\s*AgentCard\s*=\s*\{|\bAgentCard\.builder\(\)|\ba2a\.AgentCard\{")
+
+
+def _agent_cards(entry: FileEntry, text: str) -> list[AssetDraft]:
+    """A2A agent cards built in TS/JS, Java or Go code."""
+    if "AgentCard" not in text or "a2a" not in text.lower():
+        return []
+    drafts: list[AssetDraft] = []
+    for m in list(_TS_AGENT_CARD.finditer(text))[:20]:
+        body = (
+            _balanced(text, m.end(), 8000) if m.group(0).endswith("{") else text[m.end() :][:3000]
+        )
+        name = _group(re.search(r"(?:\bname\s*:|\.name\(|\bName:)\s*" + _STR, body))
+        if not name:
+            continue
+        desc = _group(
+            re.search(r"(?:\bdescription\s*:|\.description\(|\bDescription:)\s*" + _STR, body)
+        )
+        skills = [
+            _group(x) or "" for x in re.finditer(r"(?:\bid\s*:|\.id\(|\bID:)\s*" + _STR, body)
+        ]
+        line = _line_of(text, m.start())
+        drafts.append(
+            AssetDraft(
+                kind="agent",
+                ecosystem="a2a",
+                name=name,
+                path=entry.path,
+                line=line,
+                detector="code-AgentCard",
+                text=_snippet(entry.path, text, line, 20),
+                body=desc or "",
+                description=desc[:500] if desc else None,
+                tools=[s for s in skills if s][:40],
+                confidence="medium",
+                frontmatter={"constructor": "AgentCard", "line": line},
+            )
+        )
+    return drafts
 
 
 def _closest(servers: list[AssetDraft], path: str) -> AssetDraft:

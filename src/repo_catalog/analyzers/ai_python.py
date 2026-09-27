@@ -15,7 +15,7 @@ import warnings
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
-from .ai_common import AssetDraft
+from .ai_common import AssetDraft, looks_like_html
 
 PROMPT_NAME = re.compile(
     r"(prompt|instruction|system|persona|template|guideline|preamble|backstory)", re.I
@@ -95,7 +95,15 @@ class _Module:
         self.modules: set[str] = set()
         self.imported: dict[str, str] = {}  # local name -> module it came from
         self.strings: dict[str, tuple[str, int]] = {}  # NAME -> (value, line)
+        self.calls: dict[str, ast.Call] = {}  # NAME = SomeCall(...) at any level
         for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                # enum-style constants: ``class GitTools(str, Enum): STATUS = "git_status"``
+                for stmt in node.body:
+                    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                        target, const = stmt.targets[0], self.literal(stmt.value)
+                        if isinstance(target, ast.Name) and const is not None:
+                            self.strings[f"{node.name}.{target.id}"] = (const, stmt.lineno)
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     self.modules.add(alias.name)
@@ -108,10 +116,13 @@ class _Module:
                 value = node.value
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 s = self.literal(value) if value is not None else None
-                if s is not None:
-                    for t in targets:
-                        if isinstance(t, ast.Name):
-                            self.strings[t.id] = (s, node.lineno)
+                for t in targets:
+                    if not isinstance(t, ast.Name):
+                        continue
+                    if s is not None:
+                        self.strings[t.id] = (s, node.lineno)
+                    elif isinstance(value, ast.Call):
+                        self.calls.setdefault(t.id, value)
 
     def uses(self, *prefixes: str) -> bool:
         return any(m == p or m.startswith(p + ".") for m in self.modules for p in prefixes)
@@ -135,6 +146,13 @@ class _Module:
             return left + right if left is not None and right is not None else None
         if resolve and isinstance(node, ast.Name) and node.id in self.strings:
             return self.strings[node.id][0]
+        if resolve and isinstance(node, ast.Attribute):
+            # ``GitTools.STATUS`` / ``GitTools.STATUS.value`` (enum members)
+            target = node.value if node.attr == "value" else node
+            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                hit = self.strings.get(f"{target.value.id}.{target.attr}")
+                if hit:
+                    return hit[0]
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -251,6 +269,10 @@ def analyze(tree: ast.Module, text: str, path: str, *, want_prompts: bool) -> Py
                 if tool:
                     desc = mod.literal(_kw(node, "description"), True)
                     out.tools.append((tool, desc[:300] if desc else None))
+            elif name == "AgentCard" and mod.uses("a2a"):
+                card = _agent_card(mod, node)
+                if card:
+                    out.agents.append(card)
             # ---- agents --------------------------------------------------------------------
             elif agent_eco and name in AGENT_CTORS:
                 draft = _agent(mod, node, name, agent_eco)
@@ -283,6 +305,7 @@ def analyze(tree: ast.Module, text: str, path: str, *, want_prompts: bool) -> Py
                         ),
                         frontmatter={"nodes": nodes},
                         confidence="high",
+                        auto_description=True,
                     )
                 )
         elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and (
@@ -398,6 +421,8 @@ def _prompts(mod: _Module, fname: str, skip_calls: set[int]) -> list[AssetDraft]
     for var, body, line in sorted(found, key=lambda f: f[2]):
         if line in seen_lines or len(body.strip()) < MIN_PROMPT or body.count(" ") < 20:
             continue
+        if "html" in var.lower() or looks_like_html(body):
+            continue  # HTML_TEMPLATE and friends render pages, they do not prompt a model
         seen_lines.add(line)
         label = f"{fname}:{var}"
         used[label] = used.get(label, 0) + 1
@@ -422,12 +447,68 @@ def _prompts(mod: _Module, fname: str, skip_calls: set[int]) -> list[AssetDraft]
     return drafts
 
 
+_GENERIC_STEMS = {"server", "main", "__main__", "app", "index", "program", "lib", "mod"}
+_GENERIC_DIRS = {"src", "lib", "source", "cmd", "bin", "app", "main", "java", "kotlin"}
+
+
 def _fallback_name(path: str) -> str:
+    """A server name from its path: ``weather/src/main.rs`` -> ``weather``."""
     p = PurePosixPath(path)
-    return (
-        p.parent.name
-        if p.stem in ("server", "main", "__main__", "app", "index") and p.parent.name
-        else p.stem
+    if p.stem.lower() not in _GENERIC_STEMS:
+        return p.stem
+    for parent in p.parents:
+        if parent.name and parent.name.lower() not in _GENERIC_DIRS:
+            return parent.name
+    return p.stem
+
+
+def without_multiline_strings(tree: ast.Module, text: str) -> str:
+    """Source with docstrings and other multi-line strings blanked (line numbers kept), so
+    ``>>> from openai import OpenAI`` in a docstring is not an import."""
+    lines = text.split("\n")
+    for node in ast.walk(tree):
+        is_str = isinstance(node, ast.JoinedStr) or (
+            isinstance(node, ast.Constant) and isinstance(node.value, str)
+        )
+        if (
+            is_str
+            and isinstance(node, ast.expr)
+            and node.end_lineno is not None
+            and node.end_lineno > node.lineno
+        ):
+            for i in range(node.lineno - 1, min(node.end_lineno, len(lines))):
+                lines[i] = ""
+    return "\n".join(lines)
+
+
+def _agent_card(mod: _Module, call: ast.Call) -> AssetDraft | None:
+    """A2A ``AgentCard(name=..., description=..., skills=[AgentSkill(id=...)])`` in code."""
+    name = mod.literal(_kw(call, "name"), True)
+    if not name:
+        return None
+    skills_node = _kw(call, "skills")
+    skills: list[str] = []
+    if isinstance(skills_node, ast.List | ast.Tuple):
+        for el in skills_node.elts:
+            skill = mod.calls.get(el.id) if isinstance(el, ast.Name) else el
+            if isinstance(skill, ast.Call):
+                label = mod.literal(_kw(skill, "id", "name"), True)
+                if label:
+                    skills.append(label)
+    description = mod.literal(_kw(call, "description"), True)
+    return AssetDraft(
+        kind="agent",
+        ecosystem="a2a",
+        name=name,
+        path=mod.path,
+        line=call.lineno,
+        detector="code-AgentCard",
+        text=_snippet(mod.text, call.lineno, 25, end=getattr(call, "end_lineno", None)),
+        body=description or "",
+        description=description[:500] if description else None,
+        tools=skills[:40],
+        frontmatter={"constructor": "AgentCard", "line": call.lineno},
+        confidence="high",
     )
 
 

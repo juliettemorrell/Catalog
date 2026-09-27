@@ -98,7 +98,7 @@ The authoritative definitions are the Pydantic models in [`src/repo_catalog/mode
 | Field | Meaning |
 |---|---|
 | `id` | Stable hash of repo + path + kind + name |
-| `kind` | `skill`, `agent`, `command`, `prompt`, `instructions`, `mcp-server`, `mcp-config`, `hook`, `plugin`, `eval`, `workflow`, `sdk-usage` |
+| `kind` | `skill`, `agent`, `command`, `prompt`, `instructions`, `mcp-server`, `mcp-config`, `settings`, `hook`, `plugin`, `eval`, `workflow`, `sdk-usage` |
 | `ecosystem` | `claude-code`, `agent-skills`, `agents-md`, `agent-plugins`, `copilot`, `gh-aw` (agentic workflows), `cursor`, `windsurf`, `cline`, `roo`, `kiro`, `amazon-q`, `junie`, `gemini`, `codex`, `opencode`, `continue`, `trae`, `augment`, `firebase-studio`, `antigravity`, `factory`, `a2a`, `mcp`, `crewai`, `langgraph`, `promptfoo`, `prompty`, `github-models`, `inline`, `generic`, or an SDK key for `sdk-usage` (`anthropic`, `openai`, `bedrock`, `snowflake-cortex`…) |
 | `name`, `title`, `description` | From frontmatter/manifest; commands are named `/command` (Claude Code subfolders add a `namespace:<folder>` tag) or `/namespace:command` for other tools |
 | `repo`, `path`, `url` | Location; `url` is a permalink at the scanned commit (with `#L<line>` for code) |

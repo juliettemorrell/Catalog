@@ -101,6 +101,7 @@
         "instructions",
         "mcp-server",
         "mcp-config",
+        "settings",
         "hook",
         "plugin",
         "eval",

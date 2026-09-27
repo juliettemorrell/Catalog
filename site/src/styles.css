@@ -231,7 +231,7 @@ a.chip:hover { border-color: var(--accent); color: var(--accent-ink); text-decor
   display: inline-block; font-size: 0.7rem; font-weight: 650; text-transform: uppercase; letter-spacing: 0.04em;
   padding: 2px 7px; border-radius: 6px; background: var(--ai-soft); color: var(--ai);
 }
-.kind-sdk-usage, .kind-mcp-config, .kind-hook { background: var(--surface-2); color: var(--text-2); }
+.kind-sdk-usage, .kind-mcp-config, .kind-settings, .kind-hook { background: var(--surface-2); color: var(--text-2); }
 .kind-instructions { background: var(--accent-soft); color: var(--accent-ink); }
 .more-btn {
   justify-self: center; padding: 10px 18px; border-radius: 10px; cursor: pointer;
