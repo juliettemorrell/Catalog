@@ -20,13 +20,13 @@ The `repo-catalog` MCP server exposes a catalog of every repository in the org a
 3. **Inspect the best 2–3 candidates** with `get_repo(repo_id)`. Look at `summary.reuse_notes`, `structure.packages` (importable libraries), `structure.entrypoints` and `api_specs`, and `practices` (prefer grade A/B, active lifecycle). The owners are in `declared.owner` and `ownership.codeowners`.
 4. **For AI work**, check the asset library first:
    - `search_ai_assets(query_text=..., kind="skill" | "agent" | "prompt" | "mcp-server" | "instructions")`
-   - `get_ai_asset(id)` returns the full content, so you can reuse or adapt it. Prefer high `quality_score`. `duplicates` shows where a copy already lives.
+   - `get_ai_asset(asset_id)` returns the full content, so you can reuse or adapt it. Prefer high `quality_score`. `duplicates` shows where a copy already lives.
 5. **Check risk before reusing.** `get_repo` includes `flags` (committed secrets, end-of-life runtimes, retired models, workflow injection…); `list_flags(repo=...)` lists them. Don't copy code with open high-severity findings without saying so. `repo_relationships(repo_id)` shows who depends on a repo, which is the blast radius of changing it.
 6. **Report** what you found: repo, path, permalink `url`, why it fits, and any caveats (stale, low score, different stack). If nothing fits, say so explicitly before building new.
 
 ## Tips
 
 - Free-text search is prefix-matched. If it returns nothing, it falls back to OR, so keep queries short and specific.
-- For anything the tools don't cover, use `sql` (read-only). The tables and views are listed in the server instructions; for example:
+- For anything the tools don't cover, use `sql(statement=...)` (read-only). The tables and views are listed in the server instructions; for example:
   `SELECT name, repo_count FROM dependency_usage WHERE ecosystem='npm' LIMIT 20`.
 - Scan data can be up to a day old. Confirm details in the linked source before depending on them.

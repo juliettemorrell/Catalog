@@ -63,13 +63,25 @@ export function chips(values: string[], cls = "chip", max = 99): string {
   return shown + more;
 }
 
+/** Items per value. Case-insensitive like the filters ("Read" and "read" are one facet,
+ * shown with the first spelling seen), and each item counts once per value. */
 export function countBy<T>(items: T[], key: (t: T) => string | string[] | null | undefined): [string, number][] {
-  const counts = new Map<string, number>();
+  const counts = new Map<string, [string, number]>();
   for (const item of items) {
     const k = key(item);
-    for (const v of new Set(Array.isArray(k) ? k : k ? [k] : [])) counts.set(v, (counts.get(v) ?? 0) + 1);
+    const values = Array.isArray(k) ? k : k ? [k] : [];
+    const seen = new Set<string>();
+    for (const v of values) {
+      if (!v) continue;
+      const lower = v.toLowerCase();
+      if (seen.has(lower)) continue;
+      seen.add(lower);
+      const entry = counts.get(lower);
+      if (entry) entry[1] += 1;
+      else counts.set(lower, [v, 1]);
+    }
   }
-  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  return [...counts.values()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
 
 /** CSV cell safe for spreadsheets: quotes doubled and formula triggers neutralised. */

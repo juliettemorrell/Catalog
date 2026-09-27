@@ -38,23 +38,40 @@ def swift_package(path: str, text: str, res: ManifestResult, _: RepoFiles) -> No
         url = re.search(r'url:\s*"([^"]+)"', args)
         if not url:
             continue
-        ver = re.search(r'(?:from|exact|branch|revision):\s*"([^"]+)"', args) or re.search(
-            r'"(\d+\.\d+(?:\.\d+)?)"', args
-        )
-        res.add_dep(
-            swift_name(url.group(1)), ver.group(1) if ver else None, "swift", "runtime", path
-        )
+        res.add_dep(swift_name(url.group(1)), _swift_requirement(args), "swift", "runtime", path)
+
+
+def _swift_requirement(args: str) -> str | None:
+    """SwiftPM requirement as a range: ``from: "2.0.0"`` means up to the next major."""
+    if m := re.search(r'exact:\s*"([^"]+)"', args):
+        return m.group(1)
+    if m := re.search(r'\.upToNextMinor\s*\(\s*from:\s*"([^"]+)"', args):
+        return f"~{m.group(1)}"
+    if m := re.search(r'(?:from|upToNextMajor\s*\(\s*from):\s*"([^"]+)"', args):
+        return f"^{m.group(1)}"
+    if m := re.search(r'"([^"]+)"\s*\.\.<\s*"([^"]+)"', args):
+        return f">={m.group(1)} <{m.group(2)}"
+    if m := re.search(r'"([^"]+)"\s*\.\.\.\s*"([^"]+)"', args):
+        return f">={m.group(1)} <={m.group(2)}"
+    if m := re.search(r'(?:branch|revision):\s*"([^"]+)"', args):
+        return m.group(1)
+    return None
 
 
 def podfile(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
     for m in re.finditer(
-        r"^\s*pod\s+['\"]([^'\"/]+)(?:/[^'\"]+)?['\"]\s*(?:,\s*['\"]([^'\"]+)['\"])?", text, re.M
+        r"^[ \t]*pod\s+['\"]([^'\"/]+)(?:/[^'\"]+)?['\"]\s*(?:,\s*['\"]([^'\"]+)['\"])?", text, re.M
     ):
-        res.add_dep(m.group(1), m.group(2), "cocoapods", "runtime", path)
+        if not any(
+            d.ecosystem == "cocoapods" and d.name == m.group(1) and d.manifest == path
+            for d in res.dependencies
+        ):  # Firebase/Analytics + Firebase/Crashlytics
+            res.add_dep(m.group(1), m.group(2), "cocoapods", "runtime", path)
 
 
 def mix_exs(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
-    for m in re.finditer(r"\{:(\w+),\s*(?:\"([^\"]+)\")?([^}]*)\}", text):
+    # bounded: an unclosed "{:a," must not rescan the rest of the file from every start
+    for m in re.finditer(r"\{:(\w+),\s*(?:\"([^\"]+)\")?([^{}]{0,400})\}", text):
         name, version, rest = m.group(1), m.group(2), m.group(3)
         if not version and "github:" not in rest and "git:" not in rest and "path:" not in rest:
             continue
@@ -92,29 +109,50 @@ def conda_env(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
     data = _d(load_yaml(text))
     for dep in _l(data.get("dependencies")):
         if isinstance(dep, str):
-            m = re.match(r"([A-Za-z0-9_.\-]+)\s*([=<>!~].*)?$", dep.split("::")[-1].strip())
+            # "numpy=1.26", "numpy >=1.26", "numpy 1.26.*", "conda-forge::numpy"
+            m = re.match(r"([A-Za-z0-9_.\-]+)\s*([=<>!~]?.*)$", dep.split("::")[-1].strip())
             if m and m.group(1) not in ("python", "pip"):
-                res.add_dep(
-                    m.group(1), (m.group(2) or "").lstrip("=") or None, "conda", "runtime", path
-                )
+                spec = m.group(2).strip()
+                spec = spec[1:] if spec.startswith("=") and not spec.startswith("==") else spec
+                res.add_dep(m.group(1), spec or None, "conda", "runtime", path)
         elif isinstance(dep, dict):
             for req in _l(dep.get("pip")):
-                m = re.match(r"([A-Za-z0-9_.\-\[\]]+)\s*(.*)$", str(req).strip())
-                if m and not str(req).startswith("-"):
-                    res.add_dep(
-                        m.group(1).split("[")[0], m.group(2) or None, "pypi", "runtime", path
-                    )
+                name, version = pip_requirement(str(req))
+                if name:
+                    res.add_dep(name, version, "pypi", "runtime", path)
     if "python" in text:
-        m = re.search(r"^\s*-\s*python\s*=+\s*([\d.]+)", text, re.M)
+        m = re.search(r"^[ \t]*-[ \t]*python\s*=+\s*([\d.]+)", text, re.M)
         if m:
             res.runtimes.setdefault("python", m.group(1))
 
 
+def pip_requirement(line: str) -> tuple[str | None, str | None]:
+    """``requests[socks]>=2 ; python_version>"3"`` -> (requests, >=2). URL/VCS requirements
+    keep only the name: their URL may carry credentials and is not a version."""
+    line = line.split("#", 1)[0].strip() if not line.lstrip().startswith("git+") else line.strip()
+    if not line or line.startswith(("-", "git+", "http:", "https:", "file:", ".", "/")):
+        egg = re.search(r"#egg=([A-Za-z0-9_.\-]+)", line)
+        return (egg.group(1), None) if egg else (None, None)
+    m = re.match(r"([A-Za-z0-9_.\-]+)\s*(\[[^\]]*\])?\s*(.*)$", line)
+    if not m:
+        return None, None
+    rest = m.group(3).split(";", 1)[0].strip()
+    return m.group(1), (None if rest.startswith("@") else rest or None)
+
+
 def sbt(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
+    scala = re.search(r'scalaVersion\s*:?=\s*"(\d+)\.(\d+)', text)
+    suffix = (
+        ("_3" if scala.group(1) == "3" else f"_{scala.group(1)}.{scala.group(2)}") if scala else ""
+    )
     for m in re.finditer(
-        r'"([\w.\-]+)"\s*%%?%?\s*"([\w.\-]+)"\s*%\s*"([^"]+)"(?:\s*%\s*"?(\w+)"?)?', text
+        r'"([\w.\-]+)"\s*(%%%|%%|%)\s*"([\w.\-]+)"\s*%\s*(?:"([^"]+)"|(\w+))'
+        r'(?:\s*%\s*"?(\w+)"?)?',
+        text,
     ):
-        group, artifact, version, config = m.groups()
+        group, op, artifact, version, _variable, config = m.groups()
+        # %% appends the Scala binary version to the artifact id
+        artifact = artifact + suffix if op != "%" and suffix else artifact
         scope = "dev" if config and config.lower() in ("test", "it") else "runtime"
         res.add_dep(f"{group}:{artifact}", version, "maven", scope, path)
 
@@ -124,10 +162,10 @@ def bazel_module(path: str, text: str, res: ManifestResult, _: RepoFiles) -> Non
         name = re.search(r'name\s*=\s*"([^"]+)"', m.group(1))
         version = re.search(r'version\s*=\s*"([^"]+)"', m.group(1))
         dev = re.search(r"dev_dependency\s*=\s*True", m.group(1))
-        if name:
+        if name:  # Bzlmod picks the highest requested version (MVS): this is a minimum
             res.add_dep(
                 name.group(1),
-                version.group(1) if version else None,
+                f">={version.group(1)}" if version else None,
                 "bazel",
                 "dev" if dev else "runtime",
                 path,
@@ -137,8 +175,8 @@ def bazel_module(path: str, text: str, res: ManifestResult, _: RepoFiles) -> Non
 def vcpkg(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
     for dep in _l(_d(load_json(text)).get("dependencies")):
         name = dep if isinstance(dep, str) else _d(dep).get("name")
-        version = _d(dep).get("version>=") if isinstance(dep, dict) else None
-        res.add_dep(name, version, "vcpkg", "runtime", path)
+        minimum = _d(dep).get("version>=") if isinstance(dep, dict) else None
+        res.add_dep(name, f">={minimum}" if minimum else None, "vcpkg", "runtime", path)
 
 
 def conanfile(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
@@ -178,12 +216,9 @@ def setup_cfg(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
             )
     for _extra, scope, block in sections:
         for line in block.splitlines():
-            line = line.split("#")[0].strip()
-            m = re.match(r"([A-Za-z0-9_.\-]+)(\[[^\]]*\])?\s*(.*)$", line)
-            if m and line:
-                res.add_dep(
-                    m.group(1), m.group(3).split(";")[0].strip() or None, "pypi", scope, path
-                )
+            name, version = pip_requirement(line)
+            if name:
+                res.add_dep(name, version, "pypi", scope, path)
 
 
 # -------------------------------------------------------------------- infrastructure deps
@@ -208,8 +243,7 @@ def terraform(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
         version = re.search(r'version\s*=\s*"([^"]+)"', m.group("body"))
         src = source.group(1)
         ref = re.search(r"[?&]ref=([^&\"]+)", src)
-        git = re.search(r"github\.com[/:]([\w.-]+/[\w.-]+?)(?:\.git)?(?://|\?|$)", src)
-        name = f"github.com/{git.group(1)}" if git else src.split("//")[0]
+        name = terraform_source_name(src)
         res.add_dep(
             name,
             (version.group(1) if version else ref.group(1) if ref else None),
@@ -219,13 +253,33 @@ def terraform(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
         )
 
 
+def terraform_source_name(src: str) -> str:
+    """Module source -> a stable, credential-free name. Registry sources stay as written
+    (``terraform-aws-modules/vpc/aws``); git/http/s3 sources become ``host/path``."""
+    rest = re.sub(r"^[a-z0-9]+::", "", src.strip())  # forced getters: git::, s3::, gcs::
+    rest = re.sub(r"^(?:[a-z0-9+.-]+://|git@)", "", rest)
+    rest = rest.split("?", 1)[0]
+    host_path, _, _subdir = rest.partition("//")
+    host_path = host_path.rsplit("@", 1)[-1]  # drop userinfo (user:token@host)
+    host_path = (
+        host_path.replace(":", "/", 1) if src.startswith(("git@", "git::git@")) else host_path
+    )
+    return host_path.removesuffix(".git").strip("/")
+
+
 def helm_chart(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
     for dep in _l(_d(load_yaml(text)).get("dependencies")):
         dep = _d(dep)
         res.add_dep(dep.get("name"), dep.get("version"), "helm", "runtime", path)
 
 
-_FROM = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", re.I | re.M)
+_FROM = re.compile(r"^[ \t]*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", re.I | re.M)
+
+
+def has_registry(name: str) -> bool:
+    """``ghcr.io/x``, ``localhost:5000/x`` and ``registry:5000/x`` name a registry host."""
+    first, sep, _ = name.partition("/")
+    return bool(sep) and ("." in first or ":" in first or first == "localhost")
 
 
 def split_image(image: str) -> tuple[str, str | None]:
@@ -243,17 +297,40 @@ def split_image(image: str) -> tuple[str, str | None]:
     return name, ref
 
 
+_ARG = re.compile(r"^[ \t]*ARG\s+([A-Za-z_]\w*)=(\"[^\"]*\"|'[^']*'|\S+)", re.I | re.M)
+
+
 def dockerfile(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
-    stages: set[str] = set()
-    froms = list(_FROM.finditer(text))
-    for i, m in enumerate(froms):
-        image, alias = m.group(1), m.group(2)
+    args = {k: v.strip("\"'") for k, v in _ARG.findall(text)}
+
+    def expand(image: str) -> str:
+        return re.sub(
+            r"\$\{?([A-Za-z_]\w*)(?::?-([^}]*))?\}?",
+            lambda m: str(args.get(m.group(1), m.group(2) or m.group(0))),
+            image,
+        )
+
+    stages: dict[str, str] = {}  # alias -> the external image it builds on
+    froms = [(expand(m.group(1)), (m.group(2) or "").lower()) for m in _FROM.finditer(text)]
+    # the final stage (and everything it builds FROM, through aliases) is the runtime
+    runtime_images: set[str] = set()
+    for image, alias in froms:
+        base = stages.get(image.lower(), image)
         if alias:
-            stages.add(alias.lower())
+            stages[alias] = base
+    if froms:
+        last = froms[-1][0]
+        runtime_images.add(stages.get(last.lower(), last))
+    for image, _alias in froms:
         if image.lower() in stages or image == "scratch" or "$" in image:
             continue
         name, ref = split_image(image)
-        res.add_dep(name, ref, "docker", "runtime" if i == len(froms) - 1 else "build", path)
+        scope = "runtime" if image in runtime_images else "build"
+        if not any(
+            d.ecosystem == "docker" and d.name == name and d.version == ref and d.manifest == path
+            for d in res.dependencies
+        ):
+            res.add_dep(name, ref, "docker", scope, path)
 
 
 def compose(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
@@ -292,7 +369,9 @@ def _images(node: Any, depth: int = 0) -> list[str]:
     return []
 
 
-_USES = re.compile(r"^\s*-?\s*uses:\s*['\"]?([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@([^\s'\"#]+)", re.M)
+_USES = re.compile(
+    r"^[ \t]*-?[ \t]*uses:\s*['\"]?([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@([^\s'\"#]+)", re.M
+)
 
 
 def github_actions(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:

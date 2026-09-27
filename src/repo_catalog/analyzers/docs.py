@@ -18,7 +18,7 @@ _BADGE = re.compile(
 )
 _HTML = re.compile(r"<[^<>\n]{1,400}>")
 _LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)|\[([^\]]+)\]\[[^\]]*\]")
-_REF_DEF = re.compile(r"^\s*\[[^\]]+\]:\s*\S+.*$", re.M)
+_REF_DEF = re.compile(r"^[ \t]*\[[^\]]+\]:\s*\S+.*$", re.M)
 _FENCE = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.S | re.M)
 _RST_DIRECTIVE = re.compile(r"^\.\. [\w|:-]+.*(?:\n[ \t]+.*)*", re.M)
 
@@ -147,7 +147,7 @@ def _features(body: str, max_items: int = 10) -> list[str]:
     section = body[m.end() :]
     nxt = re.search(r"^#{1,3}\s", section, re.M)
     section = section[: nxt.start()] if nxt else section
-    items = [_clean(x) for x in re.findall(r"^\s*[-*+]\s+(.+)$", section, re.M)]
+    items = [_clean(x) for x in re.findall(r"^[ \t]*[-*+]\s+(.+)$", section, re.M)]
     return [i for i in items if 3 < len(i) < 200][:max_items]
 
 

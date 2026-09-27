@@ -18,7 +18,8 @@ It is built for SDLC agents: the same data is available as JSON (with JSON Schem
 |---|---|
 | Local scanning (`--local`) | Verified on 22 public OSS repos: 0 crashes, 0 scan errors, ~1 minute for the lot |
 | Outputs | JSON validated by the Pydantic models; SBOMs and AI-BOM pass strict CycloneDX 1.6 schema validation |
-| Tests | 70 Python tests (`uv run pytest`), 17 site tests (`cd site && npm test`); ruff, mypy, tsc, actionlint and zizmor clean |
+| Tests | 94 Python tests (`uv run pytest`), 17 site tests (`cd site && npm test`); ruff, mypy, tsc, actionlint and zizmor clean |
+| Independent review | Four adversarial reviews (dependency parsing, org links/OSV/SBOM, security, package/UI) found 37 issues; all were fixed, and every high and medium code finding has a regression test in `tests/test_review_fixes.py`. The UI findings were re-verified in a browser: all 329 facet counts match their results and all 147 Insights bars lead to results. Credential canaries never reach any output or OSV; pathological files scan in well under a second |
 | Web UI | Axe accessibility checks: 0 violations in light and dark themes; no mobile overflow |
 | **Not verified live** | GitHub org discovery against a real org (tested with mocked HTTP only), `--github-sbom`, `--osv` (OSV.dev was unreachable from the build sandbox; tested with mocked responses) and `--llm` summaries. Run a small trial first: `repo-catalog scan --org <org> --limit 5` |
 
@@ -84,6 +85,8 @@ Conventions (also in `CLAUDE.md`): detectors never raise on bad input (errors go
 - The GitHub App needs read-only permissions; nothing writes to scanned repos.
 
 ## Known limitations
+
+- There is no per-repo wall-clock timeout. Every file-parsing regex has been checked for catastrophic backtracking, but if an org has something truly pathological, scan it with `--exclude`.
 
 - Dependency trees are flat: a transitive dependency is known, but not which direct dependency pulled it in. Gradle and Maven transitive deps need a lockfile (`gradle.lockfile`) or `--github-sbom`.
 - Retired-model data covers Anthropic fully and only long-retired OpenAI models; Gemini is not yet listed (`reference.py`).

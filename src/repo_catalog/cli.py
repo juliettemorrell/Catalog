@@ -1,4 +1,4 @@
-"""Command line entry point: ``repo-catalog scan|build|search|sql|mcp|schema``."""
+"""Command line entry point: ``repo-catalog scan|build|search|blocks|deps|flags|sql|mcp|schema``."""
 
 from __future__ import annotations
 

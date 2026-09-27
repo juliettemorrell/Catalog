@@ -16,6 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 from ..models import AIAsset, Flag, Repo, RepoLink, Severity
 from .ai_risk import launched_package
 from .flags import release_cycle
+from .manifests import NON_PRODUCT_DIR
 from .reference import MODEL_DEPRECATIONS, RUNTIME_EOL
 
 DERIVED_FLAGS = {"eol-runtime", "deprecated-model", "depends-on-archived", "vulnerable-dependency"}
@@ -89,13 +90,25 @@ def eol_flags(repo: Repo, today: date) -> list[Flag]:
 
 def _model_index() -> dict[str, tuple[str, str, str | None, str | None]]:
     index: dict[str, tuple[str, str, str | None, str | None]] = {}
-    for model_id, (status, when, replacement) in MODEL_DEPRECATIONS.items():
+    # oldest snapshot first, so an alias ("-latest") ends up pointing at the newest one
+    for model_id, (status, when, replacement) in sorted(
+        MODEL_DEPRECATIONS.items(), key=lambda kv: re.findall(r"\d{8}", kv[0]) or [""]
+    ):
         entry = (model_id, status, when, replacement)
         index[model_id] = entry
         if m := re.fullmatch(r"(.+)-\d{8}", model_id):
             family = m.group(1)
             for alias in (family, f"{family}-latest", f"{family}-0"):
-                index.setdefault(alias, entry)
+                index[alias] = entry
+    # Bedrock's original model ids
+    for legacy, canonical in (
+        ("claude-v2", "claude-2.0"),
+        ("claude-v2:1", "claude-2.1"),
+        ("claude-v1", "claude-1.3"),
+        ("claude-instant-v1", "claude-instant-1.2"),
+    ):
+        if canonical in index:
+            index[legacy] = index[canonical]
     return index
 
 
@@ -108,9 +121,11 @@ def lookup_model(raw: str) -> tuple[str, str, str | None, str | None] | None:
     Accepts provider spellings: Bedrock ``us.anthropic.claude-3-haiku-20240307-v1:0``,
     Vertex ``claude-3-opus@20240229``, and router prefixes such as ``anthropic/``."""
     m = raw.strip().lower()
-    m = re.sub(r"^(?:[a-z-]+/)+", "", m)  # openrouter/litellm prefixes
+    m = re.sub(r"^(?:[a-z0-9_.-]+/)+", "", m)  # openrouter / litellm / vertex_ai prefixes
     m = re.sub(r"^(?:(?:us|eu|apac|global|jp|au)\.)?anthropic\.", "", m)
-    m = re.sub(r"-v\d+(?::\d+)?$", "", m)
+    if m in _MODELS:
+        return _MODELS[m]  # e.g. claude-v2:1
+    m = re.sub(r"(\d{8})-v\d+(?::\d+)?$", r"\1", m)  # Bedrock version suffix after a date
     m = m.replace("@", "-")
     return _MODELS.get(m)
 
@@ -169,23 +184,29 @@ def _entity_name(ref: str) -> str:
 def _mcp_targets(
     name: str,
     cfg: object,
-    published: dict[tuple[str, str], str],
+    publishers: dict[tuple[str, str], list[Repo]],
     providers: dict[str, set[str]],
-) -> list[str]:
-    """Org repos behind an MCP server a repo configures: by launched package, else name."""
-    command = cfg.get("command") if isinstance(cfg, dict) else None
-    launched = launched_package(str(command or ""))
+    consumer: Repo,
+) -> list[Repo | str]:
+    """Org repos behind an MCP server a repo configures. The launched package decides;
+    the server name is only a fallback for configs that give nothing else (a remote URL or
+    a third-party package means the server is not one of ours)."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    launched = launched_package(str(cfg.get("command") or ""))
     if launched and launched[0] in ("npm", "pypi"):
         ecosystem, spec = launched
         if ecosystem == "npm":
             base = "@" + spec[1:].split("@")[0] if spec.startswith("@") else spec.split("@")[0]
         else:
             base = re.split(r"[=<>!~\[@ ]", spec, maxsplit=1)[0]
-        target = published.get((ecosystem, _norm(ecosystem, base)))
-        if target:
-            return [target]
+        owner = _owner(publishers.get((ecosystem, _norm(ecosystem, base)), []), consumer)
+        return [owner] if owner else []
+    if launched or cfg.get("url"):
+        return []
     owners = providers.get(name.lower(), set())
-    return sorted(owners) if len(owners) == 1 else []  # ambiguous names link nothing
+    if len(owners) != 1:
+        return []  # ambiguous names link nothing
+    return [next(iter(owners))]
 
 
 def _norm(ecosystem: str, name: str) -> str:
@@ -193,35 +214,60 @@ def _norm(ecosystem: str, name: str) -> str:
     return re.sub(r"[-_.]+", "-", name) if ecosystem == "pypi" else name
 
 
+_SCOPE_RANK = {"runtime": 0, "peer": 0, "optional": 1, "dev": 2, "build": 3, "transitive": 4}
+MAX_ROUTES_PER_PAIR = 5  # repos are never dropped; only extra routes to the same repo are
+
+
+def _publishers(repos: list[Repo]) -> dict[tuple[str, str], list[Repo]]:
+    """Who publishes each package. Forks (they would claim every consumer of the upstream
+    package) and example/test packages (templates copy them) never count."""
+    out: dict[tuple[str, str], list[Repo]] = {}
+    for repo in repos:
+        if repo.fork:
+            continue
+        for pkg in repo.structure.packages:
+            if pkg.private is True or NON_PRODUCT_DIR.search(f"{pkg.path}/"):
+                continue
+            key = (pkg.ecosystem, _norm(pkg.ecosystem, pkg.name))
+            if repo not in out.setdefault(key, []):
+                out[key].append(repo)
+    return out
+
+
+def _owner(candidates: list[Repo], consumer: Repo) -> Repo | None:
+    """The one repo a package comes from, or None when it is the consumer's own package
+    or ownership is ambiguous (linking the wrong repo is worse than no link)."""
+    if consumer in candidates:
+        return None  # a workspace member of the consumer itself
+    live = [r for r in candidates if not r.archived] or candidates
+    return live[0] if len(live) == 1 else None
+
+
 def _link(repos: list[Repo], assets_by_repo: dict[str, list[AIAsset]] | None = None) -> None:
     assets_by_repo = assets_by_repo or {}
     by_id = {r.id.lower(): r for r in repos}
-    published: dict[tuple[str, str], str] = {}
-    for repo in repos:
-        if repo.fork:
-            continue  # a fork of a public package would claim every consumer of it
-        for pkg in repo.structure.packages:
-            if pkg.private is not True:
-                published.setdefault((pkg.ecosystem, _norm(pkg.ecosystem, pkg.name)), repo.id)
-    go_modules = sorted(
-        ((name, rid) for (eco, name), rid in published.items() if eco == "go"),
-        key=lambda kv: -len(kv[0]),
-    )
+    publishers = _publishers(repos)
+    go_modules = {name: key for key in publishers if key[0] == "go" for name in [key[1]]}
 
-    edges: dict[tuple[str, str, str], None] = {}  # ordered set; every route is kept
+    # (src, dst) -> {base via: strongest scope rank}
+    routes: dict[tuple[str, str], dict[str, int]] = {}
 
-    def link(src: Repo, target_id: str | None, via: str) -> None:
-        if target_id and target_id.lower() != src.id.lower():
-            edges.setdefault((src.id, by_id[target_id.lower()].id, via), None)
+    def link(src: Repo, target: Repo | str | None, via: str, scope: str = "runtime") -> None:
+        dst = by_id.get(target.lower()) if isinstance(target, str) else target
+        if dst is None or dst.id.lower() == src.id.lower():
+            return
+        pair = routes.setdefault((src.id, dst.id), {})
+        rank = _SCOPE_RANK.get(scope, 0)
+        pair[via] = min(pair.get(via, rank), rank)
 
     # names teams declared (Backstage metadata.name) and MCP servers repos implement
-    declared_names: dict[str, str] = {}
+    declared_names: dict[str, set[str]] = {}
     mcp_providers: dict[str, set[str]] = {}
     api_providers: dict[str, set[str]] = {}
     for repo in repos:
         for name in {repo.declared.name, repo.name}:
             if name:
-                declared_names.setdefault(name.lower(), repo.id)
+                declared_names.setdefault(name.lower(), set()).add(repo.id)
         for asset in assets_by_repo.get(repo.id, []):
             # example servers (SDK samples, tutorials) are not something others deploy
             if asset.kind == "mcp-server" and "example" not in asset.tags:
@@ -232,19 +278,22 @@ def _link(repos: list[Repo], assets_by_repo: dict[str, list[AIAsset]] | None = N
     for repo in repos:
         for dep in repo.dependencies:
             key = (dep.ecosystem, _norm(dep.ecosystem, dep.name))
-            target = published.get(key)
-            if not target and dep.ecosystem == "go":
-                target = next(
-                    (rid for mod, rid in go_modules if key[1].startswith(mod + "/")), None
-                )
-            suffix = " (transitive)" if dep.scope == "transitive" else ""
-            if target:
-                link(repo, target, f"{dep.ecosystem} {dep.name}{suffix}")
+            candidates = publishers.get(key)
+            if candidates is None and dep.ecosystem == "go":
+                # a package path inside a module: walk its prefixes (github.com/a/b/c -> a/b)
+                parts = key[1].split("/")
+                for i in range(len(parts) - 1, 0, -1):
+                    module = go_modules.get("/".join(parts[:i]))
+                    if module:
+                        candidates = publishers[module]
+                        break
+            if candidates:
+                link(repo, _owner(candidates, repo), f"{dep.ecosystem} {dep.name}", dep.scope)
                 continue
             if dep.ecosystem == "docker" and dep.name.startswith("ghcr.io/"):
                 parts = dep.name.split("/")
-                if len(parts) >= 3 and f"{parts[1]}/{parts[2]}" in by_id:
-                    link(repo, f"{parts[1]}/{parts[2]}", f"image {dep.name}")
+                if len(parts) >= 3:
+                    link(repo, f"{parts[1]}/{parts[2]}", f"image {dep.name}", dep.scope)
                 continue
             if dep.ecosystem in ("terraform", "github-actions"):
                 continue  # resolved from `references`, which keep the exact file
@@ -252,14 +301,15 @@ def _link(repos: list[Repo], assets_by_repo: dict[str, list[AIAsset]] | None = N
                 if m := _GITHUB_REF.search(text):
                     target_id = f"{m.group(1)}/{m.group(2)}".lower()
                     if target_id in by_id:
-                        link(repo, target_id, f"{dep.ecosystem} {dep.name}")
+                        link(repo, target_id, f"{dep.ecosystem} {dep.name}", dep.scope)
                         break
         for ref in repo.references:
             if ref.target in by_id:
-                link(repo, ref.target, f"{ref.kind} {ref.target}")
+                link(repo, ref.target, f"{ref.kind} {ref.target}")  # kind says how
         for entity in repo.declared.depends_on:
-            target = declared_names.get(_entity_name(entity))
-            link(repo, target, f"declared dependsOn {entity}")
+            owners = declared_names.get(_entity_name(entity), set())
+            if len(owners) == 1:
+                link(repo, next(iter(owners)), f"declared dependsOn {entity}")
         for api in repo.declared.consumes_apis:
             for target in sorted(api_providers.get(_entity_name(api), ())):
                 link(repo, target, f"consumes API {api}")
@@ -268,23 +318,18 @@ def _link(repos: list[Repo], assets_by_repo: dict[str, list[AIAsset]] | None = N
                 continue
             servers = asset.frontmatter.get("servers")
             for name, cfg in (servers if isinstance(servers, dict) else {}).items():
-                for target in _mcp_targets(str(name), cfg, published, mcp_providers):
-                    link(repo, target, f"MCP server {name}")
+                for server in _mcp_targets(str(name), cfg, publishers, mcp_providers, repo):
+                    link(repo, server, f"MCP server {name}")
 
-    # a package used directly and transitively is one route: keep the direct one
-    direct_routes = {(s_, d_, v) for s_, d_, v in edges if not v.endswith(" (transitive)")}
+    labels = {1: " (optional)", 2: " (dev)", 3: " (build)", 4: " (transitive)"}
     flagged: set[tuple[str, str]] = set()
-    for src_id, dst_id, via in edges:
-        if (
-            via.endswith(" (transitive)")
-            and (src_id, dst_id, via.removesuffix(" (transitive)")) in direct_routes
-        ):
-            continue
+    for (src_id, dst_id), vias in sorted(routes.items()):
         src, dst = by_id[src_id.lower()], by_id[dst_id.lower()]
-        if len(src.depends_on) < MAX_LINKS:
-            src.depends_on.append(RepoLink(repo=dst.id, via=via))
-        if len(dst.used_by) < MAX_LINKS:
-            dst.used_by.append(RepoLink(repo=src.id, via=via))
+        ordered = sorted(vias.items(), key=lambda kv: (kv[1], kv[0]))[:MAX_ROUTES_PER_PAIR]
+        for via, rank in ordered:
+            label = via + labels.get(rank, "")
+            src.depends_on.append(RepoLink(repo=dst.id, via=label))
+            dst.used_by.append(RepoLink(repo=src.id, via=label))
         if dst.archived and not src.archived and (src.id, dst.id) not in flagged:
             flagged.add((src.id, dst.id))
             src.flags.append(
@@ -292,7 +337,7 @@ def _link(repos: list[Repo], assets_by_repo: dict[str, list[AIAsset]] | None = N
                     id="depends-on-archived",
                     category="maintenance",
                     severity="medium",
-                    message=f"Depends on archived repo {dst.id} ({via})",
+                    message=f"Depends on archived repo {dst.id} ({ordered[0][0]})",
                 )
             )
     for repo in repos:

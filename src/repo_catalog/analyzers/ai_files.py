@@ -911,7 +911,7 @@ class FileDetector:
                 detector="promptfoo-config",
                 text=text,
                 description=_str(data.get("description")),
-                models=[p for p in providers if p],
+                models=[m for m in (_promptfoo_model(p) for p in providers) if m],
                 frontmatter=sanitize_config(
                     {
                         "prompts": as_list_raw(data.get("prompts"))[:20],
@@ -1064,3 +1064,13 @@ def _has_inline_secret(cfg: dict[str, Any], env: dict[str, Any]) -> bool:
 def _headers(cfg: dict[str, Any]) -> dict[str, Any]:
     h = cfg.get("headers") or cfg.get("http_headers")
     return h if isinstance(h, dict) else {}
+
+
+def _promptfoo_model(provider: str) -> str | None:
+    """``openai:gpt-4o`` / ``anthropic:messages:claude-sonnet-4-6`` -> the model id. HTTP,
+    file, script and exec providers are not models (and URLs may carry credentials)."""
+    provider = provider.strip()
+    if not provider or re.match(r"^(https?|wss?|file|exec|python|js|golang|ruby)\b", provider):
+        return None
+    model = provider.rsplit(":", 1)[-1]
+    return model if re.fullmatch(r"[A-Za-z0-9][\w.\-/@]{1,120}", model) else None

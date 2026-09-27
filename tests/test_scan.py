@@ -698,7 +698,7 @@ def test_dependencies_from_manifests_and_lockfiles(
     assert (
         one("gem", "rails").resolved == "7.1.3" and one("gem", "actionpack").scope == "transitive"
     )
-    assert one("go", "github.com/google/uuid").purl == "pkg:golang/github.com/google/uuid@1.6.0"
+    assert one("go", "github.com/google/uuid").purl == "pkg:golang/github.com/google/uuid@v1.6.0"
     assert one("go", "golang.org/x/sys").scope == "transitive"
     nio = one("swift", "github.com/apple/swift-nio")
     assert nio.resolved == "2.64.0" and nio.purl == "pkg:swift/github.com/apple/swift-nio@2.64.0"

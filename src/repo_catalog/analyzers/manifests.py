@@ -19,9 +19,9 @@ from typing import Any
 
 from ..fs import RepoFiles
 from ..models import Dependency, Package
-from ..textutil import load_json, load_yaml
+from ..textutil import clean_ref, load_json, load_yaml
 from .deps_more import extra_jobs
-from .lockfiles import apply_lockfiles
+from .lockfiles import apply_lockfiles, split_at
 from .purls import finalize_dependencies
 
 log = logging.getLogger(__name__)
@@ -89,7 +89,19 @@ class ManifestResult:
             return
         ver = version if isinstance(version, str) else None
         if isinstance(version, dict):
+            if version.get("path") and not (version.get("version") or version.get("git")):
+                return  # a path dependency is the repo's own code
             ver = _str(version.get("version"))
+            name = _str(version.get("package")) or name  # Cargo: rq = { package = "reqwest" }
+        name = clean_ref(name)
+        if ver is not None:
+            ver = ver.strip()
+            if ver.startswith("npm:"):  # npm alias: "myalias": "npm:left-pad@^1.3.0"
+                real, rng = split_at(ver[4:])
+                name, ver = real, rng or None
+            elif ver.startswith(("workspace:", "file:", "link:", "portal:")):
+                return  # the repo's own packages in a monorepo
+            ver = clean_ref(ver) if ver else ver  # git/tarball URLs may carry credentials
         self.dependencies.append(
             Dependency(
                 name=name,
@@ -176,8 +188,14 @@ def parse_manifests(files: RepoFiles) -> ManifestResult:
         except Exception as exc:  # never fail the scan on a bad manifest
             res.errors.append(f"{path}: {type(exc).__name__}: {str(exc)[:200]}")
     res.dependencies = _collapse_repeats(res.dependencies)
-    apply_lockfiles(files, res.lockfiles, res.dependencies, res.errors)
-    finalize_dependencies(res.dependencies)
+    for label, step in (
+        ("lockfiles", lambda: apply_lockfiles(files, res.lockfiles, res.dependencies, res.errors)),
+        ("purls", lambda: finalize_dependencies(res.dependencies)),
+    ):
+        try:
+            step()
+        except Exception as exc:  # never lose the manifests over a resolution bug
+            res.errors.append(f"{label}: {type(exc).__name__}: {str(exc)[:200]}")
     try:
         _runtime_files(files, res)
     except Exception as exc:
@@ -416,7 +434,42 @@ def _go_mod(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
             res.add_dep(parts[0], parts[1], "go", scope, path)
         elif line.startswith("require ") and len(parts) >= 3:
             res.add_dep(parts[1], parts[2], "go", scope, path)
+    # replace old [v] => new [v]: the build uses the replacement (a fork, or local code)
+    replaces = re.findall(
+        r"^[ \t]*(?:replace\s+)?(\S+)(?:\s+(v\S+))?\s+=>\s+(\S+)(?:\s+(v\S+))?\s*$",
+        "\n".join(ln for ln in _go_blocks(text, "replace")),
+        re.M,
+    )
+    for old, old_ver, new, new_ver in replaces:
+        for dep in res.dependencies:
+            if (
+                dep.ecosystem == "go"
+                and dep.manifest == path
+                and dep.name == old
+                and (not old_ver or dep.version == old_ver)
+            ):
+                if new.startswith((".", "/")):
+                    dep.version = None  # replaced by local code: no registry version ships
+                else:
+                    dep.name, dep.version = new, new_ver or dep.version
     res.package_managers.add("go modules")
+
+
+def _go_blocks(text: str, keyword: str) -> list[str]:
+    """Lines of `keyword x` directives and `keyword ( ... )` blocks, comments removed."""
+    out: list[str] = []
+    in_block = False
+    for raw in text.splitlines():
+        line = raw.split("//", 1)[0].strip()
+        if re.match(rf"^{keyword}\s*\($", line):
+            in_block = True
+        elif in_block and line == ")":
+            in_block = False
+        elif in_block and line:
+            out.append(line)
+        elif line.startswith(f"{keyword} "):
+            out.append(line[len(keyword) + 1 :])
+    return out
 
 
 def _cargo(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
@@ -516,15 +569,18 @@ def _gradle(path: str, text: str, res: ManifestResult, files: RepoFiles) -> None
         if module:
             scope = "dev" if conf.startswith("test") else "runtime"
             res.add_dep(module[0], module[1], "maven", scope, path)
+    # plugins resolve through their marker artifact: <id>:<id>.gradle.plugin
     plugins = re.findall(
-        r"id\s*\(?\s*['\"](org\.springframework\.boot|io\.quarkus|io\.micronaut[\w.]*|"
-        r"com\.android\.application)['\"]|alias\(\s*libs\.plugins\.([\w.]+)",
+        r"\bid\s*\(?\s*['\"]([a-z][\w-]*(?:\.[\w-]+)+)['\"]\s*\)?"
+        r"(?:\s*version\s*\(?\s*['\"]([^'\"]+)['\"])?|alias\(\s*libs\.plugins\.([\w.]+)",
         text,
     )
-    for plugin_id, alias in plugins:
-        pid = plugin_id or (catalog.get("plugin:" + alias.replace(".", "-").lower(), ("",))[0])
+    for plugin_id, version, alias in plugins:
+        pid, pver = plugin_id, version or None
+        if alias:
+            pid, pver = catalog.get("plugin:" + alias.replace(".", "-").lower(), ("", None))
         if pid:
-            res.add_dep(f"{pid}:plugin", None, "maven", "build", path)
+            res.add_dep(f"{pid}:{pid}.gradle.plugin", pver, "maven", "build", path)
     res.package_managers.add("gradle")
 
 
@@ -572,12 +628,15 @@ def _gradle_catalog(path: str, text: str, res: ManifestResult, files: RepoFiles)
 
 
 def _gemfile(path: str, text: str, res: ManifestResult, _: RepoFiles) -> None:
-    stack: list[bool] = []  # one entry per open `do` block: True if it is a dev/test group
+    stack: list[bool] = []  # one entry per open block: True if it is a dev/test group
     for line in text.splitlines():
         s = line.split("#", 1)[0].strip()
         if not s:
             continue
-        if re.match(r"^(group|platforms?|source|install_if|git|path|gemspec)\b.*\bdo\b", s):
+        # every block opener needs an entry, so its `end` never closes an enclosing group
+        if re.search(r"\bdo(\s*\|[^|]*\|)?$", s) or re.match(
+            r"^(if|unless|case|begin|while|until|for)\b", s
+        ):
             stack.append(s.startswith("group") and bool(re.search(r":(development|test)", s)))
             continue
         if s == "end" and stack:
@@ -641,7 +700,7 @@ def _csproj(path: str, text: str, res: ManifestResult, files: RepoFiles) -> None
     central = _central_versions(files, path)
     scope = "dev" if is_test else "runtime"
     for name, ref in refs:
-        ver = ref.attrib.get("Version")
+        ver = ref.attrib.get("VersionOverride") or ref.attrib.get("Version")
         if ver is None:
             child = next((c for c in ref if c.tag.endswith("Version")), None)
             ver = child.text if child is not None else central.get((name or "").lower())

@@ -173,6 +173,21 @@ def _secretish_segment(seg: str) -> bool:
     return len(seg) >= 24 and bool(re.search(r"\d", seg)) and bool(re.search(r"[A-Za-z]", seg))
 
 
+_USERINFO = re.compile(r"(?<![^\s/])[^\s/:@]+:[^\s/@]+@")
+
+
+def clean_ref(text: str) -> str:
+    """A dependency name/version as stored: URLs lose credentials, query strings and
+    secret-looking path segments; bare ``user:pass@host`` userinfo is dropped; any
+    credential-shaped string is masked. Plain names and versions pass through unchanged."""
+    if "://" in text:
+        text = redact_url(text)
+    elif re.search(r"\?[^?\s]*=", text):
+        text = text.split("?", 1)[0]  # registry-style sources: mod/aws?token=...
+    text = _USERINFO.sub("", text)
+    return redact_secrets(text)
+
+
 def redact_args(args: list[Any]) -> list[str]:
     """Command-line args with secret values masked (``--api-key X``, ``TOKEN=X``)."""
     out: list[str] = []

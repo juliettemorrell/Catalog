@@ -73,12 +73,12 @@ export const REPO_FILTERS: Record<string, FilterDef<Repo>> = {
   tech: { get: stackValues, help: "any framework, library, tool or dependency (partial match)" },
   type: { get: (r) => r.structure.repo_type, exact: true, help: "repo type" },
   grade: { get: (r) => r.practices.grade, exact: true, help: "best-practice grade A-F" },
-  cap: { get: (r) => [...r.capabilities, ...r.summary.domains], help: "capability or domain" },
+  cap: { get: (r) => [...r.capabilities, ...r.summary.domains], exact: true, help: "capability or domain" },
   topic: { get: (r) => r.topics, exact: true, help: "GitHub topic" },
   owner: { get: (r) => [r.declared.owner, r.owner, ...r.ownership.codeowners], help: "owner/team" },
   lifecycle: { get: (r) => r.lifecycle, exact: true, help: "active, maintained, stale, archived" },
   ai: { get: (r) => (r.ai.has_ai ? "yes" : "no"), exact: true, help: "uses AI (yes/no)" },
-  uses: { get: (r) => [...r.ai.sdks, ...r.ai.models, ...r.ai.ecosystems], help: "AI SDK, model or ecosystem" },
+  uses: { get: (r) => [...r.ai.sdks, ...r.ai.models, ...r.ai.ecosystems], exact: true, help: "AI SDK, model or ecosystem" },
   missing: { get: (r) => r.practices.checks.filter((c) => !c.passed).map((c) => c.id), exact: true, help: "failing practice check id" },
   has: { get: (r) => r.practices.checks.filter((c) => c.passed).map((c) => c.id), exact: true, help: "passing practice check id" },
   is: {
@@ -99,9 +99,9 @@ export const ASSET_FILTERS: Record<string, FilterDef<Asset>> = {
   kind: { get: (a) => a.kind, exact: true, help: "skill, agent, command, prompt, instructions, mcp-server…" },
   eco: { get: (a) => a.ecosystem, exact: true, help: "ecosystem, e.g. claude-code, cursor, copilot" },
   repo: { get: (a) => [a.repo, a.repo.split("/")[1]], exact: true, help: "repository" },
-  tool: { get: (a) => a.tools, help: "tool the asset uses/exposes" },
-  model: { get: (a) => a.models, help: "model id" },
-  tag: { get: (a) => [...a.tags, a.category], help: "tag or category" },
+  tool: { get: (a) => a.tools, exact: true, help: "tool the asset uses/exposes" },
+  model: { get: (a) => a.models, exact: true, help: "model id" },
+  tag: { get: (a) => [...a.tags, a.category], exact: true, help: "tag or category" },
   conf: { get: (a) => a.confidence, exact: true, help: "detection confidence" },
   scope: { get: (a) => a.scope, exact: true, help: "repo, plugin" },
   dup: { get: (a) => (a.duplicates.length ? "yes" : "no"), exact: true, help: "has copies elsewhere (yes/no)" },
@@ -129,6 +129,10 @@ function matches<T>(item: T, f: Filter, defs: Record<string, FilterDef<T>>): boo
   const raw = def.get(item);
   const values = (Array.isArray(raw) ? raw : [raw]).map(lc).filter(Boolean);
   const want = f.value.toLowerCase();
+  if (want.length > 1 && want.endsWith("*")) { // explicit prefix match: tool:Bash*, uses:claude*
+    const prefix = want.slice(0, -1);
+    return values.some((v) => v.startsWith(prefix));
+  }
   return values.some((v) => (def.exact ? v === want : v.includes(want)));
 }
 

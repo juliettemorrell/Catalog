@@ -268,7 +268,9 @@ _MCP_SERVER_NAME = [
     re.compile(r"new\s+(?:Mcp|Fast)?(?:Server|MCP)\(\s*\{\s*name:\s*['\"`]([^'\"`]+)['\"`]"),
     re.compile(r"NewMCPServer\(\s*\"([^\"]+)\""),
     re.compile(r"mcp\.Implementation\{\s*Name:\s*\"([^\"]+)\""),
-    re.compile(r"(?i)server_?info['\"]?\s*[=:]\s*\{[^}]*?['\"]name['\"]\s*:\s*['\"]([^'\"]+)"),
+    re.compile(
+        r"(?i)server_?info['\"]?\s*[=:]\s*\{[^}]{0,2000}?['\"]name['\"]\s*:\s*['\"]([^'\"]+)"
+    ),
 ]
 _MCP_SERVER_CTOR = re.compile(
     r"\b(FastMCP|MCPServer)\(|new\s+McpServer\(|new\s+Server\(\s*\{|NewMCPServer\(|mcp\.NewServer\(|"

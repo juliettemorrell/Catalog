@@ -26,7 +26,7 @@ _TEST_CMD = re.compile(
     re.IGNORECASE,
 )
 _USES = re.compile(r"uses:\s*['\"]?([\w.-]+/[\w./-]+)@([\w.-]+)")
-_WRITE_ALL = re.compile(r"^\s*permissions:\s*['\"]?write-all", re.M)
+_WRITE_ALL = re.compile(r"^[ \t]*permissions:\s*['\"]?write-all", re.M)
 
 
 def assess_practices(
@@ -194,7 +194,7 @@ def assess_practices(
             "security",
             "Workflows declare least-privilege permissions",
             all(
-                re.search(r"^\s*permissions:", t, re.M) and not _WRITE_ALL.search(t)
+                re.search(r"^[ \t]*permissions:", t, re.M) and not _WRITE_ALL.search(t)
                 for t in workflows.values()
             ),
             1,

@@ -40,5 +40,6 @@ function catalogData(): Plugin {
 export default defineConfig({
   base: "./",
   plugins: process.env.VITEST ? [] : [catalogData()],
-  build: { target: "es2022", sourcemap: true },
+  // no sourcemaps: they embed the build machine's absolute paths and double the download
+  build: { target: "es2022", sourcemap: false },
 });

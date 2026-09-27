@@ -113,7 +113,7 @@ sev:high flag:committed-secret         reuse:terraform-module usedby:yes
 dep:express vuln:yes                   depeco:terraform
 ```
 
-Filters: `lang` (primary language), `anylang`, `fw`, `data`, `infra`, `tech` (any stack item, partial), `type`, `grade`, `cap`, `topic`, `owner`, `lifecycle`, `ai`, `uses`, `missing`, `has`, `is`, `minscore`, `flag`, `sev`, `reuse`, `usedby`, `dep`, `depeco`, `vuln`; for assets `kind`, `eco`, `repo`, `tool`, `model`, `tag`, `conf`, `scope`, `dup`, `minq`, `flag`, `sev`; for building blocks `kind`, `format`, `repo`, `lang`, `grade`, `lifecycle`. Prefix with `-` to exclude. Unknown keys are searched as text.
+Filters: `lang` (primary language), `anylang`, `fw`, `data`, `infra`, `tech` (any stack item, partial), `type`, `grade`, `cap`, `topic`, `owner`, `lifecycle`, `ai`, `uses`, `missing`, `has`, `is`, `minscore`, `flag`, `sev`, `reuse`, `usedby`, `dep`, `depeco`, `vuln`; for assets `kind`, `eco`, `repo`, `tool`, `model`, `tag`, `conf`, `scope`, `dup`, `minq`, `flag`, `sev`; for building blocks `kind`, `format`, `repo`, `lang`, `grade`, `lifecycle`. Values match exactly (so facet counts equal their results) except `tech` and free text; end a value with `*` to match a prefix (`tool:Bash*`, `uses:claude*`). Prefix a filter with `-` to exclude. Unknown keys are searched as text. The examples assume a real org; the bundled `demo-data` holds 22 public open-source repos.
 
 **CLI**
 

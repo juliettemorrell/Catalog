@@ -200,10 +200,10 @@ _IMAGES = {
     "ibm-semeru-runtimes": "java",
 }
 _WORKFLOW_VERSION = re.compile(
-    r"^\s*-?\s*(node|python|java|go|dotnet|ruby|php)-version:\s*['\"]?([0-9][\w.+\-]*)['\"]?\s*$",
+    r"^[ \t]*-?[ \t]*(node|python|java|go|dotnet|ruby|php)-version:\s*['\"]?([0-9][\w.+\-]*)['\"]?\s*$",
     re.M,
 )
-_FROM = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", re.I | re.M)
+_FROM = re.compile(r"^[ \t]*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", re.I | re.M)
 
 
 def _add(out: list[RuntimeVersion], runtime: str, version: str, path: str) -> None:
@@ -340,7 +340,7 @@ def _docker_flags(files: RepoFiles) -> list[Flag]:
         if not last_image or last_image == "scratch" or "nonroot" in last_image:
             continue
         final = text[text.rfind(last_image) :]
-        users = re.findall(r"^\s*USER\s+(\S+)", final, re.I | re.M)
+        users = re.findall(r"^[ \t]*USER\s+(\S+)", final, re.I | re.M)
         if not users or users[-1].split(":")[0] in ("root", "0"):
             flags.append(
                 Flag(
@@ -357,9 +357,9 @@ def _docker_flags(files: RepoFiles) -> list[Flag]:
 # -------------------------------------------------------------------- GitHub workflows
 
 _UNTRUSTED = re.compile(
-    r"\$\{\{[^}]*\b(github\.event\.(?:issue\.(?:title|body)|pull_request\.(?:title|body|head\."
+    r"\$\{\{[^}]{0,300}?\b(github\.event\.(?:issue\.(?:title|body)|pull_request\.(?:title|body|head\."
     r"(?:ref|label|repo\.default_branch))|comment\.body|review\.body|review_comment\.body|"
-    r"discussion\.(?:title|body)|pages\.[^}]*?page_name|commits\.[^}]*?(?:message|author\."
+    r"discussion\.(?:title|body)|pages\.[^}]{0,200}?page_name|commits\.[^}]{0,200}?(?:message|author\."
     r"(?:email|name))|head_commit\.(?:message|author\.(?:email|name))|workflow_run\."
     r"(?:head_branch|head_commit\.message|display_title))|github\.head_ref)\b"
 )

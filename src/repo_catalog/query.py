@@ -19,6 +19,32 @@ def fts_query(text: str, mode: str = "AND") -> str:
     return f" {mode} ".join(f'"{t}"*' for t in dict.fromkeys(tokens[:12]))
 
 
+def like(text: str) -> str:
+    """A substring LIKE pattern for user text: % and _ match themselves (use ESCAPE '\\')."""
+    return "%" + re.sub(r"([%_\\])", r"\\\1", text) + "%"
+
+
+def resolve_repo(con: sqlite3.Connection, repo_id: str) -> str | list[str] | None:
+    """``owner/name`` or a bare ``name``. A bare name shared by several owners returns the
+    candidates instead of an arbitrary one."""
+    exact = con.execute("SELECT id FROM repos WHERE id = ? COLLATE NOCASE", (repo_id,)).fetchone()
+    if exact:
+        return str(exact[0])
+    rows = [
+        str(r[0])
+        for r in con.execute(
+            "SELECT id FROM repos WHERE name = ? COLLATE NOCASE ORDER BY id", (repo_id,)
+        )
+    ]
+    if len(rows) > 1:
+        return rows
+    return rows[0] if rows else None
+
+
+def _ambiguous(candidates: list[str]) -> dict[str, Any]:
+    return {"error": "ambiguous repo name; use owner/name", "candidates": candidates}
+
+
 def _rows(cur: sqlite3.Cursor) -> list[dict[str, Any]]:
     return [dict(r) for r in cur.fetchall()]
 
@@ -94,13 +120,16 @@ def search_repos(
         params.append(language)
     if technology:
         where.append(
-            "r.id IN (SELECT repo_id FROM repo_tech WHERE name LIKE ? COLLATE NOCASE "
-            "UNION SELECT repo_id FROM dependencies WHERE name LIKE ? COLLATE NOCASE)"
+            "r.id IN (SELECT repo_id FROM repo_tech WHERE name LIKE ? ESCAPE '\\' "
+            "COLLATE NOCASE UNION SELECT repo_id FROM dependencies WHERE name LIKE ? "
+            "ESCAPE '\\' COLLATE NOCASE)"
         )
-        params += [f"%{technology}%", f"%{technology}%"]
+        params += [like(technology), like(technology)]
     if capability:
-        where.append("r.id IN (SELECT repo_id FROM repo_capabilities WHERE capability LIKE ?)")
-        params.append(f"%{capability}%")
+        where.append(
+            "r.id IN (SELECT repo_id FROM repo_capabilities WHERE capability LIKE ? ESCAPE '\\')"
+        )
+        params.append(like(capability))
     if repo_type:
         where.append("r.repo_type = ?")
         params.append(repo_type)
@@ -209,8 +238,10 @@ def list_flags(
             where.append(f"f.{col} = ?")
             params.append(val)
     if repo:
-        where.append("(f.repo_id = ? COLLATE NOCASE OR f.repo_id LIKE ? COLLATE NOCASE)")
-        params += [repo, f"%/{repo}"]
+        where.append(
+            "(f.repo_id = ? COLLATE NOCASE OR f.repo_id LIKE ? ESCAPE '\\' COLLATE NOCASE)"
+        )
+        params += [repo, "%/" + like(repo)[1:-1]]
     return _rows(
         con.execute(
             "SELECT f.repo_id AS repo, f.asset_id, f.flag_id, f.category, f.severity, "
@@ -225,13 +256,12 @@ def list_flags(
 
 def repo_relationships(con: sqlite3.Connection, repo_id: str) -> dict[str, Any] | None:
     """Which org repos this one depends on, and which depend on it (blast radius)."""
-    row = con.execute(
-        "SELECT id FROM repos WHERE id = ? COLLATE NOCASE OR name = ? COLLATE NOCASE",
-        (repo_id, repo_id),
-    ).fetchone()
-    if not row:
+    found = resolve_repo(con, repo_id)
+    if isinstance(found, list):
+        return _ambiguous(found)
+    if found is None:
         return None
-    rid = row[0]
+    rid = found
     return {
         "repo": rid,
         "depends_on": _rows(
@@ -248,10 +278,10 @@ def get_repo(
 ) -> dict[str, Any] | None:
     """Full record. Locked transitive dependencies (often thousands) are left out unless
     asked for; `dependency_summary` has their count and `dependency_usage` queries them."""
-    row = con.execute(
-        "SELECT json FROM repos WHERE id = ? COLLATE NOCASE OR name = ? COLLATE NOCASE",
-        (repo_id, repo_id),
-    ).fetchone()
+    found = resolve_repo(con, repo_id)
+    if isinstance(found, list):
+        return _ambiguous(found)
+    row = con.execute("SELECT json FROM repos WHERE id = ?", (found,)).fetchone() if found else None
     if not row:
         return None
     data: dict[str, Any] = json.loads(row[0])
@@ -271,7 +301,13 @@ def dependency_usage(
 ) -> list[dict[str, Any]]:
     """Every repo that ships a package (exact name, case-insensitive), with the declared and
     locked version, whether it is direct or transitive, where, and known advisories."""
-    where, params = ["d.name = ? COLLATE NOCASE"], [name]
+    # PyPI treats -, _ and . alike (PEP 503): typing_extensions == typing-extensions
+    pep503 = re.sub(r"[-_.]+", "-", name.lower())
+    where = [
+        "(d.name = ? COLLATE NOCASE OR (d.ecosystem = 'pypi' AND "
+        "replace(replace(lower(d.name), '_', '-'), '.', '-') = ?))"
+    ]
+    params: list[Any] = [name, pep503]
     if ecosystem:
         where.append("d.ecosystem = ?")
         params.append(ecosystem)
@@ -316,13 +352,14 @@ def repos_using(con: sqlite3.Connection, name: str) -> list[dict[str, Any]]:
     return _rows(
         con.execute(
             "SELECT DISTINCT r.id, r.url, r.one_liner, t.category, t.name AS matched "
-            "FROM repo_tech t JOIN repos r ON r.id = t.repo_id WHERE t.name LIKE ? COLLATE NOCASE "
+            "FROM repo_tech t JOIN repos r ON r.id = t.repo_id "
+            "WHERE t.name LIKE ? ESCAPE '\\' COLLATE NOCASE "
             "UNION SELECT DISTINCT r.id, r.url, r.one_liner, "
             "CASE d.scope WHEN 'transitive' THEN 'transitive dependency' ELSE 'dependency' END, "
             "d.name || ' ' || COALESCE(d.resolved, d.version, '') "
             "FROM dependencies d JOIN repos r ON r.id = d.repo_id "
-            "WHERE d.name LIKE ? COLLATE NOCASE ORDER BY 1 LIMIT 500",
-            (f"%{name}%", f"%{name}%"),
+            "WHERE d.name LIKE ? ESCAPE '\\' COLLATE NOCASE ORDER BY 1 LIMIT 500",
+            (like(name), like(name)),
         )
     )
 

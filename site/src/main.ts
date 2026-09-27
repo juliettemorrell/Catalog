@@ -175,7 +175,7 @@ function listView(tab: Tab, q: ReturnType<typeof resolveQuery>, raw: string): Li
     return {
       results, total: catalog.repos.length, noun: "repositories", defs: REPO_FILTERS, idx: repoIdx,
       placeholder: "Search repos: what they do, stack, capabilities…",
-      examples: ["payments", "lang:python fw:fastapi", "type:service missing:tests", "sev:high", "usedby:yes"],
+      examples: ["lang:python fw:fastapi", "missing:tests", "sev:high", "usedby:yes", "depeco:docker"],
       facets: repoFacets(results, raw), card: repoCard as (x: never) => string,
       csv: () => downloadCsv("repos.csv", results.map(repoRow)),
     };
@@ -186,7 +186,7 @@ function listView(tab: Tab, q: ReturnType<typeof resolveQuery>, raw: string): Li
     return {
       results, total: blocks.length, noun: "building blocks", defs: BLOCK_FILTERS, idx: blockIdx,
       placeholder: "Search actions, reusable workflows, Terraform modules, Helm charts, templates, APIs…",
-      examples: ["kind:terraform-module", "deploy", "kind:action release", "kind:api format:openapi", "kind:template"],
+      examples: ["kind:terraform-module", "kind:reusable-workflow", "kind:action release", "kind:api", "kind:helm-chart"],
       facets: blockFacets(results, raw), card: blockCard as (x: never) => string,
       csv: () => downloadCsv("building-blocks.csv", results.map(blockRow)),
     };
@@ -214,7 +214,8 @@ function renderSearch(state: State): void {
 
   const { examples, defs, idx } = view;
   const help = Object.entries(defs).map(([k, d]) => `<li><code>${k}:</code> ${esc(d.help)}</li>`).join("")
-    + "<li>Prefix with <code>-</code> to exclude. Repeat a key to OR values. Quote values with spaces.</li>";
+    + "<li>Prefix with <code>-</code> to exclude. Repeat a key to OR values. Quote values with spaces. End a value with <code>*</code> to match by prefix (<code>tool:Bash*</code>).</li>"
+    + (state.tab === "repos" ? "<li><code>is:public</code> / <code>is:private</code> need a scan with GitHub discovery (<code>--org</code>); <code>--local</code> scans have no visibility.</li>" : "");
   const indexing = q.text.trim() && !idx.ready
     ? `<p class="notice" role="status">Building the search index (${Math.round(idx.progress * 100)}%). Showing exact matches until it is ready.</p>`
     : "";
@@ -224,6 +225,7 @@ function renderSearch(state: State): void {
 
   $main.innerHTML = `
     <h1 class="sr-only">${esc(TAB_TITLE[state.tab])}</h1>
+    <a class="skip" href="#results">Skip to results</a>
     <section class="search">
       <label class="sr-only" for="q">Search ${view.noun}</label>
       <div class="search-box">
@@ -242,7 +244,7 @@ function renderSearch(state: State): void {
     </section>
     <div class="layout">
       <aside class="facets" aria-label="Filters">${view.facets}</aside>
-      <section class="results" aria-live="polite" aria-label="Results">
+      <section class="results" id="results" tabindex="-1" aria-live="polite" aria-label="Results">
         ${results.length ? results.slice(0, shown).map(view.card).join("")
           : `<div class="empty"><h2>No matches</h2><p>Remove a filter or try broader words.</p></div>`}
         ${results.length > shown ? `<button type="button" class="more-btn" id="more" data-focus="more">Show ${Math.min(PAGE, results.length - shown)} more</button>` : ""}
@@ -682,6 +684,7 @@ function renderInsights(): void {
   const labelToId = new Map(active.flatMap((r) => r.practices.checks.map((c) => [c.label, c.id] as const)));
   const kindByLabel = new Map(Object.entries(KIND_LABEL).map(([k, l]) => [l, k]));
   const flagIdByLabel = new Map([...rs.flatMap((r) => r.flags), ...as.flatMap((a) => a.flags)].map((f) => [flagLabel(f.id), f.id]));
+  const repoFlagIds = new Set(rs.flatMap((r) => r.flags.map((f) => f.id)));
   const assetFlagsByRepo = new Map<string, Flag[]>();
   for (const a of as) if (a.flags.length) assetFlagsByRepo.set(a.repo, [...(assetFlagsByRepo.get(a.repo) ?? []), ...a.flags]);
   const blockKindByLabel = new Map(Object.entries(BLOCK_LABEL).map(([k, l]) => [l, k]));
@@ -710,7 +713,11 @@ function renderInsights(): void {
         ${bars("Models referenced (repos)", countBy(rs, (r) => r.ai.models), (v) => repoQ(`uses:${quote(v)}`), rs.length)}
         ${bars("Capabilities", countBy(rs, (r) => r.capabilities), (v) => repoQ(`cap:${quote(v)}`), rs.length, 14)}
         ${bars("Practices grade", countBy(rs, (r) => r.practices.grade).sort((a, b) => a[0].localeCompare(b[0])), (v) => repoQ(`grade:${v}`), rs.length)}
-        ${bars("Findings (active repos)", countBy(active, (r) => [...r.flags, ...(assetFlagsByRepo.get(r.id) ?? [])].map((f) => flagLabel(f.id))), (v) => repoQ(`flag:${flagIdByLabel.get(v) ?? v}`), active.length, 12)}
+        ${bars("Findings (active repos)", countBy(active, (r) => [...r.flags, ...(assetFlagsByRepo.get(r.id) ?? [])].map((f) => flagLabel(f.id))), (v) => {
+          const id = flagIdByLabel.get(v) ?? v;
+          // findings raised on AI assets are filtered in the asset library, not on repos
+          return repoFlagIds.has(id) ? repoQ(`flag:${id}`) : assetQ(`flag:${id}`);
+        }, active.length, 12)}
         ${bars("Building blocks", countBy(blocks, (b) => BLOCK_LABEL[b.kind] ?? b.kind), (v) => href({ tab: "blocks", q: `kind:${blockKindByLabel.get(v) ?? v}`, open: null }), blocks.length)}
         ${bars("Dependency ecosystems (repos)", countBy(rs, (r) => Object.keys(r.dependency_summary.ecosystems)), (v) => repoQ(`depeco:${v}`), rs.length, 12)}
         ${bars("Packages with known advisories (repos)", countBy(rs, (r) => r.dependencies.filter((d) => d.vulns.length).map((d) => d.name)), (v) => repoQ(`dep:${quote(v)} vuln:yes`), rs.length)}
@@ -774,7 +781,9 @@ function repoRow(r: Repo): Record<string, unknown> {
 
 function blockRow(b: Block): Record<string, unknown> {
   return {
-    kind: b.kind, name: b.name, repo: b.repo, path: b.path, description: b.description,
+    kind: b.kind, name: b.name, repo: b.repo, path: b.path,
+    url: b.path === "." ? b.repoRef.url : blobUrl(b.repoRef, b.path, null).replace("/blob/", "/tree/"),
+    description: b.description,
     summary: blockSummary(b), repo_grade: b.repoRef.practices.grade, repo_lifecycle: b.repoRef.lifecycle,
   };
 }

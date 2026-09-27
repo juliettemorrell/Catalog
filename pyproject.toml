@@ -52,3 +52,4 @@ addopts = "-q"
 "src/repo_catalog/analyzers/deps_more.py" = ["E501"]  # manifest regexes read best unwrapped
 "tests/test_scan.py" = ["E501"]  # fixture file contents read best unwrapped
 "tests/test_cli.py" = ["E501"]  # fixture file contents read best unwrapped
+"tests/test_review_fixes.py" = ["E501"]  # fixture file contents read best unwrapped

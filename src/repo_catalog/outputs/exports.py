@@ -211,6 +211,8 @@ def write_aibom(path: Path, repos: list[Repo], assets: list[AIAsset], source: st
 
 
 _CDX_SCOPE = {"dev": "optional", "build": "excluded", "optional": "optional"}
+# higher wins when one package appears with several scopes
+_SCOPE_STRENGTH = {"build": 0, "dev": 1, "optional": 2, "transitive": 3, "peer": 4, "runtime": 5}
 
 
 def repo_sbom(r: Repo) -> dict[str, object]:
@@ -218,18 +220,26 @@ def repo_sbom(r: Repo) -> dict[str, object]:
     its purl, plus known advisories when the catalog was built with ``--osv``."""
     root = f"repo:{r.id}"
     components: list[dict[str, object]] = []
-    refs: dict[tuple[str, str, str | None], str] = {}
+    by_ref: dict[str, dict[str, object]] = {}
+    scope_rank: dict[str, int] = {}
     direct: list[str] = []
     vulns: dict[str, list[str]] = {}
     for d in r.dependencies:
-        key = (d.ecosystem, d.name, d.resolved or d.version)
-        if key in refs:
-            ref = refs[key]
+        # one component per package version: the purl identifies it (PyYAML == pyyaml)
+        ref = d.purl or f"{d.ecosystem}:{d.name.lower()}@{d.resolved or d.version or ''}"
+        rank = _SCOPE_STRENGTH.get(d.scope, 0)
+        if ref in by_ref:
+            if rank > scope_rank[ref]:  # runtime use anywhere makes the package required
+                scope_rank[ref] = rank
+                for prop in by_ref[ref]["properties"]:  # type: ignore[attr-defined]
+                    if prop["name"] == "repo-catalog:scope":
+                        prop["value"] = d.scope
+                if d.scope in _CDX_SCOPE:
+                    by_ref[ref]["scope"] = _CDX_SCOPE[d.scope]
+                else:
+                    by_ref[ref].pop("scope", None)
         else:
-            ref = d.purl or f"{d.ecosystem}:{d.name}@{d.resolved or d.version or ''}"
-            if ref in refs.values():
-                ref = f"{ref}#{len(refs)}"
-            refs[key] = ref
+            scope_rank[ref] = rank
             comp: dict[str, object] = {
                 "bom-ref": ref,
                 "type": "container" if d.ecosystem == "docker" else "library",
@@ -245,13 +255,14 @@ def repo_sbom(r: Repo) -> dict[str, object]:
                     ),
                 ],
             }
-            if d.resolved or d.version:
-                comp["version"] = d.resolved or d.version
+            if d.resolved:  # a declared range is not a version; it stays in the property
+                comp["version"] = d.resolved
             if d.purl:
                 comp["purl"] = d.purl
             if d.scope in _CDX_SCOPE:
                 comp["scope"] = _CDX_SCOPE[d.scope]
             components.append(comp)
+            by_ref[ref] = comp
         if d.scope != "transitive" and ref not in direct:
             direct.append(ref)
         for vuln in d.vulns:

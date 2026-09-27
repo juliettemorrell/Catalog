@@ -8,6 +8,7 @@ org-wide in ``org.py`` into depends-on / used-by links.
 
 from __future__ import annotations
 
+import bisect
 import re
 from collections import defaultdict
 from collections.abc import Callable
@@ -46,7 +47,7 @@ def _readme_blurb(files: RepoFiles, folder: str) -> str | None:
     for name in ("README.md", "readme.md", "README.rst"):
         text = files.read(prefix + name, 20_000)
         if text:
-            body = re.sub(r"(?m)^\s*(#.*|!\[.*|\[!\[.*|<.*>|```.*|\|.*)$", "", text)
+            body = re.sub(r"(?m)^[ \t]*(#.*|!\[.*|\[!\[.*|<.*>|```.*|\|.*)$", "", text)
             para = next((p.strip() for p in re.split(r"\n\s*\n", body) if len(p.strip()) > 20), "")
             return first_sentence(" ".join(para.split())) if para else None
     return None
@@ -102,10 +103,10 @@ def _reusable_workflows(workflow_texts: dict[str, str], out: list[Reusable]) -> 
         )
 
 
-_TF_VAR = re.compile(r'^\s*variable\s+"([\w-]+)"', re.M)
-_TF_OUT = re.compile(r'^\s*output\s+"([\w-]+)"', re.M)
-_TF_RES = re.compile(r'^\s*(?:resource|data)\s+"([a-z0-9]+)_', re.M)
-_TF_BACKEND = re.compile(r'^\s*backend\s+"', re.M)
+_TF_VAR = re.compile(r'^[ \t]*variable\s+"([\w-]+)"', re.M)
+_TF_OUT = re.compile(r'^[ \t]*output\s+"([\w-]+)"', re.M)
+_TF_RES = re.compile(r'^[ \t]*(?:resource|data)\s+"([a-z0-9]+)_', re.M)
+_TF_BACKEND = re.compile(r'^[ \t]*backend\s+"', re.M)
 
 
 def _terraform_modules(files: RepoFiles, repo_name: str, out: list[Reusable]) -> None:
@@ -225,10 +226,22 @@ def _templates(files: RepoFiles, is_template: bool, repo_name: str, out: list[Re
         )
 
 
-_PROTO_SERVICE = re.compile(r"^\s*service\s+(\w+)\s*\{", re.M)
-_PROTO_RPC = re.compile(r"^\s*rpc\s+(\w+)\s*\(", re.M)
-_PROTO_PKG = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.M)
-_GQL_ROOT = re.compile(r"\btype\s+(Query|Mutation|Subscription)\s*(?:@\w+\s*)*\{([^}]*)\}", re.S)
+_PROTO_SERVICE = re.compile(r"^[ \t]*service\s+(\w+)\s*\{", re.M)
+_PROTO_RPC = re.compile(r"^[ \t]*rpc\s+(\w+)\s*\(", re.M)
+_PROTO_PKG = re.compile(r"^[ \t]*package\s+([\w.]+)\s*;", re.M)
+_GQL_ROOT = re.compile(r"\btype\s+(Query|Mutation|Subscription)\b[^{}]{0,200}\{")
+
+
+def _graphql_roots(text: str) -> list[tuple[str, str]]:
+    """(root type, body) pairs. Linear: each opening brace is paired with the next closing
+    brace by bisecting a precomputed index instead of scanning ahead from every match."""
+    closes = [i for i, c in enumerate(text) if c == "}"]
+    out = []
+    for m in _GQL_ROOT.finditer(text):
+        k = bisect.bisect_left(closes, m.end())
+        if k < len(closes):
+            out.append((m.group(1), text[m.end() : closes[k]]))
+    return out
 
 
 def _apis(files: RepoFiles, api_specs: list[str], out: list[Reusable]) -> None:
@@ -254,8 +267,8 @@ def _apis(files: RepoFiles, api_specs: list[str], out: list[Reusable]) -> None:
         if path.endswith((".graphql", ".graphqls")):
             fields = [
                 f"{root}.{m}"
-                for root, body in _GQL_ROOT.findall(text)
-                for m in re.findall(r"^\s*(\w+)\s*[(:]", body, re.M)
+                for root, body in _graphql_roots(text)
+                for m in re.findall(r"^[ \t]*(\w+)\s*[(:]", body, re.M)
             ]
             if fields:
                 out.append(
@@ -312,7 +325,12 @@ def _apis(files: RepoFiles, api_specs: list[str], out: list[Reusable]) -> None:
                 },
             )
         )
-    for path, details in protos.items():
+    seen_services: set[tuple[object, ...]] = set()
+    for path, details in sorted(protos.items(), key=lambda kv: ("client" in kv[0].lower(), kv[0])):
+        signature = (details["package"], tuple(details["services"]), tuple(details["sample"]))
+        if signature in seen_services:
+            continue  # a client's copy of a proto it consumes is not a second API
+        seen_services.add(signature)
         out.append(
             Reusable(
                 kind="api",
@@ -377,14 +395,14 @@ def find_reusables(
 # --------------------------------------------------------------------- cross references
 
 _USES = re.compile(
-    r"^\s*-?\s*uses:\s*['\"]?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)((?:/[^@\s'\"]+)?)@", re.M
+    r"^[ \t]*-?[ \t]*uses:\s*['\"]?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)((?:/[^@\s'\"]+)?)@", re.M
 )
 _TF_SOURCE = re.compile(
-    r"^\s*source\s*=\s*\"(?:git::)?(?:https://|ssh://git@|git@)?github\.com[/:]"
+    r"^[ \t]*source\s*=\s*\"(?:git::)?(?:https://|ssh://git@|git@)?github\.com[/:]"
     r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?://|\?|\"|/)",
     re.M,
 )
-_GHCR_FROM = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*ghcr\.io/([\w.-]+)/([\w.-]+)", re.I | re.M)
+_GHCR_FROM = re.compile(r"^[ \t]*FROM\s+(?:--\S+\s+)*ghcr\.io/([\w.-]+)/([\w.-]+)", re.I | re.M)
 _SUBMODULE = re.compile(
     r"url\s*=\s*(?:https://|git@)github\.com[/:]([\w.-]+)/([\w.-]+?)(?:\.git)?\s*$", re.M
 )

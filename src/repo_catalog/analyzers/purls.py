@@ -13,6 +13,8 @@ from typing import Any
 from urllib.parse import quote
 
 from ..models import Dependency, DependencySummary
+from ..textutil import clean_ref
+from .deps_more import has_registry
 
 # ecosystems whose deps are code packages (vs images, actions, tooling hooks)
 PACKAGE_ECOSYSTEMS = frozenset(
@@ -66,7 +68,18 @@ _PURL_TYPE = {
 def exact_version(ecosystem: str, version: str | None) -> str | None:
     if not version or ecosystem in _BARE_IS_RANGE:
         return None
-    m = _EXACT.match(version.strip())
+    version = version.strip()
+    if ecosystem == "github-actions":
+        # only a commit SHA or a full x.y.z tag pins an action; "v4" moves with each release
+        full = re.fullmatch(r"[0-9a-f]{40}|v?\d+\.\d+\.\d+", version)
+        return version if full else None
+    if ecosystem == "docker" and re.fullmatch(r"sha256:[0-9a-f]{6,64}", version):
+        return version  # a digest is the most exact reference an image can have
+    if ecosystem == "go":  # Go versions keep their "v" (v1.2.3, v0.0.0-2024...-abcdef)
+        return version if re.fullmatch(r"v\d+\.\d+\.\d+\S*", version) else None
+    if ecosystem == "nuget" and re.fullmatch(r"\[[^,\]]+\]", version):
+        version = version[1:-1]  # [13.0.3] is NuGet's exact-version syntax
+    m = _EXACT.match(version)
     if not m:
         return None
     if ecosystem == "docker" and version in ("latest", "stable"):
@@ -84,6 +97,7 @@ def purl(dep: Dependency) -> str | None:
     name = dep.name
     namespace = ""
     qualifiers = ""
+    subpath = ""
     if kind == "npm" and name.startswith("@") and "/" in name:
         scope, _, name = name.partition("/")
         namespace = quote(scope, safe="")
@@ -91,10 +105,14 @@ def purl(dep: Dependency) -> str | None:
         name = re.sub(r"[-_.]+", "-", name.lower())
     elif kind == "maven" and ":" in name:
         namespace, _, name = name.partition(":")
+    elif kind == "github" and name.count("/") >= 2:
+        # owner/repo/path/to/action -> pkg:github/owner/repo@ref#path/to/action
+        owner, repo, sub = name.split("/", 2)
+        namespace, name, subpath = owner, repo, sub
     elif kind in ("golang", "swift", "composer", "github") and "/" in name:
         namespace, _, name = name.rpartition("/")
     elif kind == "docker":
-        registry, _, rest = name.partition("/") if "." in name.split("/")[0] else ("", "", name)
+        registry, _, rest = name.partition("/") if has_registry(name) else ("", "", name)
         if registry:
             qualifiers = f"?repository_url={quote(registry, safe='')}"
         namespace, _, name = rest.rpartition("/")
@@ -106,7 +124,7 @@ def purl(dep: Dependency) -> str | None:
     out = "/".join(parts)
     if version:
         out += "@" + quote(version, safe="")
-    return out + qualifiers
+    return out + qualifiers + (f"#{subpath}" if subpath else "")
 
 
 def finalize_dependencies(deps: list[Dependency]) -> None:
@@ -146,6 +164,9 @@ def parse_purl(value: str) -> tuple[str, str, str | None] | None:
     path = [unquote(p) for p in m.group(2).split("/")]
     maven = ecosystem == "maven" and len(path) == 2
     name = f"{path[0]}:{path[1]}" if maven else "/".join(path)
+    if ecosystem == "docker":  # back to the image reference the manifests use
+        registry = re.search(r"[?&]repository_url=([^&#]+)", value)
+        name = f"{unquote(registry.group(1))}/{name}" if registry else name.removeprefix("library/")
     version = unquote(m.group(3)) if m.group(3) else None
     return ecosystem, name, version
 
@@ -153,7 +174,18 @@ def parse_purl(value: str) -> tuple[str, str, str | None] | None:
 def merge_github_sbom(deps: list[Dependency], sbom: dict[str, Any]) -> int:
     """Add packages from GitHub's dependency graph that the manifest parsers did not see
     (ecosystems or files we don't parse). Returns how many were added."""
-    have = {(d.ecosystem, d.name.lower()) for d in deps}
+
+    def key(ecosystem: str, name: str) -> tuple[str, str]:
+        name = name.lower()
+        return ecosystem, re.sub(r"[-_.]+", "-", name) if ecosystem == "pypi" else name
+
+    have = {key(d.ecosystem, d.name) for d in deps}
+    # the repository itself is described by the document, not a dependency of itself
+    described = {
+        r.get("relatedSpdxElement")
+        for r in sbom.get("relationships") or []
+        if isinstance(r, dict) and r.get("relationshipType") == "DESCRIBES"
+    }
     root_targets = {
         r.get("relatedSpdxElement")
         for r in sbom.get("relationships") or []
@@ -163,7 +195,7 @@ def merge_github_sbom(deps: list[Dependency], sbom: dict[str, Any]) -> int:
     }
     added = 0
     for pkg in sbom.get("packages") or []:
-        if not isinstance(pkg, dict):
+        if not isinstance(pkg, dict) or pkg.get("SPDXID") in described:
             continue
         refs = pkg.get("externalRefs") or []
         locator = next(
@@ -175,10 +207,11 @@ def merge_github_sbom(deps: list[Dependency], sbom: dict[str, Any]) -> int:
             None,
         )
         parsed = parse_purl(str(locator)) if locator else None
-        if not parsed or (parsed[0], parsed[1].lower()) in have:
+        if not parsed or key(parsed[0], parsed[1]) in have:
             continue
-        ecosystem, name, version = parsed
-        have.add((ecosystem, name.lower()))
+        ecosystem, name, version = clean_ref(parsed[0]), clean_ref(parsed[1]), parsed[2]
+        version = clean_ref(version) if version else None
+        have.add(key(ecosystem, name))
         dep = Dependency(
             name=name,
             version=version,

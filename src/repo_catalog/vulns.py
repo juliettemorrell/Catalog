@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -65,6 +66,12 @@ def _key(dep: Dependency) -> Key | None:
     version = dep.resolved
     if not eco or not version:
         return None
+    # only plain registry coordinates leave the machine: never URLs, paths or anything
+    # that could carry an internal host name or credential
+    if not re.fullmatch(r"v?\d[\w.+\-]*", version) or re.search(r"://|[?#\s]", dep.name):
+        return None
+    if "@" in dep.name.lstrip("@") or (":" in dep.name and dep.ecosystem != "maven"):
+        return None
     if dep.ecosystem == "github-actions" and not re.match(r"v?\d+\.\d+", version):
         return None  # branch or major-only refs cannot be matched to affected ranges
     name = dep.name
@@ -106,60 +113,142 @@ class OsvClient:
                 out[key] = list(cached.get("ids", []))
             else:
                 todo.append(key)
-        for i in range(0, len(todo), BATCH):
-            chunk = todo[i : i + BATCH]
-            body = {
-                "queries": [
-                    {"package": {"ecosystem": eco, "name": name}, "version": version}
-                    for eco, name, version in chunk
-                ]
-            }
-            resp = self.http.post(f"{OSV_API}/querybatch", json=body)
-            resp.raise_for_status()
-            results = resp.json().get("results", [])
-            for key, result in zip(chunk, results, strict=False):
-                ids = sorted({v["id"] for v in (result or {}).get("vulns", []) if v.get("id")})
-                out[key] = ids
-                self.queries["|".join(key)] = {"ids": ids, "at": now}
+        pending: list[tuple[Key, str | None]] = [(k, None) for k in todo]
+        found: dict[Key, set[str]] = {k: set() for k in todo}
+        complete: set[Key] = set(todo)
+        rounds = 0
+        while pending and rounds < 20:  # querybatch pages long result lists per query
+            rounds += 1
+            next_round: list[tuple[Key, str | None]] = []
+            for i in range(0, len(pending), BATCH):
+                chunk = pending[i : i + BATCH]
+                body = {
+                    "queries": [
+                        {
+                            "package": {"ecosystem": eco, "name": name},
+                            "version": version,
+                            **({"page_token": token} if token else {}),
+                        }
+                        for (eco, name, version), token in chunk
+                    ]
+                }
+                resp = self.http.post(f"{OSV_API}/querybatch", json=body)
+                resp.raise_for_status()
+                results = resp.json().get("results", [])
+                for (key, _), result in zip(chunk, results, strict=False):
+                    result = result or {}
+                    found[key] |= {v["id"] for v in result.get("vulns", []) if v.get("id")}
+                    if result.get("next_page_token"):
+                        next_round.append((key, str(result["next_page_token"])))
+            pending = next_round
+        for key, _ in pending:
+            complete.discard(key)  # never cache a partial list
+        for key in todo:
+            out[key] = sorted(found[key])
+            if key in complete:
+                self.queries["|".join(key)] = {"ids": out[key], "at": now}
         self._save(self.cache_dir / "queries.json", self.queries)
         return out
 
-    def advisory(self, vuln_id: str) -> dict[str, Any]:
+    def advisory(self, vuln_id: str) -> dict[str, Any] | None:
+        """The advisory, or None when it cannot be fetched (withdrawn, 5xx): one bad id
+        must not drop every other finding."""
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", vuln_id)
         path = self.cache_dir / "advisories" / f"{safe}.json"
         cached = self._load(path)
         if cached and time.time() - float(cached.get("_at", 0)) < ADVISORY_TTL:
             return dict(cached)
-        resp = self.http.get(f"{OSV_API}/vulns/{vuln_id}")
-        resp.raise_for_status()
-        data: dict[str, Any] = resp.json()
+        try:
+            resp = self.http.get(f"{OSV_API}/vulns/{vuln_id}")
+            resp.raise_for_status()
+            data: dict[str, Any] = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.info("OSV advisory %s unavailable (%s)", vuln_id, exc)
+            return None
         data["_at"] = time.time()
         self._save(path, data)
         return data
+
+
+# CVSS v3.x base metrics (https://www.first.org/cvss/v3.1/specification-document)
+_CVSS3 = {
+    "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
+    "AC": {"L": 0.77, "H": 0.44},
+    "UI": {"N": 0.85, "R": 0.62},
+    "C": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "I": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "A": {"H": 0.56, "L": 0.22, "N": 0.0},
+}
+
+
+def cvss3_base_score(vector: str) -> float | None:
+    if not vector.startswith("CVSS:3"):
+        return None
+    try:
+        m = dict(part.split(":", 1) for part in vector.split("/")[1:])
+        changed = m["S"] == "C"
+        pr = {"N": 0.85, "L": 0.68 if changed else 0.62, "H": 0.5 if changed else 0.27}[m["PR"]]
+        iss = 1 - (1 - _CVSS3["C"][m["C"]]) * (1 - _CVSS3["I"][m["I"]]) * (1 - _CVSS3["A"][m["A"]])
+        impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15 if changed else 6.42 * iss
+        exploit = 8.22 * _CVSS3["AV"][m["AV"]] * _CVSS3["AC"][m["AC"]] * pr * _CVSS3["UI"][m["UI"]]
+    except (KeyError, ValueError):
+        return None
+    if impact <= 0:
+        return 0.0
+    raw = min(1.08 * (impact + exploit), 10) if changed else min(impact + exploit, 10)
+    return math.ceil(raw * 10 - 1e-9) / 10  # "round up" to one decimal
 
 
 def _severity(advisory: dict[str, Any]) -> Severity:
     label = str((advisory.get("database_specific") or {}).get("severity") or "").upper()
     if label in _SEVERITY:
         return _SEVERITY[label]
+    scores = []
     for sev in advisory.get("severity") or []:
         score = str(sev.get("score", ""))
-        m = re.match(r"^\d+(?:\.\d+)?$", score)  # some feeds give a bare base score
-        if m:
-            value = float(score)
-            return "high" if value >= 7 else "medium" if value >= 4 else "low"
-    return "medium"
+        value = cvss3_base_score(score) if score.startswith("CVSS:") else None
+        if value is None and re.fullmatch(r"\d+(?:\.\d+)?", score):
+            value = float(score)  # some feeds give a bare base score
+        if value is not None:
+            scores.append(value)
+    if scores:
+        top = max(scores)
+        return "high" if top >= 7 else "medium" if top >= 4 else "low"
+    return "medium"  # unknown (e.g. only a CVSS v4 vector): don't under-state it
 
 
-def _fixed(advisory: dict[str, Any], name: str) -> list[str]:
+def _fixed(advisory: dict[str, Any], ecosystem: str, name: str) -> list[str]:
+    def same(a: str) -> bool:
+        if ecosystem == "PyPI":
+            return re.sub(r"[-_.]+", "-", a.lower()) == re.sub(r"[-_.]+", "-", name.lower())
+        return a.lower() == name.lower()
+
     fixed = []
     for affected in advisory.get("affected") or []:
-        pkg = (affected.get("package") or {}).get("name", "")
-        if pkg.lower() != name.lower():
+        pkg = affected.get("package") or {}
+        if (
+            not same(str(pkg.get("name", "")))
+            or str(pkg.get("ecosystem", ecosystem)).split(":")[0] != ecosystem
+        ):
             continue
         for rng in affected.get("ranges") or []:
             fixed += [e["fixed"] for e in rng.get("events") or [] if e.get("fixed")]
     return list(dict.fromkeys(fixed))
+
+
+def _distinct(ids: list[str], advisories: dict[str, dict[str, Any]]) -> list[list[str]]:
+    """Group ids that describe the same issue (GHSA-x and PYSEC-y aliasing one CVE), so it
+    is counted once. The first id of each group (GHSA preferred) is the one shown."""
+    groups: list[tuple[set[str], list[str]]] = []
+    for vid in sorted(ids, key=lambda i: (not i.startswith("GHSA-"), i)):
+        names = {vid, *advisories.get(vid, {}).get("aliases", [])}
+        match = next((g for g in groups if g[0] & names), None)
+        if match is not None:
+            match[0].update(names)
+            match[1].append(vid)
+        else:
+            groups.append((names, [vid]))
+    return [members for _, members in groups]
 
 
 def apply_vulnerabilities(
@@ -182,32 +271,37 @@ def apply_vulnerabilities(
     try:
         client = OsvClient(cache_dir, transport)
         found = client.vulns_for(key for _, _, key in keyed)
-        ids = sorted({i for v in found.values() for i in v})[:MAX_ADVISORIES]
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            advisories = dict(zip(ids, pool.map(client.advisory, ids), strict=True))
     except (httpx.HTTPError, OSError, ValueError) as exc:
         log.warning("OSV lookup skipped (%s): vulnerability data not included", exc)
         return 0
+    ids = sorted({i for v in found.values() for i in v})[:MAX_ADVISORIES]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        fetched = dict(zip(ids, pool.map(client.advisory, ids), strict=True))
+    # an advisory that could not be fetched still counts: OSV said this version is affected
+    advisories = {i: a if a is not None else {"id": i} for i, a in fetched.items()}
 
     hits = 0
     per_repo: dict[str, list[Flag]] = {}
     flagged: set[tuple[str, Key]] = set()
     for repo, dep, key in keyed:
-        vuln_ids = [i for i in found.get(key, []) if i in advisories]
-        if not vuln_ids:
+        groups = _distinct([i for i in found.get(key, []) if i in advisories], advisories)
+        if not groups:
             continue
+        vuln_ids = [g[0] for g in groups]
+        members = [i for g in groups for i in g]
         dep.vulns = vuln_ids
         if (repo.id, key) in flagged:
             continue  # same package@version from another manifest in this repo
         flagged.add((repo.id, key))
         hits += 1
-        worst = min((_severity(advisories[i]) for i in vuln_ids), key=lambda s: _RANK[s])
-        fixed = sorted({f for i in vuln_ids for f in _fixed(advisories[i], key[1])})
+        # sources can disagree on severity (GHSA label vs a PYSEC CVSS vector): take the worst
+        worst = min((_severity(advisories[i]) for i in members), key=lambda s: _RANK[s])
+        fixed = sorted({f for i in members for f in _fixed(advisories[i], key[0], key[1])})
         shown = ", ".join(vuln_ids[:3]) + ("..." if len(vuln_ids) > 3 else "")
         message = (
             f"{dep.name}@{key[2]}{' (transitive)' if dep.scope == 'transitive' else ''}: "
             f"{len(vuln_ids)} known advisor{'y' if len(vuln_ids) == 1 else 'ies'} ({shown})"
-            + (f"; fixed in {', '.join(fixed[:3])}" if fixed else "; no fixed version yet")
+            + (f"; fixed in {', '.join(fixed[:3])}" if fixed else "; no fixed version listed")
         )
         per_repo.setdefault(repo.id, []).append(
             Flag(
