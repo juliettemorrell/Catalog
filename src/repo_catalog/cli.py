@@ -610,7 +610,12 @@ def cmd_sql(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
-    from .mcp_server import serve
+    try:
+        from .mcp_server import serve
+    except ModuleNotFoundError as exc:
+        if exc.name != "mcp" and not str(exc.name).startswith("mcp."):
+            raise
+        sys.exit('The MCP server needs the "mcp" extra: pip install "repo-catalog[mcp]"')
 
     serve(args.out / DB_FILE)
     return 0

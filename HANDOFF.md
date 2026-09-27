@@ -27,7 +27,7 @@ It is built for SDLC agents: the same data is available as JSON (with JSON Schem
 ## Five-minute start
 
 ```bash
-uv sync --all-extras                        # Python 3.11+; or: pip install dist/repo_catalog-*.whl
+uv sync --all-extras                        # Python 3.11+; or: pip install "$(ls dist/*.whl)[mcp,llm]"
 export GITHUB_TOKEN=...                      # read-only: Contents + Metadata (+ org Custom properties)
 uv run repo-catalog scan --org <your-org> --limit 5 --osv
 uv run repo-catalog search "payments"
