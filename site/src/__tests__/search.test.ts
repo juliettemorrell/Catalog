@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import { applyFilters, facetValue, hasFilter, parseQuery, resolveQuery, REPO_FILTERS, ASSET_FILTERS, BLOCK_FILTERS, toggleFilter } from "../search";
-import type { Asset, Block, Flag, Repo } from "../types";
+import { normalizeRepo } from "../data";
+import type { AssetItem, Block, Flag, Repo, RepoItem } from "../types";
 import { countBy } from "../util";
 
-const repo = (over: Partial<Repo> & { lang?: string; fw?: string[]; langs?: string[] }): Repo =>
-  ({
+// full records (as older catalogs had them) normalised to list entries, like the UI does
+const repo = (over: Partial<Repo> & { lang?: string; fw?: string[]; langs?: string[] }): RepoItem =>
+  normalizeRepo({
     id: over.id ?? "acme/x", name: "x", owner: "acme", topics: [], archived: false, fork: false,
     visibility: "private", capabilities: [], dependencies: over.dependencies ?? [], lifecycle: "active",
     stack: {
@@ -18,7 +20,7 @@ const repo = (over: Partial<Repo> & { lang?: string; fw?: string[]; langs?: stri
     ownership: { codeowners: [] }, declared: { owner: null }, ai: { has_ai: false, sdks: [], models: [], ecosystems: [] },
     flags: over.flags ?? [], reusables: over.reusables ?? [], depends_on: [], used_by: over.used_by ?? [],
     dependency_summary: over.dependency_summary ?? { direct: 0, transitive: 0, ecosystems: {}, lockfile_coverage: 0, vulnerable: 0 },
-  }) as unknown as Repo;
+  });
 
 describe("query language", () => {
   it("parses free text, filters, negation and quoted values", () => {
@@ -65,7 +67,7 @@ describe("filters", () => {
   it("numeric thresholds ignore non-numbers and never crash on the wrong tab", () => {
     expect(ids("minscore:80")).toEqual(["b"]);
     expect(ids("minscore:abc")).toEqual(["a", "b"]);
-    const assets = [{ quality_score: 70 }, { quality_score: 10 }] as Asset[];
+    const assets = [{ quality_score: 70 }, { quality_score: 10 }] as AssetItem[];
     const q = resolveQuery(parseQuery("minscore:5 minq:50"), ASSET_FILTERS);
     expect(applyFilters(assets, q.filters, ASSET_FILTERS)).toHaveLength(1);
   });
@@ -124,7 +126,7 @@ describe("dependency filters", () => {
 
 describe("facets agree with their filters", () => {
   const mk = (id: string, tools: string[], tags: string[], category: string) =>
-    ({ id, tools, tags, category, repo: "acme/x", models: [], flags: [], duplicates: [] }) as unknown as Asset;
+    ({ id, tools, tags, category, repo: "acme/x", models: [], flags: [], duplicate_count: 0 }) as unknown as AssetItem;
   const assets = [mk("a", ["mcp__github__*"], [], "testing"), mk("b", ["mcp__github__create_issue"], ["testing"], "docs"), mk("c", ["Read"], [], "docs")];
   const run = <T,>(items: T[], defs: Parameters<typeof applyFilters<T>>[2], q: string) =>
     applyFilters(items, parseQuery(q).filters, defs).map((x) => (x as { id: string }).id);
@@ -145,7 +147,7 @@ describe("facets agree with their filters", () => {
     const rs = [
       { id: "r1", capabilities: ["payments"], summary: { domains: [] } },
       { id: "r2", capabilities: [], summary: { domains: ["payments"] } },
-    ] as unknown as Repo[];
+    ] as unknown as RepoItem[];
     const cap = countBy(rs, REPO_FILTERS.cap!.get).find(([v]) => v === "payments")?.[1];
     expect(cap).toBe(2);
     expect(run(rs, REPO_FILTERS, "cap:payments")).toEqual(["r1", "r2"]);
