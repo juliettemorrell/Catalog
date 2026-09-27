@@ -22,3 +22,8 @@ site/dist/
 .env.*
 !.env.example
 .DS_Store
+
+# test artifacts
+.coverage
+.coverage.*
+htmlcov/
